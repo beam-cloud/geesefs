@@ -872,6 +872,7 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		RdevAttr:            c.String("rdev-attr"),
 		MtimeAttr:           c.String("mtime-attr"),
 		SymlinkAttr:         c.String("symlink-attr"),
+		ZeroSizeMetadata:    c.Bool("fetch-zero-size-metadata"),
 		RefreshAttr:         c.String("refresh-attr"),
 		CachePath:           c.String("cache"),
 		MaxDiskCacheFD:      int64(c.Int("max-disk-cache-fd")),
