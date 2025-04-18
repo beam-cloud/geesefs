@@ -562,12 +562,14 @@ MISC OPTIONS:
 			Name:  "symlink-attr",
 			Value: "--symlink-target",
 			Usage: "Symbolic link target metadata attribute name." +
-				" Only works correctly if your S3 returns UserMetadata in listings",
+				" Only works correctly if your S3 returns UserMetadata in listings" +
+				" You can use --symlink-zeroed flag to make additional HEAD requests as a workaround.",
 		},
 
 		cli.BoolFlag{
-			Name:  "fetch-zero-size-metadata",
-			Usage: "Make an additional HEAD request to fetch metadata when encountering zero size files from ListObjectsV2.",
+			Name: "symlink-zeroed",
+			Usage: "Strip content when creating symlink files and make an additional" +
+				" HEAD request to fetch metadata when encountering files with size zero from ListObjectsV2.",
 		},
 
 		cli.StringFlag{
@@ -872,7 +874,7 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		RdevAttr:            c.String("rdev-attr"),
 		MtimeAttr:           c.String("mtime-attr"),
 		SymlinkAttr:         c.String("symlink-attr"),
-		ZeroSizeMetadata:    c.Bool("fetch-zero-size-metadata"),
+		SymlinkZeroed:       c.Bool("symlink-zeroed"),
 		RefreshAttr:         c.String("refresh-attr"),
 		CachePath:           c.String("cache"),
 		MaxDiskCacheFD:      int64(c.Int("max-disk-cache-fd")),
@@ -1077,7 +1079,7 @@ func DefaultFlags() *FlagStorage {
 		RdevAttr:            "rdev",
 		MtimeAttr:           "mtime",
 		SymlinkAttr:         "--symlink-target",
-		ZeroSizeMetadata:    false,
+		SymlinkZeroed:       false,
 		RefreshAttr:         ".invalidate",
 		StatCacheTTL:        30 * time.Second,
 		HTTPTimeout:         30 * time.Second,

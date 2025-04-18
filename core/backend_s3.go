@@ -588,7 +588,7 @@ func (s *S3Backend) ListBlobs(param *ListBlobsInput) (*ListBlobsOutput, error) {
 	}
 	for _, i := range resp.Contents {
 
-		if s.flags.ZeroSizeMetadata && *i.Size == 0 {
+		if s.flags.SymlinkZeroed && *i.Size == 0 {
 			head, err := s.HeadBlob(&HeadBlobInput{Key: *i.Key})
 			if err != nil {
 				return nil, err

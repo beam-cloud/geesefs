@@ -95,7 +95,7 @@ type FlagStorage struct {
 	RdevAttr            string
 	MtimeAttr           string
 	SymlinkAttr         string
-	ZeroSizeMetadata    bool
+	SymlinkZeroed       bool
 	RefreshAttr         string
 	RefreshFilename     string
 	FlushFilename       string
