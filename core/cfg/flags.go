@@ -565,6 +565,11 @@ MISC OPTIONS:
 				" Only works correctly if your S3 returns UserMetadata in listings",
 		},
 
+		cli.BoolFlag{
+			Name:  "fetch-zero-size-metadata",
+			Usage: "Make an additional HEAD request to fetch metadata when encountering zero size files from ListObjectsV2.",
+		},
+
 		cli.StringFlag{
 			Name:  "refresh-attr",
 			Value: ".invalidate",
@@ -1071,6 +1076,7 @@ func DefaultFlags() *FlagStorage {
 		RdevAttr:            "rdev",
 		MtimeAttr:           "mtime",
 		SymlinkAttr:         "--symlink-target",
+		ZeroSizeMetadata:    false,
 		RefreshAttr:         ".invalidate",
 		StatCacheTTL:        30 * time.Second,
 		HTTPTimeout:         30 * time.Second,
