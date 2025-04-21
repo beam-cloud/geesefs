@@ -1,6 +1,8 @@
 module github.com/yandex-cloud/geesefs
 
-go 1.23.4
+go 1.21
+
+toolchain go1.22.2
 
 require (
 	cloud.google.com/go/storage v1.16.0
