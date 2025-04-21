@@ -382,22 +382,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	allocated := int64(0)
 	curOffset, curSize := offset, size
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
-		hash, _ := inode.userMetadata[inode.fs.flags.HashAttr]
-		log.Infof("hash during read: %v", string(hash))
-
-		var alloc int64
-		var done uint64
-		var err error
-
-		// if inode.fs.flags.ExternalCacheClient != nil && hashFound {
-		// 	alloc, done, err = inode.loadFromExternalCache(curOffset, curSize, string(hash))
-		// 	if err != nil {
-		// 		alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
-		// 	}
-		// } else {
-		alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
-		// }
-
+		alloc, done, err := inode.sendRead(cloud, key, curOffset, curSize)
 		if err != nil && shouldRetry(err) {
 			s3Log.Warnf("Error reading %v +%v of %v (attempt %v): %v", curOffset, curSize, key, attempt, err)
 		}
