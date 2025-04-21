@@ -563,9 +563,9 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 
 	// Try to read from cache
 	hash, ok := fh.inode.userMetadata[fh.inode.fs.flags.HashAttr]
-	if ok {
-		log.Infof("Hash of file '%s': %s", fh.inode.FullName(), string(hash))
-		// TODO: since we have the hash of the file, we can try loading this specific part of the file
+	if ok && fh.inode.fs.flags.ExternalCacheClient != nil {
+		log.Infof("Hash of file '%s': %s, trying to use cache client", fh.inode.FullName(), string(hash))
+		// LUKE: since we have the hash of the file, we can try loading this specific part of the file
 		// from the cache client
 	}
 
