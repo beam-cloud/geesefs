@@ -1,4 +1,4 @@
-module github.com/yandex-cloud/geesefs
+module github.com/beam-cloud/geesefs
 
 go 1.21
 

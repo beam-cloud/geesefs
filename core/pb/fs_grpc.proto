@@ -2,7 +2,7 @@ syntax = "proto3";
 
 import "google/protobuf/timestamp.proto";
 
-option go_package = "github.com/yandex-cloud/geesefs/core/pb";
+option go_package = "github.com/beam-cloud/geesefs/core/pb";
 
 service FsGrpc {
   // stealing

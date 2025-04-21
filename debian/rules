@@ -1,6 +1,6 @@
 #!/usr/bin/make -f
 
-export DH_GOLANG_BUILDPKG := github.com/yandex-cloud/geesefs
+export DH_GOLANG_BUILDPKG := github.com/beam-cloud/geesefs
 export GO111MODULE = on
 export GOPROXY = 
 export CGO_ENABLED = 0
@@ -9,7 +9,7 @@ export CGO_ENABLED = 0
 	dh $@ --builddirectory=_build --buildsystem=golang --with=golang
 
 #override_dh_auto_build:
-#	cd _build && go install -trimpath -v -p 8 github.com/yandex-cloud/geesefs
+#	cd _build && go install -trimpath -v -p 8 github.com/beam-cloud/geesefs
 
 override_dh_auto_test:
 	cd _build
