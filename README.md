@@ -112,16 +112,16 @@ Note: new files, metadata changes and renames are still flushed to S3 as multipa
 # Installation
 
 * Pre-built binaries:
-  * [Linux amd64](https://github.com/beam-cloud/geesefs/releases/latest/download/geesefs-linux-amd64).
+  * [Linux amd64](https://github.com/yandex-cloud/geesefs/releases/latest/download/geesefs-linux-amd64).
     You may also need to install FUSE utils (fuse3 or fuse RPM/Debian package) first.
-  * [Mac amd64](https://github.com/beam-cloud/geesefs/releases/latest/download/geesefs-mac-amd64),
-    [arm64](https://github.com/beam-cloud/geesefs/releases/latest/download/geesefs-mac-arm64). You also need osxfuse/macfuse for GeeseFS to work.
-  * [Windows x64](https://github.com/beam-cloud/geesefs/releases/latest/download/geesefs-win-x64.exe).
+  * [Mac amd64](https://github.com/yandex-cloud/geesefs/releases/latest/download/geesefs-mac-amd64),
+    [arm64](https://github.com/yandex-cloud/geesefs/releases/latest/download/geesefs-mac-arm64). You also need osxfuse/macfuse for GeeseFS to work.
+  * [Windows x64](https://github.com/yandex-cloud/geesefs/releases/latest/download/geesefs-win-x64.exe).
     You also need to install [WinFSP](https://winfsp.dev) first.
 * Or build from source with Go 1.13 or later:
 
 ```ShellSession
-$ git clone https://github.com/beam-cloud/geesefs
+$ git clone https://github.com/yandex-cloud/geesefs
 $ cd geesefs
 $ go build
 ```
@@ -148,7 +148,7 @@ bucket    /mnt/mountpoint    fuse.geesefs    _netdev,allow_other,--file-mode=066
 
 You can also use a different path to the credentials file by adding `,--shared-config=/path/to/credentials`.
 
-See also: [Instruction for Azure Blob Storage](https://github.com/beam-cloud/geesefs/blob/master/README-azure.md).
+See also: [Instruction for Azure Blob Storage](https://github.com/yandex-cloud/geesefs/blob/master/README-azure.md).
 
 ## Windows
 

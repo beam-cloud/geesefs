@@ -3,7 +3,7 @@
 __ftp-s3-gateway__ - FTP/FTPS/SFTP сервер для предоставления доступа к бакетам S3.
 
 Реализован в формате Docker-образа, в котором запускаются стандартные FTP и SFTP
-сервера vsftpd и openssh и реализация FUSE S3 файловой системы [geesefs](https://github.com/beam-cloud/geesefs).
+сервера vsftpd и openssh и реализация FUSE S3 файловой системы [geesefs](https://github.com/yandex-cloud/geesefs).
 
 ## Сборка образа
 

@@ -1,15 +1,9 @@
 syntax = "proto3";
 
-option go_package = "github.com/beam-cloud/geesefs/core/pb";
+option go_package = "github.com/yandex-cloud/geesefs/core/pb";
 
-service Recovery {
-    rpc Unmount(UnmountRequest) returns (UnmountResponse);
-}
+service Recovery { rpc Unmount(UnmountRequest) returns (UnmountResponse); }
 
-message UnmountRequest {
-    
-}
+message UnmountRequest {}
 
-message UnmountResponse {
-
-}
+message UnmountResponse {}

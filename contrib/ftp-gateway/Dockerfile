@@ -3,7 +3,7 @@ FROM debian:bullseye
 # Install GeeseFS
 RUN echo "APT::Install-Recommends false;" >> /etc/apt/apt.conf
 RUN apt-get update && apt-get -y install fuse && apt-get clean && rm -rf /var/lib/apt/lists/*
-ADD https://github.com/beam-cloud/geesefs/releases/latest/download/geesefs-linux-amd64 /usr/bin/geesefs
+ADD https://github.com/yandex-cloud/geesefs/releases/latest/download/geesefs-linux-amd64 /usr/bin/geesefs
 RUN chmod 755 /usr/bin/geesefs
 
 # Install openssh & vsftpd
