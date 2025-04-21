@@ -1,8 +1,6 @@
 module github.com/yandex-cloud/geesefs
 
-go 1.21
-
-toolchain go1.22.2
+go 1.23.4
 
 require (
 	cloud.google.com/go/storage v1.16.0
@@ -10,7 +8,7 @@ require (
 	github.com/Azure/azure-sdk-for-go v32.1.0+incompatible
 	github.com/Azure/azure-storage-blob-go v0.7.1-0.20190724222048-33c102d4ffd2
 	github.com/Azure/go-autorest/autorest v0.11.18
-	github.com/Azure/go-autorest/autorest/adal v0.9.13
+	github.com/Azure/go-autorest/autorest/adal v0.9.24
 	github.com/Azure/go-autorest/autorest/azure/auth v0.5.7
 	github.com/Azure/go-autorest/autorest/azure/cli v0.4.2
 	github.com/aws/aws-sdk-go v1.38.7
@@ -46,8 +44,8 @@ require (
 	github.com/Azure/go-autorest/tracing v0.6.0 // indirect
 	github.com/StackExchange/wmi v0.0.0-20180116203802-5d049714c4a6 // indirect
 	github.com/dimchansky/utfbom v1.1.1 // indirect
-	github.com/form3tech-oss/jwt-go v3.2.2+incompatible // indirect
 	github.com/go-ole/go-ole v1.2.1 // indirect
+	github.com/golang-jwt/jwt/v4 v4.5.0 // indirect
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
 	github.com/googleapis/gax-go/v2 v2.0.5 // indirect
 	github.com/gopherjs/gopherjs v0.0.0-20210202160940-bed99a852dfe // indirect
