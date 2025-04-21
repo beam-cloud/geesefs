@@ -18,6 +18,7 @@ package core
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -270,17 +271,25 @@ func (inode *Inode) loadFromDisk(diskRanges []Range) (allocated int64, err error
 	return
 }
 
+var errContentNotFound = errors.New("content not found")
+
 func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash string) (allocated int64, totalDone uint64, err error) {
 	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size))
 	if err == nil && buf != nil {
-		log.Infof("Loaded from external cache: %v", string(buf))
+		// log.Infof("Loaded from external cache: %v", string(buf))
 		log.Infof("hash: %v", hash)
 		log.Infof("offset: %v", offset)
 		log.Infof("size: %v", size)
+
 		totalDone = uint64(len(buf))
 	}
+
 	if err != nil {
-		log.Errorf("Error loading from external cache: %v", err)
+		if err == errContentNotFound {
+			sourcePath := inode.FullName()
+			// _, err := inode.fs.flags.ExternalCacheClient.StoreContentFromSourceWithLock(sourcePath, "")
+			log.Infof("Storing content from source: %v", sourcePath)
+		}
 		return 0, 0, err
 	}
 
