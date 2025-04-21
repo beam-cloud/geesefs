@@ -276,7 +276,7 @@ var errContentNotFound = errors.New("content not found")
 func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash string) (allocated int64, totalDone uint64, err error) {
 	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size))
 	if err == nil && buf != nil {
-		// log.Infof("Loaded from external cache: %v", string(buf))
+		log.Infof("Loaded from external cache: %s", hash)
 		log.Infof("hash: %v", hash)
 		log.Infof("offset: %v", offset)
 		log.Infof("size: %v", size)
@@ -411,6 +411,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 		} else {
 			alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
 		}
+
 		if err != nil && shouldRetry(err) {
 			s3Log.Warnf("Error reading %v +%v of %v (attempt %v): %v", curOffset, curSize, key, attempt, err)
 		}
@@ -599,6 +600,18 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 			}
 		}
 	}()
+
+	if fh.inode.fs.flags.ExternalCacheClient != nil && fh.inode.userMetadata == nil {
+		fh.inode.mu.Lock()
+		cloud, path := fh.inode.cloud()
+		head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
+		if err != nil {
+			log.Errorf("Error getting head blob: %v", err)
+		}
+
+		fh.inode.setMetadata(head.Metadata)
+		fh.inode.mu.Unlock()
+	}
 
 	// Lock inode
 	fh.inode.mu.Lock()
