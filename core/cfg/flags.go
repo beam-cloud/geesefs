@@ -1075,7 +1075,7 @@ func DefaultFlags() *FlagStorage {
 		SmallReadCutoffKB:   128,
 		ReadAheadSmallKB:    128,
 		LargeReadCutoffKB:   20 * 1024,
-		ReadAheadLargeKB:    128 * 1024,
+		ReadAheadLargeKB:    100 * 1024,
 		ReadAheadParallelKB: 20 * 1024,
 		ReadMergeKB:         512,
 		SinglePartMB:        5,
