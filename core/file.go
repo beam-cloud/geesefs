@@ -273,9 +273,14 @@ func (inode *Inode) loadFromDisk(diskRanges []Range) (allocated int64, err error
 func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash string) (allocated int64, totalDone uint64, err error) {
 	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size))
 	if err == nil && buf != nil {
+		log.Infof("Loaded from external cache: %v", string(buf))
+		log.Infof("hash: %v", hash)
+		log.Infof("offset: %v", offset)
+		log.Infof("size: %v", size)
 		totalDone = uint64(len(buf))
 	}
 	if err != nil {
+		log.Errorf("Error loading from external cache: %v", err)
 		return 0, 0, err
 	}
 
@@ -382,7 +387,21 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	allocated := int64(0)
 	curOffset, curSize := offset, size
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
-		alloc, done, err := inode.sendRead(cloud, key, curOffset, curSize)
+		hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
+		log.Infof("hash during read: %v", string(hash))
+
+		var alloc int64
+		var done uint64
+		var err error
+
+		if inode.fs.flags.ExternalCacheClient != nil && hashFound {
+			alloc, done, err = inode.loadFromExternalCache(curOffset, curSize, string(hash))
+			if err != nil {
+				alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
+			}
+		} else {
+			alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
+		}
 		if err != nil && shouldRetry(err) {
 			s3Log.Warnf("Error reading %v +%v of %v (attempt %v): %v", curOffset, curSize, key, attempt, err)
 		}
