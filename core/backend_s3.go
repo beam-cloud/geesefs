@@ -16,13 +16,9 @@
 package core
 
 import (
-	"crypto/sha256"
-	"io"
-
 	"github.com/yandex-cloud/geesefs/core/cfg"
 	"golang.org/x/sync/errgroup"
 
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -974,31 +970,6 @@ func getDate(resp *http.Response) *time.Time {
 			resp.Request.URL.Path, date)
 	}
 	return nil
-}
-
-func (s *S3Backend) computeHash(body io.ReadSeeker) (string, error) {
-	hasher := sha256.New()
-	const bufferSize = 4096
-	buffer := make([]byte, bufferSize)
-
-	for {
-		n, err := body.Read(buffer)
-		if n > 0 {
-			_, writeErr := hasher.Write(buffer[:n])
-			if writeErr != nil {
-				return "", writeErr
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", err
-		}
-	}
-
-	hash := hex.EncodeToString(hasher.Sum(nil))
-	return hash, nil
 }
 
 func (s *S3Backend) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
