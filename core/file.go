@@ -293,7 +293,6 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 // Must be called with inode.mu taken
 // Loaded range should be guarded against eviction by adding it into inode.readRanges
 func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreMemoryLimit bool) (miss bool, err error) {
-
 	if offset >= inode.Attributes.Size {
 		return
 	}
@@ -383,21 +382,21 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	allocated := int64(0)
 	curOffset, curSize := offset, size
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
-		hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
-		log.Infof("hash during read: %v", hash)
+		hash, _ := inode.userMetadata[inode.fs.flags.HashAttr]
+		log.Infof("hash during read: %v", string(hash))
 
 		var alloc int64
 		var done uint64
 		var err error
 
-		if inode.fs.flags.ExternalCacheClient != nil && hashFound {
-			alloc, done, err = inode.loadFromExternalCache(curOffset, curSize, string(hash))
-			if err != nil {
-				alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
-			}
-		} else {
-			alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
-		}
+		// if inode.fs.flags.ExternalCacheClient != nil && hashFound {
+		// 	alloc, done, err = inode.loadFromExternalCache(curOffset, curSize, string(hash))
+		// 	if err != nil {
+		// 		alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
+		// 	}
+		// } else {
+		alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
+		// }
 
 		if err != nil && shouldRetry(err) {
 			s3Log.Warnf("Error reading %v +%v of %v (attempt %v): %v", curOffset, curSize, key, attempt, err)
@@ -604,14 +603,6 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 	// Guard buffers against eviction
 	fh.inode.LockRange(offset, size, false)
 	defer fh.inode.UnlockRange(offset, size, false)
-
-	// Try to read from cache
-	hash, ok := fh.inode.userMetadata[fh.inode.fs.flags.HashAttr]
-	if ok && fh.inode.fs.flags.ExternalCacheClient != nil {
-		log.Infof("Hash of file '%s': %s, trying to use cache client", fh.inode.FullName(), string(hash))
-		// LUKE: since we have the hash of the file, we can try loading this specific part of the file
-		// from the cache client
-	}
 
 	// Check if anything requires to be loaded from the server
 	ra := fh.getReadAhead()
