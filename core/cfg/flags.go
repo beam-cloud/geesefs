@@ -568,7 +568,7 @@ MISC OPTIONS:
 
 		cli.StringFlag{
 			Name:  "hash-attr",
-			Value: "--content-sha1",
+			Value: "--content-sha256",
 			Usage: "Hash attribute name",
 		},
 
@@ -1085,7 +1085,7 @@ func DefaultFlags() *FlagStorage {
 		FileModeAttr:        "mode",
 		RdevAttr:            "rdev",
 		MtimeAttr:           "mtime",
-		HashAttr:            "--content-sha1",
+		HashAttr:            "--content-sha256",
 		SymlinkAttr:         "--symlink-target",
 		SymlinkZeroed:       false,
 		RefreshAttr:         ".invalidate",

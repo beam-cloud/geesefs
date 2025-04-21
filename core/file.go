@@ -1565,11 +1565,11 @@ func (inode *Inode) flushSmallObject() {
 			}
 		}
 
-		// // Compute hash of file and store it in user metadata
-		// err = inode.finalizeAndHash()
-		// if err != nil {
-		// 	log.Warnf("Failed to finalize and hash object %v: %v", key, err)
-		// }
+		// Compute hash of file and store it in user metadata
+		err = inode.finalizeAndHash()
+		if err != nil {
+			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
+		}
 	}
 
 	inode.UnlockRange(0, sz, true)
@@ -1825,11 +1825,11 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 	} else {
 		log.Debugf("Finalized multi-part upload of object %v: etag=%v, size=%v", key, NilStr(resp.ETag), finalSize)
 
-		// // Compute hash of file and store it in user metadata
-		// err := inode.finalizeAndHash()
-		// if err != nil {
-		// 	log.Warnf("Failed to finalize and hash object %v: %v", key, err)
-		// }
+		// Compute hash of file and store it in user metadata
+		err := inode.finalizeAndHash()
+		if err != nil {
+			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
+		}
 
 		if inode.userMetadataDirty == 1 {
 			inode.userMetadataDirty = 0
