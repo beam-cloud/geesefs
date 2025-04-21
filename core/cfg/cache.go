@@ -1,4 +1,4 @@
-package core
+package cfg
 
 type ContentCache interface {
 	GetContent(hash string, offset int64, length int64) ([]byte, error)

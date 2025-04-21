@@ -212,6 +212,7 @@ func NewGoofys(ctx context.Context, bucketName string, flags *cfg.FlagStorage) (
 	if flags.DebugS3 {
 		cfg.SetCloudLogLevel(logrus.DebugLevel)
 	}
+
 	if flags.Backend == nil {
 		if spec, err := ParseBucketSpec(bucketName); err == nil {
 			switch spec.Scheme {

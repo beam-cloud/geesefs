@@ -1483,6 +1483,10 @@ func (inode *Inode) flushSmallObject() {
 		}
 	}
 
+	if inode.fs.flags.ExternalCacheClient != nil {
+		log.Infof("Storing content of file %v in external cache", inode.FullName())
+	}
+
 	// Key may have been changed in between (if it was moved)
 	cloud, key := inode.cloud()
 	if inode.oldParent != nil {

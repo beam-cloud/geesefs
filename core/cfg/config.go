@@ -55,6 +55,9 @@ type FlagStorage struct {
 	Endpoint       string
 	Backend        interface{}
 
+	// External Caching
+	ExternalCacheClient ContentCache
+
 	// Tuning
 	MemoryLimit         uint64
 	UseEnomem           bool
