@@ -277,7 +277,6 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size))
 	if err == nil && buf != nil {
 		log.Infof("Loaded from external cache: %s", hash)
-		log.Infof("hash: %v", hash)
 		log.Infof("offset: %v", offset)
 		log.Infof("size: %v", size)
 		totalDone = uint64(len(buf))
@@ -288,8 +287,8 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 
 		if err == errContentNotFound {
 			sourcePath := inode.FullName()
-			// LUKE: enqueue the thing to be cached.
 			log.Infof("Storing content from source: %v", sourcePath)
+			inode.fs.CacheFileInExternalCache(inode)
 		}
 
 		return 0, 0, err
