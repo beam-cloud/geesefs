@@ -45,6 +45,8 @@ const IOV_MAX = 1024
 const READ_BUF_SIZE = 128 * 1024
 const MAX_FLUSH_PRIORITY = 3
 
+var errContentNotFound = errors.New("content not found")
+
 // NewFileHandle returns a new file handle for the given `inode`
 func NewFileHandle(inode *Inode) *FileHandle {
 	fh := &FileHandle{inode: inode}
@@ -270,8 +272,6 @@ func (inode *Inode) loadFromDisk(diskRanges []Range) (allocated int64, err error
 	}
 	return
 }
-
-var errContentNotFound = errors.New("content not found")
 
 func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash string) (allocated int64, totalDone uint64, err error) {
 	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
@@ -1594,13 +1594,12 @@ func (inode *Inode) flushSmallObject() {
 			}
 		}
 
-		if !inode.isDir() {
-			// Compute hash of file and store it in user metadata
-			err = inode.finalizeAndHash()
-			if err != nil {
-				log.Warnf("Failed to finalize and hash object %v: %v", key, err)
-			}
+		// Compute hash of file and store it in user metadata
+		err = inode.finalizeAndHash()
+		if err != nil {
+			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
 		}
+
 	}
 
 	inode.UnlockRange(0, sz, true)
@@ -1857,11 +1856,9 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 		log.Debugf("Finalized multi-part upload of object %v: etag=%v, size=%v", key, NilStr(resp.ETag), finalSize)
 
 		// Compute hash of file and store it in user metadata
-		if !inode.isDir() {
-			err := inode.finalizeAndHash()
-			if err != nil {
-				log.Warnf("Failed to finalize and hash object %v: %v", key, err)
-			}
+		err := inode.finalizeAndHash()
+		if err != nil {
+			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
 		}
 
 		if inode.userMetadataDirty == 1 {
@@ -1881,6 +1878,10 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 }
 
 func (inode *Inode) finalizeAndHash() error {
+	if inode.isDir() {
+		return nil
+	}
+
 	if inode.fs.flags.HashAttr == "" {
 		return nil
 	}
