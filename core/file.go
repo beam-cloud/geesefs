@@ -279,6 +279,7 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 		if err.Error() == errContentNotFound.Error() {
 			inode.fs.CacheFileInExternalCache(inode)
 		}
+
 		return 0, 0, err
 	}
 
@@ -387,20 +388,18 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	allocated := int64(0)
 	curOffset, curSize := offset, size
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
+		hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
+
 		var alloc int64 = 0
 		var done uint64 = 0
 		var err error = nil
 
-		// Try to load from external cache first, if possible
-		hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
-
-		shouldTryCache := inode.fs.flags.ExternalCacheClient != nil && hashFound
-		if shouldTryCache {
+		if inode.fs.flags.ExternalCacheClient != nil && hashFound {
 			alloc, done, err = inode.loadFromExternalCache(curOffset, curSize, string(hash))
-		}
-
-		// Otherwise, send read to object storage
-		if !shouldTryCache || err != nil {
+			if err != nil {
+				alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
+			}
+		} else {
 			alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
 		}
 
