@@ -425,6 +425,15 @@ func (fs *Goofys) processCacheEvents() {
 			}
 
 			if inode.Attributes.Size > 0 {
+				log.Infof("Storing content from source: %v", inode.FullName())
+				log.Infof("Known hash: %v", string(knownHash))
+				log.Infof("Bucket: %v", fs.bucket)
+				log.Infof("Region: %v", s3.Region)
+				log.Infof("Endpoint: %v", flags.Endpoint)
+				log.Infof("Access key: %v", s3.AccessKey)
+				log.Infof("Secret key: %v", s3.SecretKey)
+				log.Infof("Routing key: %v", string(knownHash))
+
 				hash, err := fs.flags.ExternalCacheClient.StoreContentFromS3(struct {
 					Path        string
 					BucketName  string
