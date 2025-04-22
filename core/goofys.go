@@ -456,7 +456,11 @@ func (fs *Goofys) processCacheEvents() {
 }
 
 func (fs *Goofys) CacheFileInExternalCache(inode *Inode) {
-	hash := inode.userMetadata[fs.flags.HashAttr]
+	hash, ok := inode.userMetadata[fs.flags.HashAttr]
+	if !ok {
+		log.Errorf("No hash found for inode, not caching inode in external cache: %v", inode.FullName())
+		return
+	}
 
 	// Check and update caching status
 	fs.cachingStatusMu.Lock()
