@@ -439,7 +439,7 @@ func (fs *Goofys) processCacheEvents() {
 					EndpointURL: flags.Endpoint,
 					AccessKey:   s3.AccessKey,
 					SecretKey:   s3.SecretKey,
-				})
+				}, struct{ RoutingKey string }{RoutingKey: string(knownHash)})
 				if err != nil {
 					log.Warnf("Failed to store content from source: %v", err)
 				} else if hash != string(knownHash) {

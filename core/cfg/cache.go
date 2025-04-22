@@ -1,8 +1,8 @@
 package cfg
 
 type ContentCache interface {
-	GetContent(hash string, offset int64, length int64) ([]byte, error)
-	StoreContent(chunks chan []byte, hash string) (string, error)
+	GetContent(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]byte, error)
+	StoreContent(chunks chan []byte, hash string, opts struct{ RoutingKey string }) (string, error)
 	StoreContentFromSource(source struct {
 		Path        string
 		BucketName  string
@@ -10,7 +10,7 @@ type ContentCache interface {
 		EndpointURL string
 		AccessKey   string
 		SecretKey   string
-	}) (string, error)
+	}, opts struct{ RoutingKey string }) (string, error)
 	StoreContentFromSourceWithLock(source struct {
 		Path        string
 		BucketName  string
@@ -18,5 +18,5 @@ type ContentCache interface {
 		EndpointURL string
 		AccessKey   string
 		SecretKey   string
-	}) (string, error)
+	}, opts struct{ RoutingKey string }) (string, error)
 }
