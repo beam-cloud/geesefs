@@ -6,15 +6,13 @@ option go_package = "github.com/yandex-cloud/geesefs/core/pb";
 
 service FsGrpc {
   // stealing
-  rpc TryStealInodeOwnership(TryStealInodeOwnershipRequest)
-      returns (TryStealInodeOwnershipResponse);
+  rpc TryStealInodeOwnership(TryStealInodeOwnershipRequest) returns (TryStealInodeOwnershipResponse);
 
   // file
   rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
   rpc Unlink(UnlinkRequest) returns (UnlinkResponse);
   rpc OpenFile(OpenFileRequest) returns (OpenFileResponse);
-  rpc ReleaseFileHandle(ReleaseFileHandleRequest)
-      returns (ReleaseFileHandleResponse);
+  rpc ReleaseFileHandle(ReleaseFileHandleRequest) returns (ReleaseFileHandleResponse);
   rpc ReadFile(ReadFileRequest) returns (ReadFileResponse);
   rpc WriteFile(WriteFileRequest) returns (WriteFileResponse);
 
@@ -26,18 +24,15 @@ service FsGrpc {
   rpc MkDir(MkDirRequest) returns (MkDirResponse);
   rpc RmDir(RmDirRequest) returns (RmDirResponse);
   rpc OpenDir(OpenDirRequest) returns (OpenDirResponse);
-  rpc ReleaseDirHandle(ReleaseDirHandleRequest)
-      returns (ReleaseDirHandleResponse);
+  rpc ReleaseDirHandle(ReleaseDirHandleRequest) returns (ReleaseDirHandleResponse);
   rpc ReadDir(ReadDirRequest) returns (ReadDirResponse);
   rpc LookUpInode(LookUpInodeRequest) returns (LookUpInodeResponse);
   rpc LookUpInode2(LookUpInode2Request) returns (LookUpInode2Response);
 
   // both
-  rpc GetInodeAttributes(GetInodeAttributesRequest)
-      returns (GetInodeAttributesResponse);
-  rpc SetInodeAttributes(SetInodeAttributesRequest)
-      returns (SetInodeAttributesResponse);
-
+  rpc GetInodeAttributes(GetInodeAttributesRequest) returns (GetInodeAttributesResponse);
+  rpc SetInodeAttributes(SetInodeAttributesRequest) returns (SetInodeAttributesResponse);
+  
   rpc ForgetInode(ForgetInodeRequest) returns (ForgetInodeResponse);
   rpc ForgetInode2(ForgetInode2Request) returns (ForgetInode2Response);
 }
@@ -85,9 +80,13 @@ message JoinClusterResponse {
   repeated Peer peers = 2;
 }
 
-message AreYouInodeOwnerRequest { uint64 inodeId = 1; }
+message AreYouInodeOwnerRequest {
+  uint64 inodeId = 1;
+}
 
-message AreYouInodeOwnerResponse { bool yes = 1; }
+message AreYouInodeOwnerResponse {
+  bool yes = 1;
+}
 
 message TryStealInodeOwnershipRequest {
   uint64 inodeId = 1;
@@ -100,10 +99,10 @@ message TryStealInodeOwnershipResponse {
 }
 
 message CreateFileRequest {
-  uint64 parent = 2;
-  string name = 3;
-  uint32 mode = 4;
-  uint64 nodeId = 5;
+    uint64 parent = 2;
+    string name = 3;
+    uint32 mode = 4;
+    uint64 nodeId = 5;
 }
 
 message CreateFileResponse {
@@ -133,7 +132,9 @@ message UnlinkResponse {
   uint64 errno = 3;
 }
 
-message OpenFileRequest { uint64 inodeId = 1; }
+message OpenFileRequest {
+  uint64 inodeId = 1;
+}
 
 message OpenFileResponse {
   optional Owner AnotherOwner = 1;
@@ -143,9 +144,13 @@ message OpenFileResponse {
   uint64 errno = 3;
 }
 
-message ReleaseFileHandleRequest { uint64 handleId = 1; }
+message ReleaseFileHandleRequest {
+  uint64 handleId = 1;
+}
 
-message ReleaseFileHandleResponse { optional Owner AnotherOwner = 1; }
+message ReleaseFileHandleResponse {
+  optional Owner AnotherOwner = 1;
+}
 
 message ReadFileRequest {
   uint64 handleId = 1;
@@ -193,7 +198,9 @@ message CreateSymlinkResponse {
   Attributes attr = 4;
 }
 
-message ReadSymlinkRequest { uint64 inode = 1; }
+message ReadSymlinkRequest {
+  uint64 inode = 1;
+}
 
 message ReadSymlinkResponse {
   optional Owner AnotherOwner = 1;
@@ -230,7 +237,9 @@ message RmDirResponse {
   uint64 errno = 2;
 }
 
-message OpenDirRequest { uint64 inodeId = 1; }
+message OpenDirRequest {
+  uint64 inodeId = 1;
+}
 
 message OpenDirResponse {
   optional Owner AnotherOwner = 1;
@@ -240,9 +249,13 @@ message OpenDirResponse {
   uint64 errno = 3;
 }
 
-message ReleaseDirHandleRequest { uint64 handleId = 1; }
+message ReleaseDirHandleRequest {
+  uint64 handleId = 1;
+}
 
-message ReleaseDirHandleResponse { optional Owner AnotherOwner = 1; }
+message ReleaseDirHandleResponse {
+  optional Owner AnotherOwner = 1;
+}
 
 message ReadDirRequest {
   uint64 callerId = 1;
@@ -289,7 +302,9 @@ message LookUpInode2Response {
   Attributes attr = 2;
 }
 
-message GetInodeAttributesRequest { uint64 inodeId = 1; }
+message GetInodeAttributesRequest {
+  uint64 inodeId = 1;
+}
 
 message GetInodeAttributesResponse {
   optional Owner AnotherOwner = 1;
@@ -324,6 +339,9 @@ message ForgetInodeResponse {
   bool forget = 2;
 }
 
-message ForgetInode2Request { uint64 inodeId = 1; }
+message ForgetInode2Request {
+  uint64 inodeId = 1;
+}
 
-message ForgetInode2Response {}
+message ForgetInode2Response {
+}

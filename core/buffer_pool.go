@@ -16,14 +16,13 @@
 package core
 
 import (
+	"github.com/shirou/gopsutil/mem"
+	"github.com/yandex-cloud/geesefs/core/cfg"
 	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
-
-	"github.com/shirou/gopsutil/mem"
-	"github.com/yandex-cloud/geesefs/core/cfg"
 )
 
 var bufferLog = cfg.GetLogger("buffer")

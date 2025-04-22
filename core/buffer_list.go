@@ -587,7 +587,6 @@ func (l *BufferList) AddLoadingFromDisk(offset, size uint64) (readRanges []Range
 		if b.offset >= endOffset {
 			return
 		}
-
 		if b.data == nil && b.onDisk && !b.loading {
 			if b.offset < offset {
 				_, b = l.split(b, offset)
