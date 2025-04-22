@@ -593,7 +593,7 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 		}
 	}()
 
-	if fh.inode.fs.flags.ExternalCacheClient != nil && fh.inode.userMetadata == nil {
+	if fh.inode.fs.flags.ExternalCacheClient != nil && fh.inode.userMetadata == nil && !fh.inode.isDir() {
 		fh.inode.mu.Lock()
 		cloud, path := fh.inode.cloud()
 		head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
@@ -1594,10 +1594,12 @@ func (inode *Inode) flushSmallObject() {
 			}
 		}
 
-		// Compute hash of file and store it in user metadata
-		err = inode.finalizeAndHash()
-		if err != nil {
-			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
+		if !inode.isDir() {
+			// Compute hash of file and store it in user metadata
+			err = inode.finalizeAndHash()
+			if err != nil {
+				log.Warnf("Failed to finalize and hash object %v: %v", key, err)
+			}
 		}
 	}
 
@@ -1855,9 +1857,11 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 		log.Debugf("Finalized multi-part upload of object %v: etag=%v, size=%v", key, NilStr(resp.ETag), finalSize)
 
 		// Compute hash of file and store it in user metadata
-		err := inode.finalizeAndHash()
-		if err != nil {
-			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
+		if !inode.isDir() {
+			err := inode.finalizeAndHash()
+			if err != nil {
+				log.Warnf("Failed to finalize and hash object %v: %v", key, err)
+			}
 		}
 
 		if inode.userMetadataDirty == 1 {
