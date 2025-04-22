@@ -280,16 +280,18 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 		log.Infof("hash: %v", hash)
 		log.Infof("offset: %v", offset)
 		log.Infof("size: %v", size)
-
 		totalDone = uint64(len(buf))
 	}
 
 	if err != nil {
+		log.Infof("error during cache read: %v", err)
+
 		if err == errContentNotFound {
 			sourcePath := inode.FullName()
-			// _, err := inode.fs.flags.ExternalCacheClient.StoreContentFromSourceWithLock(sourcePath, "")
+			// LUKE: enqueue the thing to be cached.
 			log.Infof("Storing content from source: %v", sourcePath)
 		}
+
 		return 0, 0, err
 	}
 
@@ -397,7 +399,6 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	curOffset, curSize := offset, size
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
 		hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
-		log.Infof("hash during read: %v", string(hash))
 
 		var alloc int64
 		var done uint64
