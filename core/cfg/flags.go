@@ -569,7 +569,9 @@ MISC OPTIONS:
 		cli.StringFlag{
 			Name:  "hash-attr",
 			Value: "--content-sha256",
-			Usage: "Hash attribute name",
+			Usage: "Hash metadata attribute name." +
+				" If this attribute is present, the hash will be computed on the client side and pushed to user metadata." +
+				" It can then be retrieved with HEAD requests.",
 		},
 
 		cli.BoolFlag{
