@@ -283,14 +283,9 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 	}
 
 	if err != nil {
-		log.Infof("error during cache read: %v", err)
-
 		if err.Error() == errContentNotFound.Error() {
-			sourcePath := inode.FullName()
-			log.Infof("Storing content from source: %v", sourcePath)
 			inode.fs.CacheFileInExternalCache(inode)
 		}
-
 		return 0, 0, err
 	}
 
