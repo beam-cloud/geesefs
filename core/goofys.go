@@ -407,7 +407,7 @@ func (fs *Goofys) processCacheEvents() {
 		case <-fs.shutdownCh:
 			return
 		case cacheEvent := <-fs.cacheEventChan:
-			log.Infof("Processing cache event for inode: %v", cacheEvent.inode.FullName())
+			log.Debugf("Processing cache event for inode: %v", cacheEvent.inode.FullName())
 
 			inode := cacheEvent.inode
 			flags := inode.fs.flags
@@ -444,15 +444,14 @@ func (fs *Goofys) processCacheEvents() {
 					Lock       bool
 				}{RoutingKey: string(knownHash), Lock: true})
 				if err != nil {
-					log.Warnf("Failed to store content from source: %v", err)
+					log.Debugf("Failed to store content from source: %v", err)
 				} else if hash != string(knownHash) {
-					log.Errorf("Hash mismatch for inode: %v", inode.FullName())
+					log.Debugf("Hash mismatch for inode: %v", inode.FullName())
 					continue
 				}
 
 				fs.clearCachingStatus(inode.FullName())
-
-				log.Infof("Successfully cached inode: %v", inode.FullName())
+				log.Debugf("Successfully cached inode: %v", inode.FullName())
 			}
 		}
 	}

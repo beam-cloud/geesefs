@@ -1902,6 +1902,8 @@ func (inode *Inode) finalizeAndHash() error {
 	inode.userMetadata[inode.fs.flags.HashAttr] = []byte(hash)
 	inode.sendUpdateMeta()
 
+	inode.fs.CacheFileInExternalCache(inode)
+
 	return nil
 }
 
