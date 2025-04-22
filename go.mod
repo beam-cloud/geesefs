@@ -19,6 +19,7 @@ require (
 	github.com/jacobsa/fuse v0.0.0-20230810134708-ab21db1af836
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0
 	github.com/mitchellh/go-homedir v1.1.0
+	github.com/moby/sys/mountinfo v0.7.2
 	github.com/pkg/xattr v0.4.9
 	github.com/satori/go.uuid v1.2.1-0.20181028125025-b2ce2384e17b
 	github.com/sevlyar/go-daemon v0.1.6
