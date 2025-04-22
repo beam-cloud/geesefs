@@ -76,6 +76,7 @@ type FlagStorage struct {
 	ReadRetryMax        time.Duration
 	ReadRetryAttempts   int
 	RetryInterval       time.Duration
+	FuseReadAheadKB     uint64
 	ReadAheadKB         uint64
 	SmallReadCount      uint64
 	SmallReadCutoffKB   uint64

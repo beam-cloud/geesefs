@@ -931,8 +931,6 @@ func MountFuse(
 	return
 }
 
-const readAheadKB = 32768
-
 func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 	// Mount the file system.
 	mountCfg := &fuse.MountConfig{
@@ -960,10 +958,13 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 		return
 	}
 
-	err = updateReadAheadKB(fs.flags.MountPoint, readAheadKB)
-	if err != nil {
-		log.Warnf("Failed to update read_ahead_kb: %v", err)
-		err = nil
+	// Update read_ahead_kb on the mount point if set
+	if fs.flags.FuseReadAheadKB > 0 {
+		err = updateReadAheadKB(fs.flags.MountPoint, int(fs.flags.FuseReadAheadKB))
+		if err != nil {
+			log.Warnf("Failed to update read_ahead_kb: %v", err)
+			err = nil
+		}
 	}
 
 	mfs = &FuseMfsWrapper{
