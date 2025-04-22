@@ -425,7 +425,7 @@ func (fs *Goofys) processCacheEvents() {
 			}
 
 			if inode.Attributes.Size > 0 {
-				hash, err := fs.flags.ExternalCacheClient.StoreContentFromSource(struct {
+				hash, err := fs.flags.ExternalCacheClient.StoreContentFromS3(struct {
 					Path        string
 					BucketName  string
 					Region      string
@@ -439,7 +439,10 @@ func (fs *Goofys) processCacheEvents() {
 					EndpointURL: flags.Endpoint,
 					AccessKey:   s3.AccessKey,
 					SecretKey:   s3.SecretKey,
-				}, struct{ RoutingKey string }{RoutingKey: string(knownHash)})
+				}, struct {
+					RoutingKey string
+					Lock       bool
+				}{RoutingKey: string(knownHash), Lock: true})
 				if err != nil {
 					log.Warnf("Failed to store content from source: %v", err)
 				} else if hash != string(knownHash) {
