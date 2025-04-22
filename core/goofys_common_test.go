@@ -46,9 +46,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"runtime/debug"
-
 	. "gopkg.in/check.v1"
+	"runtime/debug"
 )
 
 // so I don't get complains about unused imports
