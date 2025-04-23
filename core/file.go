@@ -580,7 +580,7 @@ func (fh *FileHandle) getReadAhead() uint64 {
 
 // shouldRetrieveHash returns true if we should retrieve the hash of the file
 // from the server -- this costs an extra HEAD request, so we only do it for
-// large files or if the hash is not already present in user metadata.
+// large files where the hash is not already present in user metadata.
 func (fh *FileHandle) shouldRetrieveHash() bool {
 	if fh.inode.userMetadata != nil {
 		return false
