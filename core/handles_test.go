@@ -129,7 +129,7 @@ func TestHashFlushedPart_KnownHash(t *testing.T) {
 		t.Errorf("sha256 in-order: hash mismatch: got %x, want %x", gotSHA256, expectedSHA256)
 	}
 
-	// Out-of-order SHA-1 test
+	// Out-of-order SHA-256 test
 	inode = &Inode{
 		Attributes: InodeAttributes{Size: fileSize},
 		buffers:    newPatternBufferList(),
