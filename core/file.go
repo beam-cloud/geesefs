@@ -753,7 +753,6 @@ func (inode *Inode) TryFlush(priority int) bool {
 }
 
 func (inode *Inode) sendUpload(priority int) bool {
-	smallFile := inode.Attributes.Size <= inode.fs.flags.SinglePartMB*1024*1024
 
 	if inode.oldParent != nil && inode.IsFlushing == 0 && inode.mpu == nil {
 		// Rename file
@@ -776,6 +775,7 @@ func (inode *Inode) sendUpload(priority int) bool {
 		return false
 	}
 
+	smallFile := inode.Attributes.Size <= inode.fs.flags.SinglePartMB*1024*1024
 	canPatch := inode.fs.flags.UsePatch &&
 		// Can only patch modified inodes with completed MPUs.
 		inode.CacheState == ST_MODIFIED && inode.mpu == nil &&
