@@ -1926,7 +1926,7 @@ func (inode *Inode) finalizeAndHash() error {
 		}
 
 		hash := hex.EncodeToString(inode.hashInProgress.Sum(nil))
-		log.Infof("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
+		log.Debugf("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
 
 		if inode.userMetadata == nil {
 			inode.userMetadata = make(map[string][]byte)
