@@ -152,7 +152,7 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 		return nil
 	}
 
-	stagingPath := fh.inode.FullName()
+	stagingPath := filepath.Join(fh.inode.fs.flags.StagedWritePath, fh.inode.FullName())
 	parentDir := filepath.Dir(stagingPath)
 	if err := os.MkdirAll(parentDir, fh.inode.fs.flags.DirMode); err != nil {
 		return err
