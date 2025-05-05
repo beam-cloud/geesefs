@@ -1788,6 +1788,7 @@ func (inode *Inode) flushPart(part uint64) {
 	inode.recordFlushError(err)
 	if err != nil {
 		log.Warnf("Failed to flush part %v of object %v: %v", part, key, err)
+
 		mappedErr := mapAwsError(err)
 		if mappedErr == syscall.ENOENT {
 			// Multipart upload is deleted
@@ -1887,6 +1888,7 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 		if inode.userMetadataDirty == 1 {
 			inode.userMetadataDirty = 0
 		}
+
 		inode.mpu = nil
 		inode.buffers.SetFlushedClean()
 		inode.updateFromFlush(finalSize, resp.ETag, resp.LastModified, resp.StorageClass)
@@ -1918,23 +1920,20 @@ func (inode *Inode) finalizeAndHash() error {
 		inode.hashLock.Lock()
 		defer inode.hashLock.Unlock()
 
-		if inode.hashOffset != inode.Attributes.Size {
-			return fmt.Errorf("not all parts have been hashed: hashed %d, expected %d", inode.hashOffset, inode.Attributes.Size)
+		hash, err := inode.waitForHashToComplete(inode.Attributes.Size)
+		if err != nil {
+			return err
 		}
 
-		hash := hex.EncodeToString(inode.hashInProgress.Sum(nil))
-		log.Debugf("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
+		log.Infof("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
 
 		if inode.userMetadata == nil {
 			inode.userMetadata = make(map[string][]byte)
 		}
+
 		inode.userMetadata[inode.fs.flags.HashAttr] = []byte(hash)
 		inode.sendUpdateMeta()
-		inode.fs.CacheFileInExternalCache(inode)
 
-		// Clean up
-		inode.hashInProgress = nil
-		inode.pendingHashParts = nil
 		return nil
 	}
 
@@ -1958,8 +1957,6 @@ func (inode *Inode) finalizeAndHash() error {
 
 	inode.userMetadata[inode.fs.flags.HashAttr] = []byte(hash)
 	inode.sendUpdateMeta()
-
-	inode.fs.CacheFileInExternalCache(inode)
 
 	return nil
 }

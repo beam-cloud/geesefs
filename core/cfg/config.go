@@ -178,6 +178,8 @@ var defaultHTTPTransport = http.Transport{
 	ExpectContinueTimeout: 10 * time.Second,
 }
 
+var DefaultHashTimeout = 60 * time.Second
+
 func GetHTTPTransport() *http.Transport {
 	return &defaultHTTPTransport
 }

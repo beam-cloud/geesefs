@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash"
@@ -1036,6 +1037,31 @@ func (inode *Inode) DumpThis(withBuffers bool) (children []*Inode) {
 	return children
 }
 
+func (inode *Inode) waitForHashToComplete(size uint64) (string, error) {
+	timeout := time.After(cfg.DefaultHashTimeout)
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Clean up
+	defer func() {
+		inode.hashInProgress = nil
+		inode.pendingHashParts = nil
+	}()
+
+	for {
+		select {
+		case <-timeout:
+			return "", fmt.Errorf("timeout waiting for hash to complete")
+		case <-ticker.C:
+			if inode.hashOffset == size && len(inode.pendingHashParts) == 0 {
+				hash := hex.EncodeToString(inode.hashInProgress.Sum(nil))
+				return hash, nil
+			}
+		}
+	}
+}
+
 func (inode *Inode) hashFlushedPart(partOffset, partSize uint64) error {
 	bufReader, _, err := inode.getMultiReader(partOffset, partSize)
 	if err != nil {
@@ -1071,5 +1097,6 @@ func (inode *Inode) hashFlushedPart(partOffset, partSize uint64) error {
 		// out of order, buffer part until the next caller aligns with this offset
 		inode.pendingHashParts[partOffset] = data
 	}
+
 	return nil
 }
