@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -139,6 +140,33 @@ func (inode *Inode) checkPauseWriters() {
 	}
 }
 
+func (fh *FileHandle) getOrCreateStagingFile() (err error) {
+	if fh.stagingFileHandle != nil {
+		return nil
+	}
+
+	fh.stagingFileLock.Lock()
+	defer fh.stagingFileLock.Unlock()
+
+	if fh.stagingFileHandle != nil {
+		return nil
+	}
+
+	stagingPath := fh.inode.FullName()
+	parentDir := filepath.Dir(stagingPath)
+	if err := os.MkdirAll(parentDir, fh.inode.fs.flags.DirMode); err != nil {
+		return err
+	}
+
+	stagingFile, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE, fh.inode.fs.flags.FileMode)
+	if err != nil {
+		return err
+	}
+
+	fh.stagingFileHandle = stagingFile
+	return nil
+}
+
 func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 	fh.inode.logFuse("WriteFileStaging", offset, len(data))
 
@@ -174,15 +202,9 @@ func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 		fh.inode.SetCacheState(ST_MODIFIED)
 	}
 
-	if fh.stagingFileHandle == nil {
-		fh.stagingFileLock.Lock()
-		stagingFile, err := os.OpenFile(fh.inode.FullName(), os.O_WRONLY|os.O_CREATE, 0644)
-		if err != nil {
-			log.Warnf("Failed to open staging file: %v", err)
-			return err
-		}
-		fh.stagingFileHandle = stagingFile
-		fh.stagingFileLock.Unlock()
+	err = fh.getOrCreateStagingFile()
+	if err != nil {
+		return err
 	}
 
 	_, err = fh.stagingFileHandle.WriteAt(data, offset)
