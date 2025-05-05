@@ -38,6 +38,9 @@ type FileHandle struct {
 	lastReadTotal uint64
 	lastReadSizes []uint64
 	lastReadIdx   int
+
+	stagingFileLock   *sync.Mutex
+	stagingFileHandle *os.File
 }
 
 // On Linux and MacOS, IOV_MAX = 1024
@@ -49,7 +52,7 @@ var errContentNotFound = errors.New("content not found")
 
 // NewFileHandle returns a new file handle for the given `inode`
 func NewFileHandle(inode *Inode) *FileHandle {
-	fh := &FileHandle{inode: inode}
+	fh := &FileHandle{inode: inode, stagingFileLock: &sync.Mutex{}, stagingFileHandle: nil}
 	if inode.fs.flags.SmallReadCount > 1 {
 		fh.lastReadSizes = make([]uint64, inode.fs.flags.SmallReadCount-1)
 	}
@@ -139,6 +142,55 @@ func (inode *Inode) checkPauseWriters() {
 func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 	fh.inode.logFuse("WriteFileStaging", offset, len(data))
 
+	end := uint64(offset) + uint64(len(data))
+
+	if end > fh.inode.fs.getMaxFileSize() {
+		// File offset too large
+		log.Warnf(
+			"Maximum file size exceeded when writing %v bytes at offset %v to %v",
+			len(data), offset, fh.inode.FullName(),
+		)
+		return syscall.EFBIG
+	}
+
+	fh.inode.mu.Lock()
+
+	if fh.inode.CacheState == ST_DELETED || fh.inode.CacheState == ST_DEAD {
+		fh.inode.mu.Unlock()
+		return syscall.ENOENT
+	}
+
+	fh.inode.checkPauseWriters()
+
+	// TODO: do we need this?
+	if fh.inode.Attributes.Size < end {
+		// Extend and zero fill
+		// resize staging file
+		// fh.inode.ResizeUnlocked(end, false)
+	}
+
+	fh.inode.lastWriteEnd = end
+	if fh.inode.CacheState == ST_CACHED {
+		fh.inode.SetCacheState(ST_MODIFIED)
+	}
+
+	if fh.stagingFileHandle == nil {
+		fh.stagingFileLock.Lock()
+		stagingFile, err := os.OpenFile(fh.inode.FullName(), os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			log.Warnf("Failed to open staging file: %v", err)
+			return err
+		}
+		fh.stagingFileHandle = stagingFile
+		fh.stagingFileLock.Unlock()
+	}
+
+	_, err = fh.stagingFileHandle.WriteAt(data, offset)
+	if err != nil {
+		return err
+	}
+
+	fh.inode.mu.Unlock()
 	return
 }
 

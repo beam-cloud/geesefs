@@ -560,6 +560,8 @@ func (fs *GoofysFuse) CreateFile(
 	ctx context.Context,
 	op *fuseops.CreateFileOp) (err error) {
 
+	log.Infof("Called CreateFile: %s", op.Name)
+
 	atomic.AddInt64(&fs.stats.metadataWrites, 1)
 
 	parent := fs.getInodeOrDie(op.Parent)
@@ -967,10 +969,18 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 
 	// Update read_ahead_kb on the mount point if set
 	if fs.flags.FuseReadAheadKB > 0 {
-		err = updateFuseReadAheadKB(fs.flags.MountPoint, int(fs.flags.FuseReadAheadKB))
-		if err != nil {
+		if err := updateFuseReadAheadKB(fs.flags.MountPoint, int(fs.flags.FuseReadAheadKB)); err != nil {
 			log.Warnf("Failed to update read_ahead_kb: %v", err)
-			err = nil
+		}
+	}
+
+	// Create staging directory if enabled
+	// TODO: turn on goroutine to monitor staging directory and move files to the correct location after debounce period
+	if fs.flags.StagedWriteModeEnabled {
+		log.Infof("MountFuse: StagedWriteModeEnabled")
+		if err := os.MkdirAll(fs.flags.StagedWritePath, fs.flags.DirMode); err != nil {
+			log.Warnf("Failed to create staging directory: %v", err)
+			fs.flags.StagedWriteModeEnabled = false
 		}
 	}
 
