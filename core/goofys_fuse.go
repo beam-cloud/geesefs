@@ -738,6 +738,13 @@ func (fs *GoofysFuse) WriteFile(
 	}
 	fs.mu.RUnlock()
 
+	// Write through to staging directory if "staged write mode" is enabled
+	if fs.flags.StagedWriteModeEnabled {
+		log.Infof("WriteFile: StagedWriteModeEnabled")
+		err = fh.WriteFileStaging(op.Offset, op.Data)
+		return
+	}
+
 	// fuse binding leaves extra room for header, so we
 	// account for it when we decide whether to do "zero-copy" write
 	copyData := len(op.Data) < cap(op.Data)-4096

@@ -1112,6 +1112,9 @@ func DefaultFlags() *FlagStorage {
 			{PartSize: 25 * 1024 * 1024, PartCount: 1000},
 			{PartSize: 125 * 1024 * 1024, PartCount: 8000},
 		},
-		ExternalCacheClient: nil,
+		ExternalCacheClient:    nil,
+		StagedWriteModeEnabled: false,
+		StagedWritePath:        "",
+		StagedWriteDebounce:    30 * time.Second,
 	}
 }

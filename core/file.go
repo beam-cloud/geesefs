@@ -136,6 +136,12 @@ func (inode *Inode) checkPauseWriters() {
 	}
 }
 
+func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
+	fh.inode.logFuse("WriteFileStaging", offset, len(data))
+
+	return
+}
+
 func (fh *FileHandle) WriteFile(offset int64, data []byte, copyData bool) (err error) {
 	fh.inode.logFuse("WriteFile", offset, len(data))
 
