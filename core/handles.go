@@ -114,18 +114,20 @@ type Inode struct {
 	lastWriteEnd uint64
 
 	// cached/buffered data
-	CacheState     int32
-	dirtyQueueId   uint64
-	buffers        BufferList
-	readRanges     []ReadRange
-	DiskFDQueueID  uint64
-	DiskCacheFD    *os.File
-	OnDisk         bool
-	forceFlush     bool
-	IsFlushing     int
-	flushError     error
-	flushErrorTime time.Time
-	readError      error
+	CacheState      int32
+	dirtyQueueId    uint64
+	buffers         BufferList
+	readRanges      []ReadRange
+	DiskFDQueueID   uint64
+	DiskCacheFD     *os.File
+	StagingFileFD   *os.File
+	stagingFileLock *sync.Mutex
+	OnDisk          bool
+	forceFlush      bool
+	IsFlushing      int
+	flushError      error
+	flushErrorTime  time.Time
+	readError       error
 	// renamed from: parent, name
 	oldParent *Inode
 	oldName   string
@@ -174,10 +176,12 @@ func NewInode(fs *Goofys, parent *Inode, name string) (inode *Inode) {
 			Gid:  fs.flags.Gid,
 			Mode: fs.flags.FileMode,
 		},
-		AttrTime:   time.Now(),
-		Parent:     parent,
-		s3Metadata: make(map[string][]byte),
-		refcnt:     0,
+		AttrTime:        time.Now(),
+		Parent:          parent,
+		s3Metadata:      make(map[string][]byte),
+		refcnt:          0,
+		stagingFileLock: &sync.Mutex{},
+		StagingFileFD:   nil,
 	}
 
 	inode.buffers.helpers = inode

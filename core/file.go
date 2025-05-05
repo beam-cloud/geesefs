@@ -39,9 +39,6 @@ type FileHandle struct {
 	lastReadTotal uint64
 	lastReadSizes []uint64
 	lastReadIdx   int
-
-	stagingFileLock   *sync.Mutex
-	stagingFileHandle *os.File
 }
 
 // On Linux and MacOS, IOV_MAX = 1024
@@ -53,7 +50,7 @@ var errContentNotFound = errors.New("content not found")
 
 // NewFileHandle returns a new file handle for the given `inode`
 func NewFileHandle(inode *Inode) *FileHandle {
-	fh := &FileHandle{inode: inode, stagingFileLock: &sync.Mutex{}, stagingFileHandle: nil}
+	fh := &FileHandle{inode: inode}
 	if inode.fs.flags.SmallReadCount > 1 {
 		fh.lastReadSizes = make([]uint64, inode.fs.flags.SmallReadCount-1)
 	}
@@ -141,14 +138,14 @@ func (inode *Inode) checkPauseWriters() {
 }
 
 func (fh *FileHandle) getOrCreateStagingFile() (err error) {
-	if fh.stagingFileHandle != nil {
+	if fh.inode.StagingFileFD != nil {
 		return nil
 	}
 
-	fh.stagingFileLock.Lock()
-	defer fh.stagingFileLock.Unlock()
+	fh.inode.stagingFileLock.Lock()
+	defer fh.inode.stagingFileLock.Unlock()
 
-	if fh.stagingFileHandle != nil {
+	if fh.inode.StagingFileFD != nil {
 		return nil
 	}
 
@@ -158,12 +155,12 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 		return err
 	}
 
-	stagingFile, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE, fh.inode.fs.flags.FileMode)
+	stagingFD, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE, fh.inode.fs.flags.FileMode)
 	if err != nil {
 		return err
 	}
 
-	fh.stagingFileHandle = stagingFile
+	fh.inode.StagingFileFD = stagingFD
 	return nil
 }
 
@@ -182,11 +179,11 @@ func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 	}
 
 	fh.inode.mu.Lock()
-
 	if fh.inode.CacheState == ST_DELETED || fh.inode.CacheState == ST_DEAD {
 		fh.inode.mu.Unlock()
 		return syscall.ENOENT
 	}
+	defer fh.inode.mu.Unlock()
 
 	fh.inode.checkPauseWriters()
 
@@ -207,12 +204,11 @@ func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 		return err
 	}
 
-	_, err = fh.stagingFileHandle.WriteAt(data, offset)
+	_, err = fh.inode.StagingFileFD.WriteAt(data, offset)
 	if err != nil {
 		return err
 	}
 
-	fh.inode.mu.Unlock()
 	return
 }
 
@@ -263,6 +259,7 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte, copyData bool) (err e
 	if fh.inode.CacheState == ST_CACHED {
 		fh.inode.SetCacheState(ST_MODIFIED)
 	}
+
 	// FIXME: Don't activate the flusher immediately for small writes
 	fh.inode.fs.WakeupFlusher()
 	fh.inode.Attributes.Mtime = time.Now()
@@ -396,6 +393,23 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 		// One of the buffers is saved as a part and then removed
 		// We must complete multipart upload to be able to read it back
 		return true, syscall.ESPIPE
+	}
+
+	if inode.fs.flags.StagedWriteModeEnabled {
+		diskRanges := inode.buffers.AddLoadingFromDisk(offset, size)
+		if len(diskRanges) > 0 {
+			allocated, err := inode.loadFromDisk(diskRanges)
+
+			// Correct memory usage without the inode lock
+			inode.mu.Unlock()
+			inode.fs.bufferPool.Use(allocated, true)
+			inode.mu.Lock()
+
+			// Return on error
+			if err != nil {
+				return miss, err
+			}
+		}
 	}
 
 	if len(readRanges) > 0 {
