@@ -113,9 +113,13 @@ func (stagedFile *StagedFile) ReadyToFlush() bool {
 func (stagedFile *StagedFile) Cleanup() {
 	stagedFile.mu.Lock()
 	defer stagedFile.mu.Unlock()
+
 	stagedFile.flushing = false
 	stagedFile.shouldFlush = false
+
 	stagedFile.FD.Close()
+	stagedFile.FH.inode.UnlockRange(0, uint64(stagedFile.FH.inode.Attributes.Size), true)
+
 	os.RemoveAll(stagedFile.FH.inode.FullName())
 }
 

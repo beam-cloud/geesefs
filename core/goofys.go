@@ -839,7 +839,7 @@ func (fs *Goofys) StagedFileFlusher() {
 			fs.mu.RLock()
 			for _, inode := range fs.inodes {
 				if inode.StagedFile != nil && inode.StagedFile.ReadyToFlush() {
-					log.Infof("StagedFileFlusher, ready to flush: %s", inode.FullName())
+					log.Infof("StagedFileFlusher, queued to flush: %s", inode.FullName())
 					go fs.flushStagedFile(inode)
 				}
 			}
@@ -860,6 +860,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
 	offset := int64(0)
 
+	inode.LockRange(0, uint64(totalSize), true)
 	for offset < totalSize {
 		chunkSize := fs.flags.StagedWriteFlushSize
 		if totalSize-offset < int64(fs.flags.StagedWriteFlushSize) {
@@ -869,7 +870,6 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		buf := make([]byte, chunkSize)
 		n, err := stagedFile.FD.ReadAt(buf, offset)
 		if err != nil && err != io.EOF {
-			err = mapAwsError(err)
 			log.Errorf("Error reading from staged file: %v", err)
 			break
 		}
@@ -892,6 +892,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	}
 
 	stagedFile.shouldFlush = true
+	log.Infof("StagedFileFlusher, ready to flush: %s", inode.FullName())
 }
 
 func (fs *Goofys) MetaEvictor() {
