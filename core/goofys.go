@@ -763,7 +763,7 @@ func (fs *Goofys) Flusher() {
 				inode := fs.inodes[fuseops.InodeID(inodeID)]
 				fs.mu.RUnlock()
 				started := false
-				if inode != nil {
+				if inode != nil && inode.StagedFile != nil {
 					started = inode.TryFlush(priority)
 				}
 				curPriorityOk = curPriorityOk || started
@@ -836,7 +836,7 @@ func (fs *Goofys) StagedFileFlusher() {
 		case <-ticker.C:
 			fs.mu.RLock()
 			for _, inode := range fs.inodes {
-				if inode.StagingFileFD != nil {
+				if inode.StagedFile != nil {
 					log.Infof("StagedFileFlusher: %s", inode.FullName())
 				}
 			}

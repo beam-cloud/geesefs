@@ -138,14 +138,14 @@ func (inode *Inode) checkPauseWriters() {
 }
 
 func (fh *FileHandle) getOrCreateStagingFile() (err error) {
-	if fh.inode.StagingFileFD != nil {
+	if fh.inode.StagedFile != nil {
 		return nil
 	}
 
-	fh.inode.stagingFileLock.Lock()
-	defer fh.inode.stagingFileLock.Unlock()
+	fh.inode.mu.Lock()
+	defer fh.inode.mu.Unlock()
 
-	if fh.inode.StagingFileFD != nil {
+	if fh.inode.StagedFile != nil {
 		return nil
 	}
 
@@ -160,7 +160,9 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 		return err
 	}
 
-	fh.inode.StagingFileFD = stagingFD
+	fh.inode.StagedFile = &StagedFile{
+		FD: stagingFD,
+	}
 	return nil
 }
 
@@ -201,17 +203,18 @@ func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 		fh.inode.SetCacheState(ST_MODIFIED)
 	}
 
-	if fh.inode.StagingFileFD == nil {
+	if fh.inode.StagedFile == nil {
 		err = fh.getOrCreateStagingFile()
 		if err != nil {
 			return err
 		}
 	}
 
-	_, err = fh.inode.StagingFileFD.WriteAt(data, offset)
+	_, err = fh.inode.StagedFile.FD.WriteAt(data, offset)
 	if err != nil {
 		return err
 	}
+	fh.inode.StagedFile.lastWriteAt = time.Now()
 
 	return
 }
@@ -354,6 +357,22 @@ func (inode *Inode) loadFromDisk(diskRanges []Range) (allocated int64, err error
 	return
 }
 
+func (inode *Inode) loadFromStagedFile(diskRanges []Range) (allocated int64, err error) {
+	inode.StagedFile.mu.Lock()
+	defer inode.StagedFile.mu.Unlock()
+
+	inode.StagedFile.lastReadAt = time.Now()
+	for _, rr := range diskRanges {
+		readSize := rr.End - rr.Start
+		data := make([]byte, readSize)
+		_, err = inode.StagedFile.FD.ReadAt(data, int64(rr.Start))
+		if err == nil {
+			inode.buffers.ReviveFromStagedFile(rr.Start, data)
+		}
+	}
+	return
+}
+
 func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash string) (allocated int64, totalDone uint64, err error) {
 	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 	if err != nil || buf == nil {
@@ -399,10 +418,14 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 		return true, syscall.ESPIPE
 	}
 
-	if inode.fs.flags.StagedWriteModeEnabled {
-		diskRanges := inode.buffers.AddLoadingFromDisk(offset, size)
-		if len(diskRanges) > 0 {
-			allocated, err := inode.loadFromDisk(diskRanges)
+	// If staged write mode is enabled, try to load from the staged file
+	if inode.fs.flags.StagedWriteModeEnabled && inode.StagedFile != nil {
+		for _, rr := range readRanges {
+			inode.buffers.AddLoading(rr.Start, rr.End-rr.Start)
+		}
+
+		if len(readRanges) > 0 {
+			allocated, err := inode.loadFromStagedFile(readRanges)
 
 			// Correct memory usage without the inode lock
 			inode.mu.Unlock()
@@ -678,6 +701,10 @@ func (fh *FileHandle) getReadAhead() uint64 {
 // large files where the hash is not already present in user metadata.
 func (fh *FileHandle) shouldRetrieveHash() bool {
 	if fh.inode.userMetadata != nil {
+		return false
+	}
+
+	if fh.inode.StagedFile != nil {
 		return false
 	}
 
