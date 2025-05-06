@@ -192,6 +192,8 @@ func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 		// Extend and zero fill
 		// resize staging file
 		// fh.inode.ResizeUnlocked(end, false)
+
+		fh.inode.Attributes.Size = end
 	}
 
 	fh.inode.lastWriteEnd = end
