@@ -838,7 +838,7 @@ func (fs *Goofys) StagedFileFlusher() {
 		case <-ticker.C:
 			fs.mu.RLock()
 			for _, inode := range fs.inodes {
-				if inode.StagedFile != nil && time.Now().Sub(inode.StagedFile.lastWriteAt) > fs.flags.StagedWriteDebounce && !inode.StagedFile.flushing {
+				if inode.StagedFile != nil && inode.StagedFile.readyToFlush() {
 					log.Infof("StagedFileFlusher, ready to flush: %s", inode.FullName())
 					go fs.flushStagedFile(inode)
 				}

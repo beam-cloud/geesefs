@@ -160,6 +160,8 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 		lastWriteAt: time.Now(),
 		lastReadAt:  time.Now(),
 		shouldFlush: false,
+		flushing:    false,
+		debounce:    fh.inode.fs.flags.StagedWriteDebounce,
 	}
 	return nil
 }
@@ -2068,6 +2070,13 @@ func (inode *Inode) finalizeAndHash() error {
 		}
 
 		log.Infof("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
+
+		if inode.StagedFile != nil {
+			sf := inode.StagedFile
+			sf.mu.Lock()
+			defer sf.mu.Unlock()
+			inode.StagedFile = nil
+		}
 
 		if inode.userMetadata == nil {
 			inode.userMetadata = make(map[string][]byte)

@@ -91,6 +91,23 @@ type StagedFile struct {
 	lastReadAt  time.Time
 	shouldFlush bool
 	flushing    bool
+	debounce    time.Duration
+}
+
+func (stagedFile *StagedFile) readyToFlush() bool {
+	if stagedFile.flushing {
+		return false
+	}
+
+	if time.Now().Sub(stagedFile.lastWriteAt) < stagedFile.debounce {
+		return false
+	}
+
+	if time.Now().Sub(stagedFile.lastReadAt) < stagedFile.debounce {
+		return false
+	}
+
+	return true
 }
 
 type Inode struct {
