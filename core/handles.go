@@ -99,11 +99,11 @@ func (stagedFile *StagedFile) ReadyToFlush() bool {
 		return false
 	}
 
-	if time.Now().Sub(stagedFile.lastWriteAt) < stagedFile.debounce {
+	if time.Since(stagedFile.lastWriteAt) < stagedFile.debounce {
 		return false
 	}
 
-	if time.Now().Sub(stagedFile.lastReadAt) < stagedFile.debounce {
+	if time.Since(stagedFile.lastReadAt) < stagedFile.debounce {
 		return false
 	}
 
