@@ -90,6 +90,7 @@ type StagedFile struct {
 	lastWriteAt time.Time
 	lastReadAt  time.Time
 	shouldFlush bool
+	flushing    bool
 }
 
 type Inode struct {

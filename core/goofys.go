@@ -838,7 +838,7 @@ func (fs *Goofys) StagedFileFlusher() {
 		case <-ticker.C:
 			fs.mu.RLock()
 			for _, inode := range fs.inodes {
-				if inode.StagedFile != nil && time.Now().Sub(inode.StagedFile.lastWriteAt) > fs.flags.StagedWriteDebounce {
+				if inode.StagedFile != nil && time.Now().Sub(inode.StagedFile.lastWriteAt) > fs.flags.StagedWriteDebounce && !inode.StagedFile.flushing {
 					log.Infof("StagedFileFlusher, ready to flush: %s", inode.FullName())
 					go fs.flushStagedFile(inode)
 				}
@@ -856,6 +856,8 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	stagedFile := inode.StagedFile
 	stagedFile.mu.Lock()
 	defer stagedFile.mu.Unlock()
+
+	stagedFile.flushing = true
 
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
 	offset := int64(0)
@@ -892,7 +894,6 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	}
 
 	stagedFile.shouldFlush = true
-	// fs.WakeupFlusherAndWait(true)
 }
 
 func (fs *Goofys) MetaEvictor() {
