@@ -972,10 +972,8 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 		}
 	}
 
-	// Create staging directory if enabled
-	// TODO: turn on goroutine to monitor staging directory and move files to the correct location after debounce period
+	// Create staged file directory if enabled
 	if fs.flags.StagedWriteModeEnabled {
-		log.Infof("MountFuse: StagedWriteModeEnabled")
 		if err := os.MkdirAll(fs.flags.StagedWritePath, fs.flags.DirMode); err != nil {
 			log.Warnf("Failed to create staging directory: %v", err)
 			fs.flags.StagedWriteModeEnabled = false
