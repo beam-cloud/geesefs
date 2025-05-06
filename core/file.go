@@ -842,9 +842,11 @@ func (inode *Inode) recordFlushError(err error) {
 }
 
 func (inode *Inode) TryFlush(priority int) bool {
-	if inode.StagedFile != nil && inode.StagedFile.shouldFlush {
+	if inode.StagedFile != nil {
 		// Don't flush staging files until we're ready (debounce period has been satisfied)
-		return false
+		if !inode.StagedFile.shouldFlush {
+			return false
+		}
 	}
 
 	log.Infof("TryFlush: %s, shouldFlush: %t", inode.FullName(), inode.StagedFile != nil && inode.StagedFile.shouldFlush)
