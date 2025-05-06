@@ -88,6 +88,7 @@ type StagedFile struct {
 	mu          sync.Mutex
 	lastWriteAt time.Time
 	lastReadAt  time.Time
+	shouldFlush bool
 }
 
 type Inode struct {

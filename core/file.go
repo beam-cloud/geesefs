@@ -158,6 +158,7 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 		mu:          sync.Mutex{},
 		lastWriteAt: time.Now(),
 		lastReadAt:  time.Now(),
+		shouldFlush: false,
 	}
 	return nil
 }
@@ -836,6 +837,13 @@ func (inode *Inode) recordFlushError(err error) {
 }
 
 func (inode *Inode) TryFlush(priority int) bool {
+	// Don't flush until we're ready to flush
+	if inode.StagedFile != nil {
+		if !inode.StagedFile.shouldFlush {
+			return false
+		}
+	}
+
 	overDeleted := false
 	parent := inode.Parent
 	if parent != nil {

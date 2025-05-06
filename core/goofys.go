@@ -763,9 +763,7 @@ func (fs *Goofys) Flusher() {
 				inode := fs.inodes[fuseops.InodeID(inodeID)]
 				fs.mu.RUnlock()
 				started := false
-				if inode != nil && inode.StagedFile == nil {
-					log.Infof("Flushing inode %v", inode.FullName())
-					log.Infof("StagedFile: %v", inode.StagedFile)
+				if inode != nil {
 					started = inode.TryFlush(priority)
 				}
 				curPriorityOk = curPriorityOk || started
