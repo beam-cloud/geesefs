@@ -363,6 +363,11 @@ func (inode *Inode) loadFromStagedFile(diskRanges []Range) (allocated int64, err
 		readSize := rr.End - rr.Start
 		data := make([]byte, readSize)
 		_, err = inode.StagedFile.FD.ReadAt(data, int64(rr.Start))
+		if err != nil {
+			log.Errorf("Error reading from staged file: %v", err)
+			return 0, err
+		}
+
 		if err == nil {
 			inode.buffers.ReviveFromStagedFile(rr.Start, data)
 		}
