@@ -847,6 +847,7 @@ func (inode *Inode) recordFlushError(err error) {
 func (inode *Inode) TryFlush(priority int) bool {
 	// Don't flush until we're ready to flush
 	if inode.StagedFile != nil {
+		log.Infof("StagedFile in TryFlush: %v", inode.StagedFile)
 		if !inode.StagedFile.shouldFlush {
 			return false
 		}
