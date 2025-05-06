@@ -142,10 +142,6 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 		return nil
 	}
 
-	if fh.inode.StagedFile != nil {
-		return nil
-	}
-
 	stagingPath := filepath.Join(fh.inode.fs.flags.StagedWritePath, fh.inode.FullName())
 	parentDir := filepath.Dir(stagingPath)
 	if err := os.MkdirAll(parentDir, fh.inode.fs.flags.DirMode); err != nil {
@@ -158,7 +154,10 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 	}
 
 	fh.inode.StagedFile = &StagedFile{
-		FD: stagingFD,
+		FD:          stagingFD,
+		mu:          sync.Mutex{},
+		lastWriteAt: time.Now(),
+		lastReadAt:  time.Now(),
 	}
 	return nil
 }
@@ -423,6 +422,7 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 
 		if len(readRanges) > 0 {
 			allocated, err := inode.loadFromStagedFile(readRanges)
+			log.Infof("Loaded %v bytes from staged file", allocated)
 
 			// Correct memory usage without the inode lock
 			inode.mu.Unlock()
@@ -431,11 +431,13 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 
 			// Return on error
 			if err != nil {
+				log.Errorf("Error loading from staged file: %v", err)
 				return miss, err
 			}
 		}
 	}
 
+	log.Infof("Loading from server")
 	if len(readRanges) > 0 {
 		miss = true
 		inode.loadFromServer(readRanges, readAheadSize, ignoreMemoryLimit)
