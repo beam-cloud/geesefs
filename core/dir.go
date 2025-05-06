@@ -1638,6 +1638,7 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 	if fromInode.isDir() {
 		fromFullName += "/"
 		toFullName += "/"
+
 		// List all objects and rename them in cache (keeping the lock)
 		var next string
 		var err error
@@ -1648,34 +1649,31 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 				return mapAwsError(err)
 			}
 		}
+
 		renameRecursive(fromInode, newParent, to)
 	} else {
-		// --- BEGIN: StagedFile rename logic ---
+		// Handle staged file renames
 		if fromInode.StagedFile != nil && fromInode.StagedFile.FD != nil {
 			fs := fromInode.fs
+
 			oldStagedPath := fromInode.StagedFile.FD.Name()
 			newStagedDir := fs.flags.StagedWritePath + "/" + newParent.FullName()
 			newStagedPath := appendChildName(newStagedDir, to)
-			if err := os.MkdirAll(newStagedDir, 0700); err == nil {
+
+			if err := os.MkdirAll(newStagedDir, fs.flags.DirMode); err == nil {
 				err := os.Rename(oldStagedPath, newStagedPath)
 				if err == nil {
 					// Reopen the file descriptor at the new path
-					newFD, openErr := os.OpenFile(newStagedPath, os.O_RDWR, 0600)
+					newFD, openErr := os.OpenFile(newStagedPath, os.O_RDWR, fs.flags.FileMode)
 					if openErr == nil {
 						oldFD := fromInode.StagedFile.FD
 						fromInode.StagedFile.FD = newFD
 						oldFD.Close()
-					} else {
-						log.Warnf("Error reopening staged file after rename %v: %v", newStagedPath, openErr)
 					}
-				} else {
-					log.Warnf("Error renaming staged file %v to %v: %v", oldStagedPath, newStagedPath, err)
 				}
-			} else {
-				log.Warnf("Error creating staged file directory %v: %v", newStagedDir, err)
 			}
 		}
-		// --- END: StagedFile rename logic ---
+
 		renameInCache(fromInode, newParent, to)
 	}
 
