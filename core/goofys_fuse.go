@@ -588,6 +588,13 @@ func (fs *GoofysFuse) CreateFile(
 
 	inode.logFuse("<-- CreateFile")
 
+	if fh.inode.StagedFile == nil {
+		err = fh.getOrCreateStagingFile()
+		if err != nil {
+			return err
+		}
+	}
+
 	return
 }
 

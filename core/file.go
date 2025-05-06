@@ -197,7 +197,7 @@ func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 		fh.inode.SetCacheState(ST_MODIFIED)
 	}
 
-	if fh.inode.StagedFile == nil {
+	if fh.inode.fs.flags.StagedWriteModeEnabled && fh.inode.StagedFile == nil {
 		err = fh.getOrCreateStagingFile()
 		if err != nil {
 			return err
