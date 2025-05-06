@@ -373,6 +373,7 @@ func (inode *Inode) loadFromStagedFile(diskRanges []Range) (allocated int64, err
 			inode.buffers.ReviveFromStagedFile(rr.Start, data)
 		}
 	}
+
 	return
 }
 
@@ -421,43 +422,44 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 		return true, syscall.ESPIPE
 	}
 
-	// If staged write mode is enabled, try to load from the staged file
-	if inode.fs.flags.StagedWriteModeEnabled && inode.StagedFile != nil {
-		for _, rr := range readRanges {
-			inode.buffers.AddLoading(rr.Start, rr.End-rr.Start)
-		}
+	if len(readRanges) > 0 {
+		miss = true
 
-		if len(readRanges) > 0 {
-			allocated, err := inode.loadFromStagedFile(readRanges)
-			log.Infof("Loaded %v bytes from staged file", allocated)
-
-			// Correct memory usage without the inode lock
-			inode.mu.Unlock()
-			inode.fs.bufferPool.Use(allocated, true)
-			inode.mu.Lock()
-
-			// Return on error
-			if err != nil {
-				log.Errorf("Error loading from staged file: %v", err)
-				return miss, err
+		// If staged write mode is enabled, try to load from the staged file
+		if inode.fs.flags.StagedWriteModeEnabled && inode.StagedFile != nil {
+			for _, rr := range readRanges {
+				inode.buffers.AddLoading(rr.Start, rr.End-rr.Start)
 			}
+
+			if len(readRanges) > 0 {
+				allocated, err := inode.loadFromStagedFile(readRanges)
+				log.Infof("Loaded %v bytes from staged file", allocated)
+
+				// Correct memory usage without the inode lock
+				inode.mu.Unlock()
+				inode.fs.bufferPool.Use(allocated, true)
+				inode.mu.Lock()
+
+				// Return on error
+				if err != nil {
+					return miss, err
+				}
+			}
+		} else {
+			inode.loadFromServer(readRanges, readAheadSize, ignoreMemoryLimit)
 		}
 	}
-
-	// log.Infof("Loading from server")
-	// if len(readRanges) > 0 {
-	// 	miss = true
-	// 	inode.loadFromServer(readRanges, readAheadSize, ignoreMemoryLimit)
-	// }
 
 	if inode.fs.flags.CachePath != "" {
 		diskRanges := inode.buffers.AddLoadingFromDisk(offset, size)
 		if len(diskRanges) > 0 {
 			allocated, err := inode.loadFromDisk(diskRanges)
+
 			// Correct memory usage without the inode lock
 			inode.mu.Unlock()
 			inode.fs.bufferPool.Use(allocated, true)
 			inode.mu.Lock()
+
 			// Return on error
 			if err != nil {
 				return miss, err
