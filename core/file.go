@@ -154,6 +154,7 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 	}
 
 	fh.inode.StagedFile = &StagedFile{
+		FH:          fh,
 		FD:          stagingFD,
 		mu:          sync.Mutex{},
 		lastWriteAt: time.Now(),

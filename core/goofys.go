@@ -20,6 +20,7 @@ import (
 
 	"context"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/url"
 	"os"
@@ -831,13 +832,15 @@ func (fs *Goofys) EvictEntry(id fuseops.InodeID) bool {
 func (fs *Goofys) StagedFileFlusher() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
 			fs.mu.RLock()
 			for _, inode := range fs.inodes {
-				if inode.StagedFile != nil {
-					log.Infof("StagedFileFlusher: %s", inode.FullName())
+				if inode.StagedFile != nil && time.Now().Sub(inode.StagedFile.lastWriteAt) > fs.flags.StagedWriteDebounce {
+					log.Infof("StagedFileFlusher, ready to flush: %s", inode.FullName())
+					go fs.flushStagedFile(inode)
 				}
 			}
 			fs.mu.RUnlock()
@@ -845,6 +848,51 @@ func (fs *Goofys) StagedFileFlusher() {
 			return
 		}
 	}
+}
+
+const stagedFileFlushBufSize = 16 * 1024 * 1024 // 16 MiB
+
+func (fs *Goofys) flushStagedFile(inode *Inode) {
+	stagedFile := inode.StagedFile
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
+	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
+	offset := int64(0)
+
+	for offset < totalSize {
+		chunkSize := stagedFileFlushBufSize
+		if totalSize-offset < int64(stagedFileFlushBufSize) {
+			chunkSize = int(totalSize - offset)
+		}
+
+		buf := make([]byte, chunkSize)
+		n, err := stagedFile.FD.ReadAt(buf, offset)
+		if err != nil && err != io.EOF {
+			err = mapAwsError(err)
+			log.Errorf("Error reading from staged file: %v", err)
+			break
+		}
+		if n == 0 {
+			break
+		}
+
+		fh := stagedFile.FH
+
+		err = fh.WriteFile(offset, buf[:n], true)
+		if err != nil {
+			log.Errorf("Error staging data for flush: %v", err)
+			break
+		}
+
+		offset += int64(n)
+		if err == io.EOF {
+			break
+		}
+	}
+
+	stagedFile.shouldFlush = true
+	// fs.WakeupFlusherAndWait(true)
 }
 
 func (fs *Goofys) MetaEvictor() {

@@ -84,6 +84,7 @@ type MPUPart struct {
 }
 
 type StagedFile struct {
+	FH          *FileHandle
 	FD          *os.File
 	mu          sync.Mutex
 	lastWriteAt time.Time

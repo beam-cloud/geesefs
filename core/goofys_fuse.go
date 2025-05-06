@@ -733,7 +733,6 @@ func (fs *GoofysFuse) WriteFile(
 	atomic.AddInt64(&fs.stats.writes, 1)
 
 	fs.mu.RLock()
-
 	fh, ok := fs.fileHandles[op.Handle]
 	if !ok {
 		panic(fmt.Sprintf("WriteFile: can't find handle %v", op.Handle))
@@ -742,7 +741,6 @@ func (fs *GoofysFuse) WriteFile(
 
 	// Write through to staging directory if "staged write mode" is enabled
 	if fs.flags.StagedWriteModeEnabled {
-		log.Infof("WriteFile: StagedWriteModeEnabled")
 		err = fh.WriteFileStaging(op.Offset, op.Data)
 		return
 	}
