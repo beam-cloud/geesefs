@@ -142,9 +142,6 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 		return nil
 	}
 
-	fh.inode.mu.Lock()
-	defer fh.inode.mu.Unlock()
-
 	if fh.inode.StagedFile != nil {
 		return nil
 	}
