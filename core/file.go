@@ -362,13 +362,14 @@ func (inode *Inode) loadFromStagedFile(diskRanges []Range) (allocated int64, err
 	for _, rr := range diskRanges {
 		readSize := rr.End - rr.Start
 		data := make([]byte, readSize)
-		_, err = inode.StagedFile.FD.ReadAt(data, int64(rr.Start))
+		n, err := inode.StagedFile.FD.ReadAt(data, int64(rr.Start))
 		if err != nil {
-			log.Errorf("Error reading from staged file: %v", err)
 			return 0, err
 		}
 
-		if err == nil {
+		if n > 0 {
+			log.Infof("Loaded %v bytes from staged file", n)
+			allocated += int64(n)
 			inode.buffers.ReviveFromStagedFile(rr.Start, data)
 		}
 	}
@@ -443,11 +444,11 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 		}
 	}
 
-	log.Infof("Loading from server")
-	if len(readRanges) > 0 {
-		miss = true
-		inode.loadFromServer(readRanges, readAheadSize, ignoreMemoryLimit)
-	}
+	// log.Infof("Loading from server")
+	// if len(readRanges) > 0 {
+	// 	miss = true
+	// 	inode.loadFromServer(readRanges, readAheadSize, ignoreMemoryLimit)
+	// }
 
 	if inode.fs.flags.CachePath != "" {
 		diskRanges := inode.buffers.AddLoadingFromDisk(offset, size)
