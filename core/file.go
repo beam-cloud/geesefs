@@ -847,6 +847,8 @@ func (inode *Inode) TryFlush(priority int) bool {
 		return false
 	}
 
+	log.Infof("TryFlush: %s", inode.FullName())
+
 	overDeleted := false
 	parent := inode.Parent
 	if parent != nil {
@@ -885,7 +887,6 @@ func (inode *Inode) TryFlush(priority int) bool {
 }
 
 func (inode *Inode) sendUpload(priority int) bool {
-
 	if inode.oldParent != nil && inode.IsFlushing == 0 && inode.mpu == nil {
 		// Rename file
 		inode.sendRename()
@@ -2017,7 +2018,7 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 		// Compute hash of file and store it in user metadata
 		err := inode.finalizeAndHash()
 		if err != nil {
-			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
+			log.Warnf("Failed to finalize and hash object (large file) %v: %v", key, err)
 		}
 
 		if inode.userMetadataDirty == 1 {
