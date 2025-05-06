@@ -148,7 +148,7 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 		return err
 	}
 
-	stagingFD, err := os.OpenFile(stagingPath, os.O_WRONLY|os.O_CREATE, fh.inode.fs.flags.FileMode)
+	stagingFD, err := os.OpenFile(stagingPath, os.O_CREATE|os.O_RDWR, fh.inode.fs.flags.FileMode)
 	if err != nil {
 		return err
 	}

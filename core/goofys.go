@@ -764,6 +764,8 @@ func (fs *Goofys) Flusher() {
 				fs.mu.RUnlock()
 				started := false
 				if inode != nil && inode.StagedFile == nil {
+					log.Infof("Flushing inode %v", inode.FullName())
+					log.Infof("StagedFile: %v", inode.StagedFile)
 					started = inode.TryFlush(priority)
 				}
 				curPriorityOk = curPriorityOk || started
