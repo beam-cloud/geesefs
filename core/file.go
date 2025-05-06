@@ -2066,6 +2066,7 @@ func (inode *Inode) finalizeAndHash() error {
 			sf := inode.StagedFile
 			sf.mu.Lock()
 			defer sf.mu.Unlock()
+			sf.Cleanup()
 			inode.StagedFile = nil
 		}
 

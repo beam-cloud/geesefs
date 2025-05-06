@@ -94,7 +94,7 @@ type StagedFile struct {
 	debounce    time.Duration
 }
 
-func (stagedFile *StagedFile) readyToFlush() bool {
+func (stagedFile *StagedFile) ReadyToFlush() bool {
 	if stagedFile.flushing {
 		return false
 	}
@@ -108,6 +108,15 @@ func (stagedFile *StagedFile) readyToFlush() bool {
 	}
 
 	return true
+}
+
+func (stagedFile *StagedFile) Cleanup() {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+	stagedFile.flushing = false
+	stagedFile.shouldFlush = false
+	stagedFile.FD.Close()
+	os.RemoveAll(stagedFile.FH.inode.FullName())
 }
 
 type Inode struct {
