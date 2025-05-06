@@ -116,7 +116,6 @@ func (stagedFile *StagedFile) Cleanup() {
 
 	stagedFile.flushing = false
 	stagedFile.shouldFlush = false
-
 	stagedFile.FD.Close()
 
 	os.RemoveAll(stagedFile.FH.inode.FullName())
