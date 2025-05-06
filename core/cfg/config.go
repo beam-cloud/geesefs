@@ -55,10 +55,11 @@ type FlagStorage struct {
 	Endpoint       string
 	Backend        interface{}
 
-	// Staged write mode Config
+	// Staged write mode
 	StagedWriteModeEnabled bool
 	StagedWritePath        string
 	StagedWriteDebounce    time.Duration
+	StagedWriteFlushSize   uint64
 
 	// External Caching
 	ExternalCacheClient  ContentCache

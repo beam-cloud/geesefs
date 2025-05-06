@@ -850,8 +850,6 @@ func (fs *Goofys) StagedFileFlusher() {
 	}
 }
 
-const stagedFileFlushBufSize = 16 * 1024 * 1024 // 16 MiB
-
 func (fs *Goofys) flushStagedFile(inode *Inode) {
 	stagedFile := inode.StagedFile
 	stagedFile.mu.Lock()
@@ -863,9 +861,9 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	offset := int64(0)
 
 	for offset < totalSize {
-		chunkSize := stagedFileFlushBufSize
-		if totalSize-offset < int64(stagedFileFlushBufSize) {
-			chunkSize = int(totalSize - offset)
+		chunkSize := fs.flags.StagedWriteFlushSize
+		if totalSize-offset < int64(fs.flags.StagedWriteFlushSize) {
+			chunkSize = uint64(totalSize - offset)
 		}
 
 		buf := make([]byte, chunkSize)

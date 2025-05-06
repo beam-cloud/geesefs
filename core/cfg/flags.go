@@ -1116,5 +1116,6 @@ func DefaultFlags() *FlagStorage {
 		StagedWriteModeEnabled: false,
 		StagedWritePath:        "",
 		StagedWriteDebounce:    30 * time.Second,
+		StagedWriteFlushSize:   16 * 1024 * 1024,
 	}
 }
