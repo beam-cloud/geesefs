@@ -860,7 +860,6 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
 	offset := int64(0)
 
-	inode.LockRange(0, uint64(totalSize), true)
 	for offset < totalSize {
 		chunkSize := fs.flags.StagedWriteFlushSize
 		if totalSize-offset < int64(fs.flags.StagedWriteFlushSize) {
