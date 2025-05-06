@@ -116,9 +116,11 @@ func (stagedFile *StagedFile) Cleanup() {
 
 	stagedFile.flushing = false
 	stagedFile.shouldFlush = false
+	fullPath := stagedFile.FD.Name()
 	stagedFile.FD.Close()
 
-	os.RemoveAll(stagedFile.FH.inode.FullName())
+	log.Infof("StagedFile, removing staged file: %s", fullPath)
+	os.RemoveAll(fullPath)
 }
 
 type Inode struct {
