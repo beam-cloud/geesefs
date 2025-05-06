@@ -1565,6 +1565,8 @@ func (parent *Inode) addModified(inc int64) {
 // LOCKS_EXCLUDED(parent.mu)
 // LOCKS_EXCLUDED(newParent.mu)
 func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error) {
+	log.Infof("RENAME: %s, to: %s", from, to)
+
 	if parent == newParent {
 		parent.mu.Lock()
 		defer parent.mu.Unlock()
