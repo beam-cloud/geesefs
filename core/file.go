@@ -166,8 +166,8 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 	return nil
 }
 
-func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
-	fh.inode.logFuse("WriteFileStaging", offset, len(data))
+func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
+	fh.inode.logFuse("WriteFileStaged", offset, len(data))
 
 	end := uint64(offset) + uint64(len(data))
 

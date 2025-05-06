@@ -748,7 +748,7 @@ func (fs *GoofysFuse) WriteFile(
 
 	// Write through to staging directory if "staged write mode" is enabled
 	if fs.flags.StagedWriteModeEnabled {
-		err = fh.WriteFileStaging(op.Offset, op.Data)
+		err = fh.WriteFileStaged(op.Offset, op.Data)
 		return
 	}
 

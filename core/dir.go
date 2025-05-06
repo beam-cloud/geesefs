@@ -1650,6 +1650,32 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 		}
 		renameRecursive(fromInode, newParent, to)
 	} else {
+		// --- BEGIN: StagedFile rename logic ---
+		if fromInode.StagedFile != nil && fromInode.StagedFile.FD != nil {
+			fs := fromInode.fs
+			oldStagedPath := fromInode.StagedFile.FD.Name()
+			newStagedDir := fs.flags.StagedWritePath + "/" + newParent.FullName()
+			newStagedPath := appendChildName(newStagedDir, to)
+			if err := os.MkdirAll(newStagedDir, 0700); err == nil {
+				err := os.Rename(oldStagedPath, newStagedPath)
+				if err == nil {
+					// Reopen the file descriptor at the new path
+					newFD, openErr := os.OpenFile(newStagedPath, os.O_RDWR, 0600)
+					if openErr == nil {
+						oldFD := fromInode.StagedFile.FD
+						fromInode.StagedFile.FD = newFD
+						oldFD.Close()
+					} else {
+						log.Warnf("Error reopening staged file after rename %v: %v", newStagedPath, openErr)
+					}
+				} else {
+					log.Warnf("Error renaming staged file %v to %v: %v", oldStagedPath, newStagedPath, err)
+				}
+			} else {
+				log.Warnf("Error creating staged file directory %v: %v", newStagedDir, err)
+			}
+		}
+		// --- END: StagedFile rename logic ---
 		renameInCache(fromInode, newParent, to)
 	}
 
