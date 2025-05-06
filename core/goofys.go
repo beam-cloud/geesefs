@@ -396,6 +396,7 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 	}
 
 	go fs.MetaEvictor()
+	go fs.StagedFileFlusher()
 	go fs.processCacheEvents()
 
 	return fs, nil
@@ -825,6 +826,25 @@ func (fs *Goofys) EvictEntry(id fuseops.InodeID) bool {
 	childTmp.mu.Unlock()
 	tmpParent.mu.Unlock()
 	return true
+}
+
+func (fs *Goofys) StagedFileFlusher() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			fs.mu.RLock()
+			for _, inode := range fs.inodes {
+				if inode.StagingFileFD != nil {
+					log.Infof("StagedFileFlusher: %s", inode.FullName())
+				}
+			}
+			fs.mu.RUnlock()
+		case <-fs.shutdownCh:
+			return
+		}
+	}
 }
 
 func (fs *Goofys) MetaEvictor() {

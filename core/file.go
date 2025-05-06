@@ -187,7 +187,7 @@ func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 
 	fh.inode.checkPauseWriters()
 
-	// TODO: do we need this?
+	// TODO: do we need this when writing to local disk?
 	if fh.inode.Attributes.Size < end {
 		// Extend and zero fill
 		// resize staging file
@@ -199,9 +199,11 @@ func (fh *FileHandle) WriteFileStaging(offset int64, data []byte) (err error) {
 		fh.inode.SetCacheState(ST_MODIFIED)
 	}
 
-	err = fh.getOrCreateStagingFile()
-	if err != nil {
-		return err
+	if fh.inode.StagingFileFD == nil {
+		err = fh.getOrCreateStagingFile()
+		if err != nil {
+			return err
+		}
 	}
 
 	_, err = fh.inode.StagingFileFD.WriteAt(data, offset)
