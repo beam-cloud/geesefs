@@ -856,7 +856,6 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	defer stagedFile.mu.Unlock()
 
 	stagedFile.flushing = true
-	stagedFile.shouldFlush = true
 
 	log.Infof("StagedFileFlusher, beginning to flush: %s", inode.FullName())
 
@@ -893,6 +892,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		}
 	}
 
+	stagedFile.shouldFlush = true
 }
 
 func (fs *Goofys) MetaEvictor() {
