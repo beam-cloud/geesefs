@@ -2091,12 +2091,6 @@ func (inode *Inode) finalizeAndHash() error {
 		inode.userMetadata[inode.fs.flags.HashAttr] = []byte(hash)
 		inode.sendUpdateMeta()
 
-		if inode.fs.flags.StagedWriteModeEnabled && inode.StagedFile != nil {
-			inode.StagedFile.mu.Lock()
-			inode.StagedFile.finalized = true
-			inode.StagedFile.mu.Unlock()
-		}
-
 		return nil
 	}
 
