@@ -114,8 +114,31 @@ func (stagedFile *StagedFile) Cleanup() {
 	stagedFile.mu.Lock()
 	defer stagedFile.mu.Unlock()
 
-	stagedFile.flushing = false
-	stagedFile.shouldFlush = false
+	// Immediately mark the staged file as invalid to prevent future use
+	fh := stagedFile.FH
+	if fh != nil {
+		fh.inode.mu.Lock()
+		if fh.inode.StagedFile == stagedFile {
+			fh.inode.StagedFile = nil
+		}
+		fh.inode.mu.Unlock()
+	}
+
+	// Wait for ongoing flushes or writes to complete
+	for {
+		fh.inode.mu.Lock()
+		ongoingOps := fh.inode.IsFlushing > 0 || fh.inode.CacheState == ST_MODIFIED || fh.inode.fileHandles > 0
+		fh.inode.mu.Unlock()
+
+		if !ongoingOps {
+			break
+		}
+
+		// Sleep briefly and retry
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Now it's safe to close and remove the file
 	fullPath := stagedFile.FD.Name()
 	stagedFile.FD.Close()
 

@@ -852,7 +852,13 @@ func (fs *Goofys) StagedFileFlusher() {
 }
 
 func (fs *Goofys) flushStagedFile(inode *Inode) {
+	inode.mu.Lock()
 	stagedFile := inode.StagedFile
+	inode.mu.Unlock()
+
+	if stagedFile == nil {
+		return
+	}
 
 	// Lock the staged file for the entire operation
 	stagedFile.mu.Lock()

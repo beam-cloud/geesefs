@@ -2087,12 +2087,6 @@ func (inode *Inode) finalizeAndHash() error {
 
 		log.Infof("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
 
-		if inode.StagedFile != nil {
-			sf := inode.StagedFile
-			sf.Cleanup()
-			inode.StagedFile = nil
-		}
-
 		if inode.userMetadata == nil {
 			inode.userMetadata = make(map[string][]byte)
 		}
@@ -2101,6 +2095,12 @@ func (inode *Inode) finalizeAndHash() error {
 		inode.sendUpdateMeta()
 
 		return nil
+	}
+
+	if inode.StagedFile != nil {
+		sf := inode.StagedFile
+		sf.Cleanup()
+		inode.StagedFile = nil
 	}
 
 	// For small files, just hash the whole file at once (we're already locking the range so no evictions can happen before this call)

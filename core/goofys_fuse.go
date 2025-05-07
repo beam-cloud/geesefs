@@ -543,6 +543,14 @@ func (fs *GoofysFuse) ReleaseFileHandle(
 
 	fs.mu.Lock()
 	fh := fs.fileHandles[op.Handle]
+	if fh == nil {
+		fs.mu.Unlock()
+		return nil
+	}
+
+	// Get a reference to the staged file before releasing the handle
+	stagedFile := fh.inode.StagedFile
+
 	fh.Release()
 	atomic.AddInt64(&fs.stats.noops, 1)
 	fuseLog.Debugln("ReleaseFileHandle", fh.inode.FullName(), op.Handle, fh.inode.Id)
@@ -550,10 +558,18 @@ func (fs *GoofysFuse) ReleaseFileHandle(
 	fs.mu.Unlock()
 
 	if fh.inode.fs.flags.FsyncOnClose {
-		return fh.inode.SyncFile()
+		err = fh.inode.SyncFile()
+		if err != nil {
+			return err
+		}
 	}
 
-	return
+	// If this was the last handle and we have a staged file, try to clean it up
+	if stagedFile != nil {
+		stagedFile.Cleanup()
+	}
+
+	return nil
 }
 
 func (fs *GoofysFuse) CreateFile(
