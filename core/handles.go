@@ -117,27 +117,6 @@ func (stagedFile *StagedFile) Cleanup() {
 	fh := stagedFile.FH
 	stagedFile.mu.Unlock()
 
-	log.Infof("StagedFile, waiting for file to be closed: %s", fh.inode.FullName())
-
-	// Wait until all file handles are closed and no flushes are in progress
-	deleted := false
-	for {
-		busy := fh.inode.fileHandles > 0 || fh.inode.IsFlushing > 0
-		deleted = fh.inode.CacheState == ST_DELETED || fh.inode.CacheState == ST_DEAD
-		if !busy || deleted {
-			break
-		}
-
-		log.Infof("StagedFile, waiting for file to be closed: %s", fh.inode.FullName())
-		log.Infof("StagedFile, busy: %t, deleted: %t", busy, deleted)
-		log.Infof("StagedFile, file handles: %d, flushing: %d", fh.inode.fileHandles, fh.inode.IsFlushing)
-		log.Infof("StagedFile, state: %d", fh.inode.CacheState)
-
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	log.Infof("StagedFile, file is closed: %s", fh.inode.FullName())
-
 	// Now it's safe to close and remove the file
 	stagedFile.mu.Lock()
 	fullPath := stagedFile.FD.Name()
@@ -149,7 +128,7 @@ func (stagedFile *StagedFile) Cleanup() {
 		log.Warnf("Failed to remove staging file: %v", err)
 	}
 
-	if fh.inode.fs.flags.StagedWriteUploadCallback != nil && !deleted {
+	if fh.inode.fs.flags.StagedWriteUploadCallback != nil {
 		fh.inode.fs.flags.StagedWriteUploadCallback(fh.inode.FullName(), int64(fh.inode.Attributes.Size))
 	}
 
