@@ -936,7 +936,9 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		}
 	}
 
+	log.Infof("flushStagedFile: calling cleanup %s", inode.FullName())
 	stagedFile.Cleanup()
+	log.Infof("flushStagedFile: cleanup done %s", inode.FullName())
 
 	inode.mu.Lock()
 	inode.StagedFile = nil
