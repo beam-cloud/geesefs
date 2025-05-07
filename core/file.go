@@ -970,6 +970,7 @@ func (inode *Inode) sendUpload(priority int) bool {
 		inode.IsFlushing += inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.stats.flushes, 1)
 		atomic.AddInt64(&inode.fs.activeFlushers, 1)
+
 		go func() {
 			inode.mu.Lock()
 			inode.completeMultipart()
@@ -978,6 +979,7 @@ func (inode *Inode) sendUpload(priority int) bool {
 			atomic.AddInt64(&inode.fs.activeFlushers, -1)
 			inode.fs.WakeupFlusher()
 		}()
+
 		return true
 	}
 
@@ -1677,7 +1679,6 @@ func (inode *Inode) abortMultipart() {
 }
 
 func (inode *Inode) flushSmallObject() {
-
 	inode.mu.Lock()
 
 	if inode.CacheState != ST_CREATED && inode.CacheState != ST_MODIFIED {
@@ -1740,6 +1741,7 @@ func (inode *Inode) flushSmallObject() {
 		// not be able to proceed to rename - it waits until inode.mpu == nil
 		inode.abortMultipart()
 	}
+
 	inode.mu.Unlock()
 	inode.fs.addInflightChange(key)
 	resp, err := cloud.PutBlob(params)
@@ -2037,7 +2039,7 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 		// Compute hash of file and store it in user metadata
 		err := inode.finalizeAndHash()
 		if err != nil {
-			log.Warnf("Failed to finalize and hash object (large file) %v: %v", key, err)
+			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
 		}
 
 		if inode.userMetadataDirty == 1 {
@@ -2058,6 +2060,8 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 }
 
 func (inode *Inode) finalizeAndHash() error {
+	log.Debugf("Called finalizeAndHash: %s", inode.FullName())
+
 	if inode.isDir() {
 		return nil
 	}
@@ -2068,17 +2072,6 @@ func (inode *Inode) finalizeAndHash() error {
 
 	if inode.fs.flags.HashAttr == "" {
 		return nil
-	}
-
-	log.Debugf("Called finalizeAndHash: %s", inode.FullName())
-
-	// If this was a staged file, cleanup
-	if inode.StagedFile != nil {
-		defer func() {
-			sf := inode.StagedFile
-			sf.Cleanup()
-			inode.StagedFile = nil
-		}()
 	}
 
 	// If this was a multipart upload, use the incremental hash

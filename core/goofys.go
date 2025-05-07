@@ -915,6 +915,11 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 			break
 		}
 	}
+
+	inode.mu.Lock()
+	stagedFile.Cleanup()
+	inode.StagedFile = nil
+	inode.mu.Unlock()
 }
 
 func (fs *Goofys) MetaEvictor() {
