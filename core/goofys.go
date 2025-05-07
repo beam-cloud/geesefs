@@ -845,7 +845,7 @@ func (fs *Goofys) StagedFileFlusher() {
 				if inode.StagedFile != nil && inode.StagedFile.ReadyToFlush() {
 					select {
 					case sem <- struct{}{}:
-						log.Debugf("StagedFileFlusher: queued to flush %s", inode.FullName())
+						log.Infof("StagedFileFlusher: queued to flush %s", inode.FullName())
 
 						go func(inode *Inode) {
 							defer func() { <-sem }()
@@ -853,7 +853,7 @@ func (fs *Goofys) StagedFileFlusher() {
 						}(inode)
 
 					default:
-						log.Debugf("StagedFileFlusher: concurrency limit reached, skipping %s", inode.FullName())
+						log.Infof("StagedFileFlusher: concurrency limit reached, skipping %s", inode.FullName())
 					}
 				}
 				return true
@@ -868,6 +868,8 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	inode.mu.Lock()
 	stagedFile := inode.StagedFile
 	inode.mu.Unlock()
+
+	log.Infof("flushStagedFile: %s", inode.FullName())
 
 	if stagedFile == nil {
 		return
