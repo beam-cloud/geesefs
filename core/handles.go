@@ -138,6 +138,10 @@ func (stagedFile *StagedFile) Cleanup() {
 		log.Warnf("Failed to remove staging file: %v", err)
 	}
 
+	if fh.inode.fs.flags.StagedFileUploadCallback != nil {
+		fh.inode.fs.flags.StagedFileUploadCallback(fh.inode.FullName(), int64(fh.inode.Attributes.Size))
+	}
+
 	log.Infof("StagedFile, removed file: %s", fh.inode.FullName())
 }
 

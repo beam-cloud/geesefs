@@ -938,6 +938,25 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	inode.mu.Unlock()
 }
 
+func (fs *Goofys) WaitForFlush() {
+	if fs.flags.StagedWriteModeEnabled {
+		for {
+			hasStaged := false
+
+			fs.stagedFiles.Range(func(_, _ interface{}) bool {
+				hasStaged = true
+				return false // stop iteration early
+			})
+
+			if !hasStaged {
+				break
+			}
+
+			time.Sleep(1 * time.Second)
+		}
+	}
+}
+
 func (fs *Goofys) MetaEvictor() {
 	retry := false
 	var seen map[fuseops.InodeID]bool
