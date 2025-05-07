@@ -1119,6 +1119,6 @@ func DefaultFlags() *FlagStorage {
 		StagedWriteFlushSize:        16 * 1024 * 1024,
 		StagedWriteFlushInterval:    5 * time.Second,
 		StagedWriteFlushConcurrency: 8,
-		StagedFileUploadCallback:    nil,
+		StagedWriteUploadCallback:   nil,
 	}
 }

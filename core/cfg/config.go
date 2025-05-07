@@ -62,7 +62,7 @@ type FlagStorage struct {
 	StagedWriteFlushSize        uint64
 	StagedWriteFlushInterval    time.Duration
 	StagedWriteFlushConcurrency int
-	StagedFileUploadCallback    func(fullPath string, fileSize int64)
+	StagedWriteUploadCallback   func(fullPath string, fileSize int64)
 
 	// External Caching
 	ExternalCacheClient  ContentCache
