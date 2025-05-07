@@ -844,17 +844,19 @@ func (inode *Inode) recordFlushError(err error) {
 }
 
 func (inode *Inode) TryFlush(priority int) bool {
-	if inode.StagedFile != nil {
-		// Don't flush staging files until we're ready (debounce period has been satisfied)
-		if !inode.StagedFile.shouldFlush {
-			return false
-		}
+	inode.mu.Lock()
+	stagedFile := inode.StagedFile
+	shouldFlush := false
+	if stagedFile != nil {
+		shouldFlush = stagedFile.shouldFlush
+	}
+	inode.mu.Unlock()
+
+	if stagedFile == nil || !shouldFlush {
+		return false
 	}
 
 	log.Infof("TryFlush: %s, inode.StagedFile: %v", inode.FullName(), inode.StagedFile)
-	if inode.StagedFile != nil {
-		log.Infof("TryFlush: %s, inode.StagedFile.shouldFlush: %t", inode.FullName(), inode.StagedFile.shouldFlush)
-	}
 
 	overDeleted := false
 	parent := inode.Parent
@@ -895,8 +897,6 @@ func (inode *Inode) TryFlush(priority int) bool {
 }
 
 func (inode *Inode) sendUpload(priority int) bool {
-	log.Infof("sendUpload: %s", inode.FullName())
-
 	if inode.oldParent != nil && inode.IsFlushing == 0 && inode.mpu == nil {
 		// Rename file
 		inode.sendRename()
