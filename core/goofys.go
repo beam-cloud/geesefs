@@ -857,7 +857,9 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	defer stagedFile.mu.Unlock()
 
 	stagedFile.flushing = true
+	stagedFile.shouldFlush = true
 
+	log.Infof("StagedFileFlusher, ready to flush: %s", inode.FullName())
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
 	offset := int64(0)
 
@@ -885,14 +887,16 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 			break
 		}
 
+		if offset == 0 {
+			fs.WakeupFlusher()
+		}
+
 		offset += int64(n)
 		if err == io.EOF {
 			break
 		}
 	}
 
-	log.Infof("StagedFileFlusher, ready to flush: %s", inode.FullName())
-	stagedFile.shouldFlush = true
 }
 
 func (fs *Goofys) MetaEvictor() {
