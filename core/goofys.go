@@ -916,8 +916,9 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		}
 	}
 
-	inode.mu.Lock()
 	stagedFile.Cleanup()
+
+	inode.mu.Lock()
 	inode.StagedFile = nil
 	inode.mu.Unlock()
 }
