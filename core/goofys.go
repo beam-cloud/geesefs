@@ -845,7 +845,7 @@ func (fs *Goofys) StagedFileFlusher() {
 				if inode.StagedFile != nil && inode.StagedFile.ReadyToFlush() {
 					select {
 					case sem <- struct{}{}:
-						log.Infof("StagedFileFlusher: queued to flush %s", inode.FullName())
+						log.Debugf("StagedFileFlusher: queued to flush %s", inode.FullName())
 
 						go func(inode *Inode) {
 							defer func() { <-sem }()

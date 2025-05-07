@@ -568,8 +568,6 @@ func (fs *GoofysFuse) CreateFile(
 	ctx context.Context,
 	op *fuseops.CreateFileOp) (err error) {
 
-	log.Infof("Called CreateFile: %s", op.Name)
-
 	atomic.AddInt64(&fs.stats.metadataWrites, 1)
 
 	parent := fs.getInodeOrDie(op.Parent)
