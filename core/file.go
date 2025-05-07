@@ -892,8 +892,8 @@ func (inode *Inode) TryFlush(priority int) bool {
 
 func (inode *Inode) sendUpload(priority int) bool {
 	log.Infof("sendUpload: %s", inode.FullName())
+
 	if inode.oldParent != nil && inode.IsFlushing == 0 && inode.mpu == nil {
-		log.Infof("sendUpload: %s, sending rename", inode.FullName())
 		// Rename file
 		inode.sendRename()
 		return true
@@ -903,7 +903,6 @@ func (inode *Inode) sendUpload(priority int) bool {
 		inode.oldParent == nil && inode.IsFlushing == 0 {
 		hasDirty := inode.buffers.AnyUnclean()
 		if !hasDirty {
-			log.Infof("sendUpload: %s, sending updateMeta", inode.FullName())
 			// Update metadata by COPYing into the same object
 			// It results in the optimized implementation in S3
 			inode.sendUpdateMeta()
@@ -911,12 +910,10 @@ func (inode *Inode) sendUpload(priority int) bool {
 		}
 	}
 
-	log.Infof("sendUpload: %s, checking max parallel parts", inode.FullName())
 	if inode.IsFlushing >= inode.fs.flags.MaxParallelParts {
 		return false
 	}
 
-	log.Infof("sendUpload: %s, checking smallFile", inode.FullName())
 	smallFile := inode.Attributes.Size <= inode.fs.flags.SinglePartMB*1024*1024
 	canPatch := inode.fs.flags.UsePatch &&
 		// Can only patch modified inodes with completed MPUs.
@@ -929,13 +926,9 @@ func (inode *Inode) sendUpload(priority int) bool {
 		// Currently PATCH does not support truncates. If the file was truncated, reupload it.
 		inode.knownSize <= inode.Attributes.Size
 
-	log.Infof("sendUpload: %s, canPatch: %t", inode.FullName(), canPatch)
-
 	if canPatch {
 		return inode.patchObjectRanges()
 	}
-
-	log.Infof("sendUpload: %s, smallFile: %t, mpu: %t", inode.FullName(), smallFile, inode.mpu == nil)
 
 	if smallFile && inode.mpu == nil {
 		// Don't flush small files with active file handles (if not under memory pressure)
@@ -952,12 +945,11 @@ func (inode *Inode) sendUpload(priority int) bool {
 
 	// Initiate multipart upload, if not yet
 	if inode.mpu == nil {
-		log.Infof("sendUpload: %s, initiating multipart upload", inode.FullName())
-
 		// Wait for other updates to complete.
 		if inode.IsFlushing > 0 {
 			return false
 		}
+
 		if inode.fs.flags.UsePatch && inode.fs.flags.PreferPatchUploads {
 			inode.uploadMinMultipart()
 		} else {
@@ -969,15 +961,12 @@ func (inode *Inode) sendUpload(priority int) bool {
 	// Pick part(s) to flush
 	initiated, canComplete := inode.sendUploadParts(priority)
 	if initiated {
-		log.Infof("sendUpload: %s, initiated multipart upload", inode.FullName())
 		return true
 	}
 
 	canComplete = canComplete && !inode.IsRangeLocked(0, inode.Attributes.Size, true)
 
 	if canComplete && (inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.wantFree) > 0) {
-		log.Infof("sendUpload: %s, completing multipart upload", inode.FullName())
-
 		// Complete the multipart upload
 		inode.IsFlushing += inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.stats.flushes, 1)
@@ -1001,21 +990,26 @@ func (inode *Inode) sendRename() {
 	if inode.isDir() {
 		key += "/"
 	}
+
 	inode.IsFlushing += inode.fs.flags.MaxParallelParts
 	atomic.AddInt64(&inode.fs.stats.flushes, 1)
 	atomic.AddInt64(&inode.fs.activeFlushers, 1)
+
 	_, from := inode.oldParent.cloud()
 	from = appendChildName(from, inode.oldName)
+
 	oldParent := inode.oldParent
 	oldName := inode.oldName
 	newParent := inode.Parent
 	newName := inode.Name
 	inode.renamingTo = true
 	skipRename := false
+
 	if inode.isDir() {
 		from += "/"
 		skipRename = true
 	}
+
 	go func() {
 		var err error
 		if !inode.isDir() || !inode.fs.flags.NoDirObject {
@@ -1142,6 +1136,7 @@ func (inode *Inode) sendRename() {
 				}
 			}
 		}
+
 		inode.mu.Lock()
 		inode.IsFlushing -= inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.activeFlushers, -1)
@@ -1168,12 +1163,14 @@ func (inode *Inode) sendUpdateMeta() {
 		ETag:        PString(inode.knownETag),
 		Metadata:    escapeMetadata(inode.userMetadata),
 	}
+
 	go func() {
 		inode.fs.addInflightChange(key)
 		_, err := cloud.CopyBlob(copyIn)
 		inode.fs.completeInflightChange(key)
 		inode.mu.Lock()
 		inode.recordFlushError(err)
+
 		if err != nil {
 			mappedErr := mapAwsError(err)
 			inode.userMetadataDirty = 2
@@ -1187,6 +1184,7 @@ func (inode *Inode) sendUpdateMeta() {
 			inode.SetCacheState(ST_CACHED)
 			inode.SetAttrTime(time.Now())
 		}
+
 		inode.IsFlushing -= inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.activeFlushers, -1)
 		inode.fs.WakeupFlusher()
