@@ -1215,7 +1215,6 @@ func (inode *Inode) sendStartMultipart() {
 }
 
 func (inode *Inode) beginMultipartUpload(cloud StorageBackend, key string) {
-	log.Infof("beginMultipartUpload: %s", inode.FullName())
 	params := &MultipartBlobBeginInput{
 		Key:         key,
 		ContentType: inode.fs.flags.GetMimeType(key),
@@ -1908,8 +1907,6 @@ func (inode *Inode) flushPart(part uint64) {
 		}
 		// File size may have been changed again
 		if inode.Attributes.Size <= partOffset || inode.CacheState != ST_MODIFIED {
-			log.Infof("Aborting flush: %s", inode.FullName())
-
 			// Abort flush
 			return
 		}
