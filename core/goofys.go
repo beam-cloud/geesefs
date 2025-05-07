@@ -854,13 +854,15 @@ func (fs *Goofys) StagedFileFlusher() {
 func (fs *Goofys) flushStagedFile(inode *Inode) {
 	stagedFile := inode.StagedFile
 
-	fs.flusherMu.Lock()
-
+	// Lock the staged file for the entire operation
 	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
-	stagedFile.mu.Unlock()
 
+	// Wake up flusher immediately
+	fs.flusherMu.Lock()
 	fs.flushPending = 1
 	fs.flusherCond.Broadcast()
 	fs.flusherMu.Unlock()
@@ -874,23 +876,31 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 			chunkSize = uint64(totalSize - offset)
 		}
 
+		// Lock this part's range while we're reading and staging it
+		inode.LockRange(uint64(offset), chunkSize, true)
+
 		buf := make([]byte, chunkSize)
 		n, err := stagedFile.FD.ReadAt(buf, offset)
 		if err != nil && err != io.EOF {
 			log.Errorf("Error reading from staged file: %v", err)
+			inode.UnlockRange(uint64(offset), chunkSize, true)
 			break
 		}
 		if n == 0 {
+			inode.UnlockRange(uint64(offset), chunkSize, true)
 			break
 		}
 
 		fh := stagedFile.FH
-
 		err = fh.WriteFile(offset, buf[:n], true)
 		if err != nil {
 			log.Errorf("Error staging data for flush: %v", err)
+			inode.UnlockRange(uint64(offset), chunkSize, true)
 			break
 		}
+
+		// Unlock this part's range after it's staged
+		inode.UnlockRange(uint64(offset), chunkSize, true)
 
 		offset += int64(n)
 		if err == io.EOF {
