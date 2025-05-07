@@ -851,7 +851,10 @@ func (inode *Inode) TryFlush(priority int) bool {
 		}
 	}
 
-	log.Infof("TryFlush: %s, shouldFlush: %t", inode.FullName(), inode.StagedFile != nil && inode.StagedFile.shouldFlush)
+	log.Infof("TryFlush: %s, inode.StagedFile: %v", inode.FullName(), inode.StagedFile)
+	if inode.StagedFile != nil {
+		log.Infof("TryFlush: %s, inode.StagedFile.shouldFlush: %t", inode.FullName(), inode.StagedFile.shouldFlush)
+	}
 
 	overDeleted := false
 	parent := inode.Parent
@@ -886,7 +889,6 @@ func (inode *Inode) TryFlush(priority int) bool {
 			return false
 		}
 
-		log.Infof("TryFlush: %s, sending upload", inode.FullName())
 		return inode.sendUpload(priority)
 	}
 	return false
