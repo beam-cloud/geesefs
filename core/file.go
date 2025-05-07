@@ -180,6 +180,13 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 		return syscall.EFBIG
 	}
 
+	if fh.inode.fs.flags.StagedWriteModeEnabled && fh.inode.StagedFile == nil {
+		err = fh.getOrCreateStagingFile()
+		if err != nil {
+			return err
+		}
+	}
+
 	fh.inode.mu.Lock()
 	if fh.inode.CacheState == ST_DELETED || fh.inode.CacheState == ST_DEAD {
 		fh.inode.mu.Unlock()
@@ -195,13 +202,6 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 	fh.inode.lastWriteEnd = end
 	if fh.inode.CacheState == ST_CACHED {
 		fh.inode.SetCacheState(ST_MODIFIED)
-	}
-
-	if fh.inode.fs.flags.StagedWriteModeEnabled && fh.inode.StagedFile == nil {
-		err = fh.getOrCreateStagingFile()
-		if err != nil {
-			return err
-		}
 	}
 
 	_, err = fh.inode.StagedFile.FD.WriteAt(data, offset)
@@ -849,7 +849,7 @@ func (inode *Inode) TryFlush(priority int) bool {
 		}
 	}
 
-	// log.Infof("TryFlush: %s, shouldFlush: %t", inode.FullName(), inode.StagedFile != nil && inode.StagedFile.shouldFlush)
+	log.Infof("TryFlush: %s, shouldFlush: %t", inode.FullName(), inode.StagedFile != nil && inode.StagedFile.shouldFlush)
 
 	overDeleted := false
 	parent := inode.Parent
@@ -1888,6 +1888,8 @@ func (inode *Inode) flushPart(part uint64) {
 		}
 		// File size may have been changed again
 		if inode.Attributes.Size <= partOffset || inode.CacheState != ST_MODIFIED {
+			log.Infof("Aborting flush: %s", inode.FullName())
+
 			// Abort flush
 			return
 		}
@@ -2052,6 +2054,8 @@ func (inode *Inode) finalizeAndHash() error {
 	if inode.fs.flags.HashAttr == "" {
 		return nil
 	}
+
+	log.Infof("Called finalizeAndHash: %s", inode.FullName())
 
 	// If this was a multipart upload, use the incremental hash
 	if inode.mpu != nil && inode.hashInProgress != nil {
