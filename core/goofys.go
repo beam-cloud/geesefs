@@ -862,7 +862,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
 
-	// Wake up flusher immediately
+	// Wake up flusher
 	fs.flusherMu.Lock()
 	fs.flushPending = 1
 	fs.flusherCond.Broadcast()
@@ -877,7 +877,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 			chunkSize = uint64(totalSize - offset)
 		}
 
-		// Lock this part's range while we're reading and staging it
+		// Lock this part's range while we're reading / flushing it
 		inode.LockRange(uint64(offset), chunkSize, true)
 
 		var n int
@@ -915,8 +915,6 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 			break
 		}
 	}
-
-	log.Infof("StagedFileFlusher, ready to flush: %s", inode.FullName())
 }
 
 func (fs *Goofys) MetaEvictor() {

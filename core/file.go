@@ -170,7 +170,6 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 	fh.inode.logFuse("WriteFileStaged", offset, len(data))
 
 	end := uint64(offset) + uint64(len(data))
-
 	if end > fh.inode.fs.getMaxFileSize() {
 		// File offset too large
 		log.Warnf(
@@ -2071,7 +2070,7 @@ func (inode *Inode) finalizeAndHash() error {
 		return nil
 	}
 
-	log.Infof("Called finalizeAndHash: %s", inode.FullName())
+	log.Debugf("Called finalizeAndHash: %s", inode.FullName())
 
 	// If this was a staged file, cleanup
 	if inode.StagedFile != nil {

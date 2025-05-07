@@ -111,11 +111,9 @@ func (stagedFile *StagedFile) ReadyToFlush() bool {
 }
 
 func (stagedFile *StagedFile) Cleanup() {
-	log.Infof("StagedFile, cleaning up: %s", stagedFile.FH.inode.FullName())
+	log.Infof("Cleaning up staged file: %s", stagedFile.FH.inode.FullName())
 
-	stagedFile.mu.Lock()
 	fh := stagedFile.FH
-	stagedFile.mu.Unlock()
 
 	// Wait until all file handles are closed and no flushes are in progress
 	for {
@@ -138,7 +136,7 @@ func (stagedFile *StagedFile) Cleanup() {
 
 	err := os.RemoveAll(fullPath)
 	if err != nil {
-		log.Warnf("StagedFile, failed to remove file: %s", err)
+		log.Warnf("Failed to remove staging file: %v", err)
 	}
 }
 
