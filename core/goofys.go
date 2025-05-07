@@ -766,6 +766,7 @@ func (fs *Goofys) Flusher() {
 				started := false
 				if inode != nil {
 					started = inode.TryFlush(priority)
+					log.Infof("[FLUSHER]TryFlush: %s, started: %t", inode.FullName(), started)
 				}
 				curPriorityOk = curPriorityOk || started
 			}

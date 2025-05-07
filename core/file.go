@@ -883,12 +883,15 @@ func (inode *Inode) TryFlush(priority int) bool {
 		if overDeleted {
 			return false
 		}
+
+		log.Infof("TryFlush: %s, sending upload", inode.FullName())
 		return inode.sendUpload(priority)
 	}
 	return false
 }
 
 func (inode *Inode) sendUpload(priority int) bool {
+	log.Infof("sendUpload: %s", inode.FullName())
 	if inode.oldParent != nil && inode.IsFlushing == 0 && inode.mpu == nil {
 		// Rename file
 		inode.sendRename()
@@ -925,6 +928,8 @@ func (inode *Inode) sendUpload(priority int) bool {
 	if canPatch {
 		return inode.patchObjectRanges()
 	}
+
+	log.Infof("sendUpload: %s, smallFile: %t, mpu: %t", inode.FullName(), smallFile, inode.mpu == nil)
 
 	if smallFile && inode.mpu == nil {
 		// Don't flush small files with active file handles (if not under memory pressure)
@@ -1187,6 +1192,7 @@ func (inode *Inode) sendStartMultipart() {
 	atomic.AddInt64(&inode.fs.stats.flushes, 1)
 	atomic.AddInt64(&inode.fs.activeFlushers, 1)
 	go func() {
+		log.Infof("sendStartMultipart: %s", inode.FullName())
 		inode.beginMultipartUpload(cloud, key)
 		inode.IsFlushing -= inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.activeFlushers, -1)
@@ -1196,6 +1202,7 @@ func (inode *Inode) sendStartMultipart() {
 }
 
 func (inode *Inode) beginMultipartUpload(cloud StorageBackend, key string) {
+	log.Infof("beginMultipartUpload: %s", inode.FullName())
 	params := &MultipartBlobBeginInput{
 		Key:         key,
 		ContentType: inode.fs.flags.GetMimeType(key),
@@ -1857,7 +1864,7 @@ func (inode *Inode) flushPart(part uint64) {
 		_, key = inode.oldParent.cloud()
 		key = appendChildName(key, inode.oldName)
 	}
-	log.Debugf("Flushing part %v (%v-%v MB) of %v", part, partOffset/1024/1024, (partOffset+partSize)/1024/1024, key)
+	log.Infof("Flushing part %v (%v-%v MB) of %v", part, partOffset/1024/1024, (partOffset+partSize)/1024/1024, key)
 
 	// Last part may be shorter
 	if inode.Attributes.Size < partOffset+partSize {
