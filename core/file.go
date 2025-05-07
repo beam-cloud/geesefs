@@ -1875,7 +1875,7 @@ func (inode *Inode) flushPart(part uint64) {
 		_, key = inode.oldParent.cloud()
 		key = appendChildName(key, inode.oldName)
 	}
-	log.Debugf("Flushing part %v (%v-%v MB) of %v", part, partOffset/1024/1024, (partOffset+partSize)/1024/1024, key)
+	log.Infof("Flushing part %v (%v-%v MB) of %v", part, partOffset/1024/1024, (partOffset+partSize)/1024/1024, key)
 
 	// Last part may be shorter
 	if inode.Attributes.Size < partOffset+partSize {
@@ -2083,13 +2083,19 @@ func (inode *Inode) finalizeAndHash() error {
 			return err
 		}
 
-		log.Debugf("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
+		log.Infof("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
 		if inode.userMetadata == nil {
 			inode.userMetadata = make(map[string][]byte)
 		}
 
 		inode.userMetadata[inode.fs.flags.HashAttr] = []byte(hash)
 		inode.sendUpdateMeta()
+
+		if inode.fs.flags.StagedWriteModeEnabled && inode.StagedFile != nil {
+			inode.StagedFile.mu.Lock()
+			inode.StagedFile.finalized = true
+			inode.StagedFile.mu.Unlock()
+		}
 
 		return nil
 	}

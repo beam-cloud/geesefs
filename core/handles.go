@@ -91,6 +91,7 @@ type StagedFile struct {
 	lastReadAt  time.Time
 	shouldFlush bool
 	flushing    bool
+	finalized   bool
 	debounce    time.Duration
 }
 
@@ -122,11 +123,11 @@ func (stagedFile *StagedFile) Cleanup() {
 	// Wait until all flushes are complete
 	for {
 		flushing := fh.inode.IsFlushing > 0
-		if !flushing {
+		if !flushing && fh.inode.StagedFile.finalized {
 			break
 		}
 
-		log.Infof("StagedFile, waiting for flush: %s", fh.inode.FullName())
+		log.Infof("StagedFile, waiting for flush / finalization: %s", fh.inode.FullName())
 		time.Sleep(100 * time.Millisecond)
 	}
 
