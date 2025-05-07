@@ -1205,7 +1205,6 @@ func (inode *Inode) sendStartMultipart() {
 	atomic.AddInt64(&inode.fs.stats.flushes, 1)
 	atomic.AddInt64(&inode.fs.activeFlushers, 1)
 	go func() {
-		log.Infof("sendStartMultipart: %s", inode.FullName())
 		inode.beginMultipartUpload(cloud, key)
 		inode.IsFlushing -= inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.activeFlushers, -1)
