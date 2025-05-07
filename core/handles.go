@@ -142,7 +142,7 @@ func (stagedFile *StagedFile) Cleanup() {
 		fh.inode.fs.flags.StagedWriteUploadCallback(fh.inode.FullName(), int64(fh.inode.Attributes.Size))
 	}
 
-	log.Infof("StagedFile, removed file: %s", fh.inode.FullName())
+	log.Debugf("StagedFile, removed file: %s", fh.inode.FullName())
 }
 
 type Inode struct {
