@@ -163,6 +163,8 @@ func (fh *FileHandle) getOrCreateStagingFile() (err error) {
 		flushing:    false,
 		debounce:    fh.inode.fs.flags.StagedWriteDebounce,
 	}
+
+	fh.inode.fs.stagedFiles.Store(fh.inode.Id, fh.inode)
 	return nil
 }
 
@@ -364,7 +366,6 @@ func (inode *Inode) loadFromStagedFile(diskRanges []Range) (allocated int64, err
 		}
 
 		if n > 0 {
-			log.Infof("Loaded %v bytes from staged file", n)
 			allocated += int64(n)
 			inode.buffers.ReviveFromStagedFile(rr.Start, data)
 		}
@@ -429,7 +430,6 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 
 			if len(readRanges) > 0 {
 				allocated, err := inode.loadFromStagedFile(readRanges)
-				log.Infof("Loaded %v bytes from staged file", allocated)
 
 				// Correct memory usage without the inode lock
 				inode.mu.Unlock()

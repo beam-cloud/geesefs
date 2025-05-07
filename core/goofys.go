@@ -129,6 +129,8 @@ type Goofys struct {
 	cacheEventChan  chan cacheEvent
 	cachingStatus   map[string]bool
 	cachingStatusMu sync.Mutex
+
+	stagedFiles sync.Map
 }
 
 type OpStats struct {
@@ -829,21 +831,25 @@ func (fs *Goofys) EvictEntry(id fuseops.InodeID) bool {
 	return true
 }
 
+const stagedFileFlushInterval = 5 * time.Second
+
 func (fs *Goofys) StagedFileFlusher() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(stagedFileFlushInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			fs.mu.RLock()
-			for _, inode := range fs.inodes {
+			fs.stagedFiles.Range(func(key, value interface{}) bool {
+				inode := value.(*Inode)
+
 				if inode.StagedFile != nil && inode.StagedFile.ReadyToFlush() {
 					log.Infof("StagedFileFlusher, queued to flush: %s", inode.FullName())
 					go fs.flushStagedFile(inode)
 				}
-			}
-			fs.mu.RUnlock()
+
+				return true
+			})
 		case <-fs.shutdownCh:
 			return
 		}
@@ -907,7 +913,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 			}
 		}
 
-		// Unlock this part's range after it's staged
+		// Unlock this part's range after it's ready to flush
 		inode.UnlockRange(uint64(offset), chunkSize, true)
 
 		offset += int64(n)
@@ -920,6 +926,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 
 	inode.mu.Lock()
 	inode.StagedFile = nil
+	inode.fs.stagedFiles.Delete(inode.Id)
 	inode.mu.Unlock()
 }
 
