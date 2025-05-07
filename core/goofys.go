@@ -831,23 +831,31 @@ func (fs *Goofys) EvictEntry(id fuseops.InodeID) bool {
 	return true
 }
 
-const stagedFileFlushInterval = 5 * time.Second
-
 func (fs *Goofys) StagedFileFlusher() {
-	ticker := time.NewTicker(stagedFileFlushInterval)
+	ticker := time.NewTicker(fs.flags.StagedWriteFlushInterval)
 	defer ticker.Stop()
+
+	sem := make(chan struct{}, fs.flags.StagedWriteFlushConcurrency)
 
 	for {
 		select {
 		case <-ticker.C:
-			fs.stagedFiles.Range(func(key, value interface{}) bool {
+			fs.stagedFiles.Range(func(_, value interface{}) bool {
 				inode := value.(*Inode)
-
 				if inode.StagedFile != nil && inode.StagedFile.ReadyToFlush() {
-					log.Infof("StagedFileFlusher, queued to flush: %s", inode.FullName())
-					go fs.flushStagedFile(inode)
-				}
+					select {
+					case sem <- struct{}{}:
+						log.Infof("StagedFileFlusher: queued to flush %s", inode.FullName())
 
+						go func(inode *Inode) {
+							defer func() { <-sem }()
+							fs.flushStagedFile(inode)
+						}(inode)
+
+					default:
+						log.Debugf("StagedFileFlusher: concurrency limit reached, skipping %s", inode.FullName())
+					}
+				}
 				return true
 			})
 		case <-fs.shutdownCh:
