@@ -135,7 +135,11 @@ func (stagedFile *StagedFile) Cleanup() {
 	fullPath := stagedFile.FD.Name()
 	stagedFile.FD.Close()
 	stagedFile.mu.Unlock()
-	os.RemoveAll(fullPath)
+
+	err := os.RemoveAll(fullPath)
+	if err != nil {
+		log.Warnf("StagedFile, failed to remove file: %s", err)
+	}
 }
 
 type Inode struct {

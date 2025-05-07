@@ -2073,6 +2073,15 @@ func (inode *Inode) finalizeAndHash() error {
 
 	log.Infof("Called finalizeAndHash: %s", inode.FullName())
 
+	// If this was a staged file, cleanup
+	if inode.StagedFile != nil {
+		defer func() {
+			sf := inode.StagedFile
+			sf.Cleanup()
+			inode.StagedFile = nil
+		}()
+	}
+
 	// If this was a multipart upload, use the incremental hash
 	if inode.mpu != nil && inode.hashInProgress != nil {
 		inode.hashLock.Lock()
@@ -2084,7 +2093,6 @@ func (inode *Inode) finalizeAndHash() error {
 		}
 
 		log.Infof("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
-
 		if inode.userMetadata == nil {
 			inode.userMetadata = make(map[string][]byte)
 		}
@@ -2093,12 +2101,6 @@ func (inode *Inode) finalizeAndHash() error {
 		inode.sendUpdateMeta()
 
 		return nil
-	}
-
-	if inode.StagedFile != nil {
-		sf := inode.StagedFile
-		sf.Cleanup()
-		inode.StagedFile = nil
 	}
 
 	// For small files, just hash the whole file at once (we're already locking the range so no evictions can happen before this call)
@@ -2113,8 +2115,7 @@ func (inode *Inode) finalizeAndHash() error {
 	}
 	hash := hex.EncodeToString(hasher.Sum(nil))
 
-	log.Debugf("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
-
+	log.Infof("Computed and stored hash of file '%s': %s", inode.FullName(), hash)
 	if inode.userMetadata == nil {
 		inode.userMetadata = make(map[string][]byte)
 	}
@@ -2142,8 +2143,6 @@ func (inode *Inode) updateFromFlush(size uint64, etag *string, lastModified *tim
 
 func (inode *Inode) SyncFile() (err error) {
 	inode.logFuse("SyncFile")
-
-	log.Infof("SyncFile: %s", inode.FullName())
 
 	for {
 		inode.mu.Lock()
