@@ -860,10 +860,6 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		return
 	}
 
-	// Lock the staged file for the entire operation
-	stagedFile.mu.Lock()
-	defer stagedFile.mu.Unlock()
-
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
 
@@ -885,24 +881,31 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		// Lock this part's range while we're reading and staging it
 		inode.LockRange(uint64(offset), chunkSize, true)
 
-		buf := make([]byte, chunkSize)
-		n, err := stagedFile.FD.ReadAt(buf, offset)
-		if err != nil && err != io.EOF {
-			log.Errorf("Error reading from staged file: %v", err)
-			inode.UnlockRange(uint64(offset), chunkSize, true)
-			break
-		}
-		if n == 0 {
-			inode.UnlockRange(uint64(offset), chunkSize, true)
-			break
-		}
+		var n int
+		var err error
+		{
+			stagedFile.mu.Lock()
+			buf := make([]byte, chunkSize)
+			n, err = stagedFile.FD.ReadAt(buf, offset)
+			stagedFile.mu.Unlock()
 
-		fh := stagedFile.FH
-		err = fh.WriteFile(offset, buf[:n], true)
-		if err != nil {
-			log.Errorf("Error staging data for flush: %v", err)
-			inode.UnlockRange(uint64(offset), chunkSize, true)
-			break
+			if err != nil && err != io.EOF {
+				log.Errorf("Error reading from staged file: %v", err)
+				inode.UnlockRange(uint64(offset), chunkSize, true)
+				break
+			}
+			if n == 0 {
+				inode.UnlockRange(uint64(offset), chunkSize, true)
+				break
+			}
+
+			fh := stagedFile.FH
+			err = fh.WriteFile(offset, buf[:n], true)
+			if err != nil {
+				log.Errorf("Error staging data for flush: %v", err)
+				inode.UnlockRange(uint64(offset), chunkSize, true)
+				break
+			}
 		}
 
 		// Unlock this part's range after it's staged

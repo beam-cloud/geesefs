@@ -548,9 +548,6 @@ func (fs *GoofysFuse) ReleaseFileHandle(
 		return nil
 	}
 
-	// Get a reference to the staged file before releasing the handle
-	stagedFile := fh.inode.StagedFile
-
 	fh.Release()
 	atomic.AddInt64(&fs.stats.noops, 1)
 	fuseLog.Debugln("ReleaseFileHandle", fh.inode.FullName(), op.Handle, fh.inode.Id)
@@ -562,11 +559,6 @@ func (fs *GoofysFuse) ReleaseFileHandle(
 		if err != nil {
 			return err
 		}
-	}
-
-	// If this was the last handle and we have a staged file, try to clean it up
-	if stagedFile != nil {
-		stagedFile.Cleanup()
 	}
 
 	return nil
