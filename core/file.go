@@ -893,6 +893,7 @@ func (inode *Inode) TryFlush(priority int) bool {
 func (inode *Inode) sendUpload(priority int) bool {
 	log.Infof("sendUpload: %s", inode.FullName())
 	if inode.oldParent != nil && inode.IsFlushing == 0 && inode.mpu == nil {
+		log.Infof("sendUpload: %s, sending rename", inode.FullName())
 		// Rename file
 		inode.sendRename()
 		return true
@@ -902,6 +903,7 @@ func (inode *Inode) sendUpload(priority int) bool {
 		inode.oldParent == nil && inode.IsFlushing == 0 {
 		hasDirty := inode.buffers.AnyUnclean()
 		if !hasDirty {
+			log.Infof("sendUpload: %s, sending updateMeta", inode.FullName())
 			// Update metadata by COPYing into the same object
 			// It results in the optimized implementation in S3
 			inode.sendUpdateMeta()
@@ -909,10 +911,12 @@ func (inode *Inode) sendUpload(priority int) bool {
 		}
 	}
 
+	log.Infof("sendUpload: %s, checking max parallel parts", inode.FullName())
 	if inode.IsFlushing >= inode.fs.flags.MaxParallelParts {
 		return false
 	}
 
+	log.Infof("sendUpload: %s, checking smallFile", inode.FullName())
 	smallFile := inode.Attributes.Size <= inode.fs.flags.SinglePartMB*1024*1024
 	canPatch := inode.fs.flags.UsePatch &&
 		// Can only patch modified inodes with completed MPUs.
@@ -924,6 +928,8 @@ func (inode *Inode) sendUpload(priority int) bool {
 		inode.knownSize > 0 &&
 		// Currently PATCH does not support truncates. If the file was truncated, reupload it.
 		inode.knownSize <= inode.Attributes.Size
+
+	log.Infof("sendUpload: %s, canPatch: %t", inode.FullName(), canPatch)
 
 	if canPatch {
 		return inode.patchObjectRanges()
@@ -946,6 +952,8 @@ func (inode *Inode) sendUpload(priority int) bool {
 
 	// Initiate multipart upload, if not yet
 	if inode.mpu == nil {
+		log.Infof("sendUpload: %s, initiating multipart upload", inode.FullName())
+
 		// Wait for other updates to complete.
 		if inode.IsFlushing > 0 {
 			return false
@@ -961,12 +969,15 @@ func (inode *Inode) sendUpload(priority int) bool {
 	// Pick part(s) to flush
 	initiated, canComplete := inode.sendUploadParts(priority)
 	if initiated {
+		log.Infof("sendUpload: %s, initiated multipart upload", inode.FullName())
 		return true
 	}
 
 	canComplete = canComplete && !inode.IsRangeLocked(0, inode.Attributes.Size, true)
 
 	if canComplete && (inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.wantFree) > 0) {
+		log.Infof("sendUpload: %s, completing multipart upload", inode.FullName())
+
 		// Complete the multipart upload
 		inode.IsFlushing += inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.stats.flushes, 1)
