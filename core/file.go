@@ -181,9 +181,12 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 		return syscall.EFBIG
 	}
 
+	log.Infof("WriteFileStaged: %s", fh.inode.FullName())
 	if fh.inode.fs.flags.StagedWriteModeEnabled {
+		log.Infof("WriteFileStaged: %s", fh.inode.FullName())
 		_, ok := fh.inode.fs.stagedFiles.Load(fh.inode.Id)
 		if !ok {
+			log.Infof("WriteFileStaged: getOrCreateStagedFile: %s", fh.inode.FullName())
 			err = fh.getOrCreateStagedFile()
 			if err != nil {
 				return err

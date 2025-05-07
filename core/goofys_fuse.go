@@ -593,8 +593,10 @@ func (fs *GoofysFuse) CreateFile(
 	op.Handle = fs.AddFileHandle(fh)
 
 	if fs.flags.StagedWriteModeEnabled {
+		log.Infof("CreateFile: %s", inode.FullName())
 		_, ok := fs.stagedFiles.Load(inode.Id)
 		if !ok {
+			log.Infof("CreateFile: getOrCreateStagedFile: %s", inode.FullName())
 			err = fh.getOrCreateStagedFile()
 			if err != nil {
 				return err
