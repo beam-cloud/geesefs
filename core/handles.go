@@ -113,13 +113,13 @@ func (stagedFile *StagedFile) ReadyToFlush() bool {
 func (stagedFile *StagedFile) Cleanup() {
 	log.Infof("Cleaning up staged file: %s", stagedFile.FH.inode.FullName())
 
+	stagedFile.mu.Lock()
 	fh := stagedFile.FH
+	stagedFile.mu.Unlock()
 
 	// Wait until all file handles are closed and no flushes are in progress
 	for {
-		fh.inode.mu.Lock()
 		busy := fh.inode.fileHandles > 0 || fh.inode.IsFlushing > 0
-		fh.inode.mu.Unlock()
 		if !busy {
 			break
 		}
@@ -127,6 +127,8 @@ func (stagedFile *StagedFile) Cleanup() {
 		log.Infof("StagedFile, waiting for file to be flushed: %s", fh.inode.FullName())
 		time.Sleep(100 * time.Millisecond)
 	}
+
+	log.Infof("StagedFile, removing file: %s", fh.inode.FullName())
 
 	// Now it's safe to close and remove the file
 	stagedFile.mu.Lock()
@@ -138,6 +140,8 @@ func (stagedFile *StagedFile) Cleanup() {
 	if err != nil {
 		log.Warnf("Failed to remove staging file: %v", err)
 	}
+
+	log.Infof("StagedFile, removed file: %s", fh.inode.FullName())
 }
 
 type Inode struct {
