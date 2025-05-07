@@ -594,14 +594,17 @@ func (fs *GoofysFuse) CreateFile(
 
 	op.Handle = fs.AddFileHandle(fh)
 
-	inode.logFuse("<-- CreateFile")
-
-	if fh.inode.StagedFile == nil {
-		err = fh.getOrCreateStagingFile()
-		if err != nil {
-			return err
+	if fs.flags.StagedWriteModeEnabled {
+		_, ok := fs.stagedFiles.Load(inode.Id)
+		if !ok {
+			err = fh.getOrCreateStagedFile()
+			if err != nil {
+				return err
+			}
 		}
 	}
+
+	inode.logFuse("<-- CreateFile")
 
 	return
 }

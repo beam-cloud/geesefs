@@ -137,7 +137,7 @@ func (inode *Inode) checkPauseWriters() {
 	}
 }
 
-func (fh *FileHandle) getOrCreateStagingFile() (err error) {
+func (fh *FileHandle) getOrCreateStagedFile() (err error) {
 	if fh.inode.StagedFile != nil {
 		return nil
 	}
@@ -181,10 +181,13 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 		return syscall.EFBIG
 	}
 
-	if fh.inode.fs.flags.StagedWriteModeEnabled && fh.inode.StagedFile == nil {
-		err = fh.getOrCreateStagingFile()
-		if err != nil {
-			return err
+	if fh.inode.fs.flags.StagedWriteModeEnabled {
+		_, ok := fh.inode.fs.stagedFiles.Load(fh.inode.Id)
+		if !ok {
+			err = fh.getOrCreateStagedFile()
+			if err != nil {
+				return err
+			}
 		}
 	}
 
