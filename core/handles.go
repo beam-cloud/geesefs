@@ -111,7 +111,7 @@ func (stagedFile *StagedFile) ReadyToFlush() bool {
 }
 
 func (stagedFile *StagedFile) Cleanup() {
-	log.Infof("Cleaning up staged file: %s", stagedFile.FH.inode.FullName())
+	log.Debugf("Cleaning up staged file: %s", stagedFile.FH.inode.FullName())
 
 	stagedFile.mu.Lock()
 	fh := stagedFile.FH
@@ -124,11 +124,8 @@ func (stagedFile *StagedFile) Cleanup() {
 			break
 		}
 
-		log.Infof("StagedFile, waiting for file to be flushed: %s", fh.inode.FullName())
 		time.Sleep(100 * time.Millisecond)
 	}
-
-	log.Infof("StagedFile, removing file: %s", fh.inode.FullName())
 
 	// Now it's safe to close and remove the file
 	stagedFile.mu.Lock()
