@@ -873,6 +873,10 @@ func (fs *Goofys) StagedFileFlusher() {
 func (fs *Goofys) flushStagedFile(inode *Inode) {
 	inode.mu.Lock()
 	stagedFile := inode.StagedFile
+	if stagedFile == nil {
+		return
+	}
+
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
 
 	if inode.hashInProgress == nil && totalSize >= int64(inode.fs.flags.MinFileSizeForHashKB*1024) {
@@ -880,14 +884,9 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		inode.hashOffset = 0
 		inode.pendingHashParts = make(map[uint64][]byte)
 	}
-
 	inode.mu.Unlock()
 
 	log.Infof("flushStagedFile: %s", inode.FullName())
-
-	if stagedFile == nil {
-		return
-	}
 
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
@@ -945,14 +944,13 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		}
 	}
 
-	log.Infof("flushStagedFile: calling cleanup %s", inode.FullName())
-	stagedFile.Cleanup()
-	log.Infof("flushStagedFile: cleanup done %s", inode.FullName())
-
-	inode.mu.Lock()
-	inode.StagedFile = nil
-	inode.fs.stagedFiles.Delete(inode.Id)
-	inode.mu.Unlock()
+	// log.Infof("flushStagedFile: calling cleanup %s", inode.FullName())
+	// stagedFile.Cleanup()
+	// log.Infof("flushStagedFile: cleanup done %s", inode.FullName())
+	// inode.mu.Lock()
+	// inode.StagedFile = nil
+	// inode.fs.stagedFiles.Delete(inode.Id)
+	// inode.mu.Unlock()
 }
 
 func (fs *Goofys) WaitForFlush() {
