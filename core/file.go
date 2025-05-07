@@ -194,6 +194,12 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 	}
 	defer fh.inode.mu.Unlock()
 
+	_, err = fh.inode.StagedFile.FD.WriteAt(data, offset)
+	if err != nil {
+		return err
+	}
+	fh.inode.StagedFile.lastWriteAt = time.Now()
+
 	fh.inode.checkPauseWriters()
 	if fh.inode.Attributes.Size < end {
 		fh.inode.Attributes.Size = end
@@ -203,12 +209,6 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 	if fh.inode.CacheState == ST_CACHED {
 		fh.inode.SetCacheState(ST_MODIFIED)
 	}
-
-	_, err = fh.inode.StagedFile.FD.WriteAt(data, offset)
-	if err != nil {
-		return err
-	}
-	fh.inode.StagedFile.lastWriteAt = time.Now()
 
 	return
 }
@@ -2126,6 +2126,9 @@ func (inode *Inode) updateFromFlush(size uint64, etag *string, lastModified *tim
 
 func (inode *Inode) SyncFile() (err error) {
 	inode.logFuse("SyncFile")
+
+	log.Infof("SyncFile: %s", inode.FullName())
+
 	for {
 		inode.mu.Lock()
 		inode.forceFlush = false
