@@ -716,6 +716,8 @@ func (s *S3Backend) mpuCopyParts(size int64, from string, to string, mpuId strin
 
 			partNum := int64(partIdx + 1)
 			wg.Go(func() error {
+				log.Infof("<from %v> -> <to %v> Copying part %v of %v", from, to, partNum, len(parts))
+
 				etag, err := s.mpuCopyPart(from, to, mpuId, bytes, partNum, srcEtag)
 				if err != nil {
 					return err
@@ -753,6 +755,8 @@ func (s *S3Backend) copyObjectMultipart(size int64, from string, to string, mpuI
 		panic(fmt.Sprintf("object size: %v exceeds maximum S3 MPU size: %v", size, MAX_S3_MPU_SIZE))
 	}
 
+	log.Infof("from=%v to=%v Starting multipart copy: size=%d mpuId=%s", from, to, size, mpuId)
+
 	if mpuId == "" {
 		params := &s3.CreateMultipartUploadInput{
 			Bucket:       &s.bucket,
@@ -777,6 +781,8 @@ func (s *S3Backend) copyObjectMultipart(size int64, from string, to string, mpuI
 			params.ACL = &s.config.ACL
 		}
 
+		log.Infof("from=%v to=%v Creating multipart upload: Bucket=%s, Key=%s, StorageClass=%v, ContentType=%v", from, to, s.bucket, to, storageClass, s.flags.GetMimeType(to))
+
 		resp, err := s.CreateMultipartUpload(params)
 		if err != nil {
 			return "", err
@@ -786,9 +792,13 @@ func (s *S3Backend) copyObjectMultipart(size int64, from string, to string, mpuI
 	}
 
 	partSizes := s.defaultCopyPartSizes(size)
+	log.Infof("from=%v to=%v Default part sizes: %+v", from, to, partSizes)
+
 	// Preserve original part sizes if patch is enabled.
 	if s.flags.UsePatch {
 		partSizes = s.flags.PartSizes
+		log.Infof("from=%v to=%v Using patched part sizes: %+v", from, to, partSizes)
+
 	}
 
 	parts, err := s.mpuCopyParts(size, from, to, mpuId, srcEtag, partSizes)
@@ -826,9 +836,13 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 
 	from := s.bucket + "/" + param.Source
 
+	log.Infof("from=%v to=%v CopyBlob called: Source=%s, Destination=%s, Size=%v, Threshold=%v", from, param.Destination, param.Source, param.Destination, param.Size, s.config.MultipartCopyThreshold)
+
 	// Copy into the same object is used to just update metadata
 	// and should be very quick regardless of parameters
 	if param.Source != param.Destination || *param.Size > s.config.MultipartCopyThreshold {
+		log.Infof("from=%v to=%v Entering metadata update/copy path: Source=%s, Destination=%s, Size=%v, Threshold=%v", from, param.Destination, param.Source, param.Destination, param.Size, s.config.MultipartCopyThreshold)
+
 		// FIXME Remove additional HEAD query
 		if param.Size == nil || param.ETag == nil || (*param.Size > s.config.MultipartCopyThreshold &&
 			(param.Metadata == nil || param.StorageClass == nil)) {
@@ -845,6 +859,7 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 				param.Metadata = resp.Metadata
 			}
 			param.StorageClass = resp.StorageClass
+			log.Infof("HEAD result: Size=%v, ETag=%v, Metadata=%v, StorageClass=%v", resp.Size, resp.ETag, resp.Metadata, resp.StorageClass)
 		}
 
 		if param.StorageClass == nil {
@@ -852,11 +867,14 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 		}
 
 		if !s.gcs && *param.Size > s.config.MultipartCopyThreshold {
+			s3Log.Infof("from=%v to=%v Using multipart copy: Size=%v > Threshold=%v", from, param.Destination, *param.Size, s.config.MultipartCopyThreshold)
 			reqId, err := s.copyObjectMultipart(int64(*param.Size), from, param.Destination, "", param.ETag, param.Metadata, param.StorageClass)
 			if err != nil {
 				return nil, err
 			}
 			return &CopyBlobOutput{reqId}, nil
+		} else {
+			log.Infof("from=%v to=%v Using single-part CopyObject (should only happen for small objects or GCS)", from, param.Destination)
 		}
 	}
 
