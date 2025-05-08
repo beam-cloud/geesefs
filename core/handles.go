@@ -95,6 +95,9 @@ type StagedFile struct {
 }
 
 func (stagedFile *StagedFile) ReadyToFlush() bool {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
 	if stagedFile.flushing {
 		return false
 	}

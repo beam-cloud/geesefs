@@ -202,7 +202,10 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 	if err != nil {
 		return err
 	}
+
+	fh.inode.StagedFile.mu.Lock()
 	fh.inode.StagedFile.lastWriteAt = time.Now()
+	fh.inode.StagedFile.mu.Unlock()
 
 	fh.inode.checkPauseWriters()
 	if fh.inode.Attributes.Size < end {
