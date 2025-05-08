@@ -117,24 +117,6 @@ func (stagedFile *StagedFile) Cleanup() {
 	fh := stagedFile.FH
 	stagedFile.mu.Unlock()
 
-	log.Infof("StagedFile, waiting for file to be closed: %s", fh.inode.FullName())
-
-	hashInProgress := fh.inode.hashInProgress != nil
-
-	// Wait until all flushes are complete
-	for {
-		flushing := fh.inode.IsFlushing > 0
-
-		if !flushing && !hashInProgress {
-			break
-		}
-
-		log.Infof("StagedFile, waiting for flush / hashing: %s", fh.inode.FullName())
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	log.Infof("StagedFile, file is closed: %s", fh.inode.FullName())
-
 	// Now it's safe to close and remove the file
 	stagedFile.mu.Lock()
 	fullPath := stagedFile.FD.Name()
