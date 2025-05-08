@@ -111,14 +111,10 @@ func (stagedFile *StagedFile) ReadyToFlush() bool {
 }
 
 func (stagedFile *StagedFile) Cleanup() {
-	log.Infof("Cleaning up staged file: %s", stagedFile.FH.inode.FullName())
+	log.Debugf("Cleaning up staged file: %s", stagedFile.FH.inode.FullName())
 
 	stagedFile.mu.Lock()
 	fh := stagedFile.FH
-	stagedFile.mu.Unlock()
-
-	// Now it's safe to close and remove the file
-	stagedFile.mu.Lock()
 	fullPath := stagedFile.FD.Name()
 	stagedFile.FD.Close()
 	stagedFile.mu.Unlock()
@@ -132,7 +128,7 @@ func (stagedFile *StagedFile) Cleanup() {
 		fh.inode.fs.flags.StagedWriteUploadCallback(fh.inode.FullName(), int64(fh.inode.Attributes.Size))
 	}
 
-	log.Infof("StagedFile, removed file: %s", fh.inode.FullName())
+	log.Debugf("Removed staged file: %s", fh.inode.FullName())
 }
 
 type Inode struct {
@@ -1092,7 +1088,7 @@ func (inode *Inode) DumpThis(withBuffers bool) (children []*Inode) {
 }
 
 func (inode *Inode) waitForHashToComplete(size uint64) (string, error) {
-	timeout := time.After(cfg.DefaultHashTimeout)
+	timeout := time.After(inode.fs.flags.HashTimeout)
 
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()

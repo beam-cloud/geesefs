@@ -67,6 +67,7 @@ type FlagStorage struct {
 	// External Caching
 	ExternalCacheClient  ContentCache
 	HashAttr             string
+	HashTimeout          time.Duration
 	MinFileSizeForHashKB uint64
 
 	// Tuning
@@ -186,8 +187,6 @@ var defaultHTTPTransport = http.Transport{
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: 10 * time.Second,
 }
-
-var DefaultHashTimeout = 60 * time.Second
 
 func GetHTTPTransport() *http.Transport {
 	return &defaultHTTPTransport

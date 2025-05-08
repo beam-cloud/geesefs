@@ -131,8 +131,6 @@ type Goofys struct {
 	cachingStatusMu sync.Mutex
 
 	stagedFiles sync.Map
-
-	stagedFlushSem chan struct{}
 }
 
 type OpStats struct {
@@ -403,8 +401,6 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 	go fs.MetaEvictor()
 	go fs.StagedFileFlusher()
 	go fs.processCacheEvents()
-
-	fs.stagedFlushSem = make(chan struct{}, fs.flags.StagedWriteFlushConcurrency)
 
 	return fs, nil
 }
@@ -840,7 +836,6 @@ func (fs *Goofys) StagedFileFlusher() {
 	defer ticker.Stop()
 
 	sem := make(chan struct{}, fs.flags.StagedWriteFlushConcurrency)
-	log.Infof("StagedFileFlusher: concurrency limit: %d", fs.flags.StagedWriteFlushConcurrency)
 
 	for {
 		select {
@@ -850,14 +845,15 @@ func (fs *Goofys) StagedFileFlusher() {
 				if inode.StagedFile != nil && inode.StagedFile.ReadyToFlush() {
 					select {
 					case sem <- struct{}{}:
-						log.Infof("StagedFileFlusher: queued to flush %s", inode.FullName())
+						log.Debugf("StagedFileFlusher: queued to flush %s", inode.FullName())
+
 						go func(inode *Inode) {
 							defer func() { <-sem }()
 							fs.flushStagedFile(inode)
 						}(inode)
 					default:
 						// Concurrency limit reached, do not start more
-						log.Infof("StagedFileFlusher: concurrency limit reached, skipping %s", inode.FullName())
+						log.Debugf("StagedFileFlusher: concurrency limit reached, skipping %s", inode.FullName())
 					}
 				}
 				return true

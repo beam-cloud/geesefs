@@ -1097,6 +1097,7 @@ func DefaultFlags() *FlagStorage {
 		RdevAttr:             "rdev",
 		MtimeAttr:            "mtime",
 		HashAttr:             "--content-sha256",
+		HashTimeout:          60 * time.Second,
 		MinFileSizeForHashKB: 1024 * 10,
 		SymlinkAttr:          "--symlink-target",
 		SymlinkZeroed:        false,
