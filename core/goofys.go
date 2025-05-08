@@ -16,8 +16,6 @@
 package core
 
 import (
-	"crypto/sha256"
-
 	"github.com/yandex-cloud/geesefs/core/cfg"
 
 	"context"
@@ -878,15 +876,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	}
 
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
-
-	if inode.hashInProgress == nil && totalSize >= int64(inode.fs.flags.MinFileSizeForHashKB*1024) {
-		inode.hashInProgress = sha256.New()
-		inode.hashOffset = 0
-		inode.pendingHashParts = make(map[uint64][]byte)
-	}
 	inode.mu.Unlock()
-
-	log.Infof("flushStagedFile: %s", inode.FullName())
 
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
@@ -944,13 +934,17 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		}
 	}
 
-	// log.Infof("flushStagedFile: calling cleanup %s", inode.FullName())
-	// stagedFile.Cleanup()
-	// log.Infof("flushStagedFile: cleanup done %s", inode.FullName())
-	// inode.mu.Lock()
-	// inode.StagedFile = nil
-	// inode.fs.stagedFiles.Delete(inode.Id)
-	// inode.mu.Unlock()
+	err := inode.SyncFile()
+	if err != nil {
+		return
+	}
+
+	stagedFile.Cleanup()
+
+	inode.mu.Lock()
+	inode.StagedFile = nil
+	inode.fs.stagedFiles.Delete(inode.Id)
+	inode.mu.Unlock()
 }
 
 func (fs *Goofys) WaitForFlush() {

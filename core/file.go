@@ -1757,6 +1757,7 @@ func (inode *Inode) flushSmallObject() {
 		}
 	} else {
 		log.Debugf("Flushed small file %v (inode %v): etag=%v, size=%v", key, inode.Id, NilStr(resp.ETag), sz)
+
 		inode.buffers.SetState(0, sz, bufIds, BUF_CLEAN)
 		inode.updateFromFlush(sz, resp.ETag, resp.LastModified, resp.StorageClass)
 		if inode.CacheState == ST_CREATED || inode.CacheState == ST_MODIFIED {
@@ -2157,7 +2158,10 @@ func (inode *Inode) SyncFile() (err error) {
 		}
 		inode.fs.flusherMu.Unlock()
 	}
+
 	inode.logFuse("Done SyncFile")
+
+	log.Infof("Done SyncFile: %s", inode.FullName())
 	return
 }
 
