@@ -747,12 +747,12 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 		fh.inode.mu.Lock()
 		cloud, path := fh.inode.cloud()
 		head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
-		if err != nil {
+		if err == nil {
+			fh.inode.setMetadata(head.Metadata)
+			fh.inode.mu.Unlock()
+		} else {
 			log.Errorf("Error getting head blob: %v", err)
 		}
-
-		fh.inode.setMetadata(head.Metadata)
-		fh.inode.mu.Unlock()
 	}
 
 	// Lock inode
@@ -2140,6 +2140,10 @@ func (inode *Inode) updateFromFlush(size uint64, etag *string, lastModified *tim
 
 func (inode *Inode) SyncFile() (err error) {
 	inode.logFuse("SyncFile")
+
+	if inode.StagedFile != nil {
+		inode.fs.flushStagedFile(inode)
+	}
 
 	for {
 		inode.mu.Lock()
