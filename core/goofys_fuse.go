@@ -557,7 +557,7 @@ func (fs *GoofysFuse) ReleaseFileHandle(
 	if fh.inode.fs.flags.FsyncOnClose {
 		log.Infof("FsyncOnClose: %v", fh.inode.FullName())
 
-		if fh.inode.StagedFile != nil && strings.HasPrefix(fh.inode.FullName(), "/outputs") {
+		if fh.inode.StagedFile != nil && strings.HasPrefix(fh.inode.FullName(), "outputs/") {
 			fh.inode.fs.flushStagedFile(fh.inode)
 		} else {
 			err = fh.inode.SyncFile()
