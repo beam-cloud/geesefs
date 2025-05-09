@@ -555,9 +555,15 @@ func (fs *GoofysFuse) ReleaseFileHandle(
 	fs.mu.Unlock()
 
 	if fh.inode.fs.flags.FsyncOnClose {
-		err = fh.inode.SyncFile()
-		if err != nil {
-			return err
+		log.Infof("FsyncOnClose: %v", fh.inode.FullName())
+
+		if fh.inode.StagedFile != nil {
+			fh.inode.fs.flushStagedFile(fh.inode)
+		} else {
+			err = fh.inode.SyncFile()
+			if err != nil {
+				return err
+			}
 		}
 	}
 

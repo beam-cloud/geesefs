@@ -2141,10 +2141,6 @@ func (inode *Inode) updateFromFlush(size uint64, etag *string, lastModified *tim
 func (inode *Inode) SyncFile() (err error) {
 	inode.logFuse("SyncFile")
 
-	if inode.StagedFile != nil {
-		inode.fs.flushStagedFile(inode)
-	}
-
 	for {
 		inode.mu.Lock()
 		inode.forceFlush = false
