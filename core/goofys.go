@@ -848,7 +848,7 @@ func (fs *Goofys) StagedFileFlusher() {
 	for {
 		select {
 		case <-ticker.C:
-			fs.stagedFiles.Range(func(_, value interface{}) bool {
+			fs.stagedFiles.Range(func(key, value interface{}) bool {
 				inode := value.(*Inode)
 				if inode.StagedFile != nil && inode.StagedFile.ReadyToFlush() {
 					select {
@@ -881,6 +881,15 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		return
 	}
 
+	defer func(stagedFile *StagedFile) {
+		// Call Cleanup before locking inode.mu to avoid lock order inversion
+		stagedFile.Cleanup()
+		inode.mu.Lock()
+		inode.StagedFile = nil
+		inode.fs.stagedFiles.Delete(inode.Id)
+		inode.mu.Unlock()
+	}(stagedFile)
+
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
 	inode.mu.Unlock()
 
@@ -909,7 +918,9 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		}
 
 		// Lock this part's range while we're reading / flushing it
+		inode.mu.Lock()
 		inode.LockRange(uint64(offset), chunkSize, true)
+		inode.mu.Unlock()
 
 		var n int
 		var err error
@@ -921,11 +932,15 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 
 			if err != nil && err != io.EOF {
 				log.Errorf("Error reading from staged file: %v", err)
+				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
+				inode.mu.Unlock()
 				break
 			}
 			if n == 0 {
+				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
+				inode.mu.Unlock()
 				break
 			}
 
@@ -933,27 +948,23 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 			err = fh.WriteFile(offset, buf[:n], true)
 			if err != nil {
 				log.Errorf("Error writing staged data data for flush: %v", err)
+				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
+				inode.mu.Unlock()
 				break
 			}
 		}
 
 		// Unlock this part's range after it's ready to flush
+		inode.mu.Lock()
 		inode.UnlockRange(uint64(offset), chunkSize, true)
+		inode.mu.Unlock()
 
 		offset += int64(n)
 		if err == io.EOF {
 			break
 		}
 	}
-
-	defer func() {
-		stagedFile.Cleanup()
-		inode.mu.Lock()
-		inode.StagedFile = nil
-		inode.fs.stagedFiles.Delete(inode.Id)
-		inode.mu.Unlock()
-	}()
 
 	err := inode.SyncFile()
 	if err != nil {
@@ -969,14 +980,19 @@ func (fs *Goofys) WaitForFlush() {
 
 			fs.stagedFiles.Range(func(key, value interface{}) bool {
 				inode := value.(*Inode)
+				inode.mu.Lock()
 
-				log.Debugf("Waiting for flush to complete: inode=%s, lastWriteAt=%v, lastReadAt=%v, flushing=%v, shouldFlush=%v",
-					inode.FullName(),
-					inode.StagedFile.lastWriteAt,
-					inode.StagedFile.lastReadAt,
-					inode.StagedFile.flushing,
-					inode.StagedFile.shouldFlush,
-				)
+				stagedFile := inode.StagedFile
+				if stagedFile != nil {
+					log.Debugf("Waiting for flush to complete: inode=%s, lastWriteAt=%v, lastReadAt=%v, flushing=%v, shouldFlush=%v",
+						inode.FullName(),
+						stagedFile.lastWriteAt,
+						stagedFile.lastReadAt,
+						stagedFile.flushing,
+						stagedFile.shouldFlush,
+					)
+				}
+				inode.mu.Unlock()
 
 				fs.flushStagedFile(inode)
 				return true
