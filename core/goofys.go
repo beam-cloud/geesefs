@@ -452,10 +452,11 @@ func (fs *Goofys) processCacheEvents() {
 				} else if hash != string(knownHash) {
 					log.Debugf("Hash mismatch for inode: %v", inode.FullName())
 					continue
+				} else if hash == string(knownHash) {
+					log.Debugf("Successfully cached inode: %v", inode.FullName())
 				}
 
 				fs.clearCachingStatus(inode.FullName())
-				log.Debugf("Successfully cached inode: %v", inode.FullName())
 			}
 		}
 	}
@@ -944,17 +945,19 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		}
 	}
 
+	defer func() {
+		stagedFile.Cleanup()
+		inode.mu.Lock()
+		inode.StagedFile = nil
+		inode.fs.stagedFiles.Delete(inode.Id)
+		inode.mu.Unlock()
+	}()
+
 	err := inode.SyncFile()
 	if err != nil {
+		log.Errorf("Error syncing staged file: %v", err)
 		return
 	}
-
-	stagedFile.Cleanup()
-
-	inode.mu.Lock()
-	inode.StagedFile = nil
-	inode.fs.stagedFiles.Delete(inode.Id)
-	inode.mu.Unlock()
 }
 
 func (fs *Goofys) WaitForFlush() {
