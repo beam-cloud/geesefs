@@ -970,7 +970,7 @@ func (fs *Goofys) WaitForFlush() {
 			fs.stagedFiles.Range(func(key, value interface{}) bool {
 				inode := value.(*Inode)
 
-				log.Infof("Waiting for flush to complete: inode=%s, lastWriteAt=%v, lastReadAt=%v, flushing=%v, shouldFlush=%v",
+				log.Debugf("Waiting for flush to complete: inode=%s, lastWriteAt=%v, lastReadAt=%v, flushing=%v, shouldFlush=%v",
 					inode.FullName(),
 					inode.StagedFile.lastWriteAt,
 					inode.StagedFile.lastReadAt,
