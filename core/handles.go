@@ -120,6 +120,7 @@ func (stagedFile *StagedFile) Cleanup() {
 	fh := stagedFile.FH
 	fullPath := stagedFile.FD.Name()
 	stagedFile.FD.Close()
+	stagedFile.FD = nil
 	stagedFile.mu.Unlock()
 
 	err := os.RemoveAll(fullPath)

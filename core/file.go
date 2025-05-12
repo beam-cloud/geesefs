@@ -362,6 +362,10 @@ func (inode *Inode) loadFromStagedFile(diskRanges []Range) (allocated int64, err
 	inode.StagedFile.mu.Lock()
 	defer inode.StagedFile.mu.Unlock()
 
+	if inode.StagedFile.FD == nil {
+		return 0, syscall.EAGAIN
+	}
+
 	inode.StagedFile.lastReadAt = time.Now()
 	for _, rr := range diskRanges {
 		readSize := rr.End - rr.Start
