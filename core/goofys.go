@@ -968,8 +968,10 @@ func (fs *Goofys) WaitForFlush() {
 
 			fs.stagedFiles.Range(func(key, value interface{}) bool {
 				inode := value.(*Inode)
-
+				log.Debugf("WaitForFlush: checking inode=%s", inode.FullName())
 				inode.mu.Lock()
+				log.Debugf("WaitForFlush: locked inode=%s", inode.FullName())
+
 				stagedFile := inode.StagedFile
 				if stagedFile != nil {
 					hasStaged = true
@@ -977,9 +979,14 @@ func (fs *Goofys) WaitForFlush() {
 					stagedFile.mu.Lock()
 					if stagedFile.flushing {
 						anyFlushing = true
+					} else if stagedFile.ReadyToFlush() {
+						stagedFile.mu.Unlock()
+						inode.mu.Unlock()
+						fs.flushStagedFile(inode)
+						return true
 					}
-					stagedFile.mu.Unlock()
 
+					stagedFile.mu.Unlock()
 					log.Debugf("Waiting for flush to complete: inode=%s, lastWriteAt=%v, lastReadAt=%v, flushing=%v, shouldFlush=%v",
 						inode.FullName(),
 						stagedFile.lastWriteAt,
@@ -990,7 +997,7 @@ func (fs *Goofys) WaitForFlush() {
 				}
 				inode.mu.Unlock()
 
-				fs.flushStagedFile(inode)
+				log.Debugf("WaitForFlush: unlocked inode=%s", inode.FullName())
 				return true
 			})
 
