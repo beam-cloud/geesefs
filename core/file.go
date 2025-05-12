@@ -634,6 +634,15 @@ func (inode *Inode) IsRangeLocked(offset uint64, size uint64, onlyFlushing bool)
 	return false
 }
 
+func (inode *Inode) IsAnyRangeLocked(offset uint64, size uint64) bool {
+	for _, r := range inode.readRanges {
+		if r.Offset < offset+size && r.Offset+r.Size > offset {
+			return true
+		}
+	}
+	return false
+}
+
 func (inode *Inode) CheckLoadRange(offset, size, readAheadSize uint64, ignoreMemoryLimit bool) (bool, error) {
 	miss, err := inode.LoadRange(offset, size, readAheadSize, ignoreMemoryLimit)
 	if err == syscall.ESPIPE {

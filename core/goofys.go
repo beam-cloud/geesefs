@@ -638,7 +638,7 @@ func (fs *Goofys) FreeSomeCleanBuffers(origSize int64) (int64, bool) {
 		buf := inode.buffers.Get(cleanEnd)
 		// Never evict buffers flushed in an incomplete (last) part
 		if buf != nil && (buf.state == BUF_CLEAN || buf.state == BUF_FLUSHED_FULL) &&
-			buf.ptr != nil && !inode.IsRangeLocked(buf.offset, buf.length, false) {
+			buf.ptr != nil && !inode.IsAnyRangeLocked(buf.offset, buf.length) {
 			fs.tryEvictToDisk(inode, buf, &toFs)
 			allocated, _ := inode.buffers.EvictFromMemory(buf)
 			if allocated != 0 {
@@ -882,6 +882,12 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		return
 	}
 
+	stagedFile.mu.Lock()
+	if stagedFile.flushing {
+		stagedFile.mu.Unlock()
+		return
+	}
+
 	defer func(stagedFile *StagedFile) {
 		stagedFile.Cleanup()
 		inode.mu.Lock()
@@ -892,12 +898,6 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
 	inode.mu.Unlock()
-
-	stagedFile.mu.Lock()
-	if stagedFile.flushing {
-		stagedFile.mu.Unlock()
-		return
-	}
 
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
@@ -964,13 +964,22 @@ func (fs *Goofys) WaitForFlush() {
 	if fs.flags.StagedWriteModeEnabled {
 		for {
 			hasStaged := false
+			anyFlushing := false
 
 			fs.stagedFiles.Range(func(key, value interface{}) bool {
 				inode := value.(*Inode)
-				inode.mu.Lock()
 
+				inode.mu.Lock()
 				stagedFile := inode.StagedFile
 				if stagedFile != nil {
+					hasStaged = true
+
+					stagedFile.mu.Lock()
+					if stagedFile.flushing {
+						anyFlushing = true
+					}
+					stagedFile.mu.Unlock()
+
 					log.Debugf("Waiting for flush to complete: inode=%s, lastWriteAt=%v, lastReadAt=%v, flushing=%v, shouldFlush=%v",
 						inode.FullName(),
 						stagedFile.lastWriteAt,
@@ -985,7 +994,7 @@ func (fs *Goofys) WaitForFlush() {
 				return true
 			})
 
-			if !hasStaged {
+			if !hasStaged || !anyFlushing {
 				break
 			}
 
