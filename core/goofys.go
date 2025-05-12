@@ -875,6 +875,7 @@ func (fs *Goofys) StagedFileFlusher() {
 func (fs *Goofys) flushStagedFile(inode *Inode) {
 	inode.mu.Lock()
 	stagedFile := inode.StagedFile
+
 	if stagedFile == nil {
 		inode.fs.stagedFiles.Delete(inode.Id)
 		inode.mu.Unlock()
@@ -882,7 +883,6 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	}
 
 	defer func(stagedFile *StagedFile) {
-		// Call Cleanup before locking inode.mu to avoid lock order inversion
 		stagedFile.Cleanup()
 		inode.mu.Lock()
 		inode.StagedFile = nil
@@ -903,12 +903,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	stagedFile.shouldFlush = true
 	stagedFile.mu.Unlock()
 
-	// Wake up flusher
-	fs.flusherMu.Lock()
-	fs.flushPending = 1
-	fs.flusherCond.Broadcast()
-	fs.flusherMu.Unlock()
-
+	fs.WakeupFlusher()
 	offset := int64(0)
 
 	for offset < totalSize {
@@ -918,9 +913,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		}
 
 		// Lock this part's range while we're reading / flushing it
-		inode.mu.Lock()
 		inode.LockRange(uint64(offset), chunkSize, true)
-		inode.mu.Unlock()
 
 		var n int
 		var err error
@@ -932,33 +925,27 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 
 			if err != nil && err != io.EOF {
 				log.Errorf("Error reading from staged file: %v", err)
-				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
-				inode.mu.Unlock()
 				break
 			}
 			if n == 0 {
-				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
-				inode.mu.Unlock()
 				break
 			}
 
 			fh := stagedFile.FH
-			err = fh.WriteFile(offset, buf[:n], true)
+
+			copyData := len(buf) < cap(buf)-4096
+			err = fh.WriteFile(offset, buf[:n], copyData)
 			if err != nil {
 				log.Errorf("Error writing staged data data for flush: %v", err)
-				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
-				inode.mu.Unlock()
 				break
 			}
 		}
 
 		// Unlock this part's range after it's ready to flush
-		inode.mu.Lock()
 		inode.UnlockRange(uint64(offset), chunkSize, true)
-		inode.mu.Unlock()
 
 		offset += int64(n)
 		if err == io.EOF {
@@ -1019,6 +1006,7 @@ func (fs *Goofys) MetaEvictor() {
 			}
 			seen = make(map[fuseops.InodeID]bool)
 		}
+
 		// Try to keep the number of cached inodes under control %)
 		fs.mu.RLock()
 		totalInodes := len(fs.inodes)
