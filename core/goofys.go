@@ -874,8 +874,8 @@ func (fs *Goofys) StagedFileFlusher() {
 
 func (fs *Goofys) flushStagedFile(inode *Inode) {
 	inode.mu.Lock()
-	stagedFile := inode.StagedFile
 
+	stagedFile := inode.StagedFile
 	if stagedFile == nil {
 		inode.fs.stagedFiles.Delete(inode.Id)
 		inode.mu.Unlock()
@@ -885,6 +885,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	stagedFile.mu.Lock()
 	if stagedFile.flushing {
 		stagedFile.mu.Unlock()
+		inode.mu.Unlock()
 		return
 	}
 
