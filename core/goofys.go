@@ -498,10 +498,15 @@ func (fs *Goofys) clearCachingStatus(path string) {
 func (fs *Goofys) Shutdown() {
 	atomic.StoreInt32(&fs.shutdown, 1)
 	close(fs.shutdownCh)
+	log.Infof("Shutdown: shutting down (before flusher)")
 	fs.WakeupFlusher()
+
 	if fs.diskFdQueue != nil {
+		log.Infof("Shutdown: broadcasting disk fd queue")
 		fs.diskFdQueue.cond.Broadcast()
 	}
+
+	log.Infof("Shutdown: im done")
 }
 
 // from https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-golang

@@ -908,8 +908,10 @@ type FuseMfsWrapper struct {
 }
 
 func (m *FuseMfsWrapper) Unmount() error {
+	log.Infof("Unmount: attempting to unmount %v", m.mountPoint)
 	err := TryUnmount(m.mountPoint)
 	m.fs.Shutdown()
+	log.Infof("Unmount: successfully unmounted %v", m.mountPoint)
 	return err
 }
 
@@ -1045,10 +1047,13 @@ func TryUnmount(mountPoint string) (err error) {
 	for i := 0; i < 20; i++ {
 		err = fuse.Unmount(mountPoint)
 		if err != nil {
+			log.Infof("TryUnmount: error unmounting %v: %v", mountPoint, err)
 			time.Sleep(time.Second)
 		} else {
+			log.Infof("TryUnmount: successfully unmounted %v", mountPoint)
 			break
 		}
 	}
+
 	return
 }
