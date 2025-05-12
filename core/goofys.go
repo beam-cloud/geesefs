@@ -543,13 +543,16 @@ func (fs *Goofys) SigUsr1() {
 //
 // LOCKS_EXCLUDED(fs.mu)
 func (fs *Goofys) getInodeOrDie(id fuseops.InodeID) (inode *Inode) {
+	log.Infof("getInodeOrDie: id=%v", id)
 	fs.mu.RLock()
 	inode = fs.inodes[id]
+	log.Infof("getInodeOrDie: inode=%v", inode)
 	fs.mu.RUnlock()
 	if inode == nil {
 		panic(fmt.Sprintf("Unknown inode: %v", id))
 	}
 
+	log.Infof("getInodeOrDie: returning inode=%v", inode)
 	return
 }
 
@@ -867,6 +870,7 @@ func (fs *Goofys) StagedFileFlusher() {
 				return true
 			})
 		case <-fs.shutdownCh:
+			log.Infof("StagedFileFlusher: shutting down")
 			return
 		}
 	}
@@ -1001,6 +1005,8 @@ func (fs *Goofys) WaitForFlush() {
 			time.Sleep(1 * time.Second)
 		}
 	}
+
+	log.Infof("WaitForFlush: done")
 }
 
 func (fs *Goofys) MetaEvictor() {
@@ -1158,10 +1164,15 @@ func (fs *Goofys) Mount(mount *Mount) {
 
 func (fs *Goofys) Unmount(mountPoint string) {
 	mp := fs.getInodeOrDie(fuseops.RootInodeID)
+	defer func() {
+		log.Infof("Unmounted %v", mountPoint)
+	}()
 
+	log.Infof("Attempting to unmount %v", mountPoint)
 	fuseLog.Infof("Attempting to unmount %v", mountPoint)
 	path := strings.Split(strings.Trim(mountPoint, "/"), "/")
 	for _, localName := range path {
+		log.Infof("Attempting to unmount: localName=%v", localName)
 		dirInode := mp.findChild(localName)
 		if dirInode == nil || !dirInode.isDir() {
 			fuseLog.Errorf("Failed to find directory:%v while unmounting %v. "+
@@ -1170,6 +1181,7 @@ func (fs *Goofys) Unmount(mountPoint string) {
 		}
 		mp = dirInode
 	}
+	log.Infof("Unmounting: mp=%v", mp)
 	mp.addModified(-1)
 	mp.ResetForUnmount()
 	return

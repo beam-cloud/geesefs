@@ -899,6 +899,7 @@ func (inode *Inode) ResetForUnmount() {
 			inode.Name))
 	}
 
+	log.Infof("ResetForUnmount: inode=%v", inode.FullName())
 	inode.mu.Lock()
 	// First reset the cloud info for this directory. After that, any read and
 	// write operations under this directory will not know about this cloud.
