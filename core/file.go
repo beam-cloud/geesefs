@@ -16,6 +16,7 @@
 package core
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -1942,11 +1943,18 @@ func (inode *Inode) flushPart(part uint64) {
 		log.Errorf("BUG: Failed to get MultiReader for flushed part %v (%v-%v) of object %v: %v", part, partOffset, partSize, key, err)
 		return
 	}
+
+	bufData, err := io.ReadAll(bufReader)
+	if err != nil {
+		log.Errorf("Failed to read buffer data: %v", err)
+		return
+	}
+
 	bufLen := bufReader.Len()
 	partInput := MultipartBlobAddInput{
 		Commit:     inode.mpu,
 		PartNumber: uint32(part + 1),
-		Body:       bufReader,
+		Body:       bytes.NewReader(bufData),
 		Size:       bufLen,
 		Offset:     partOffset,
 	}
@@ -1982,7 +1990,7 @@ func (inode *Inode) flushPart(part uint64) {
 
 		// Only hash in chunks if it's a multipart upload
 		if inode.mpu != nil {
-			if err := inode.hashFlushedPart(partOffset, partSize); err != nil {
+			if err := inode.hashFlushedPart(partOffset, partSize, bufData); err != nil {
 				log.Warnf("Failed to hash flushed part %v of object %v: %v", part, key, err)
 			}
 		}

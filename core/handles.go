@@ -23,7 +23,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash"
-	"io"
 	"net/url"
 	"os"
 	"sort"
@@ -1120,16 +1119,7 @@ func (inode *Inode) waitForHashToComplete(size uint64) (string, error) {
 	}
 }
 
-func (inode *Inode) hashFlushedPart(partOffset, partSize uint64) error {
-	bufReader, _, err := inode.getMultiReader(partOffset, partSize)
-	if err != nil {
-		return err
-	}
-	data, err := io.ReadAll(bufReader)
-	if err != nil {
-		return err
-	}
-
+func (inode *Inode) hashFlushedPart(partOffset, partSize uint64, data []byte) error {
 	inode.hashLock.Lock()
 	defer inode.hashLock.Unlock()
 
