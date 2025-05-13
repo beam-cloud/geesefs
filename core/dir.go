@@ -1653,11 +1653,11 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 		// Handle staged file renames
 		if fromInode.StagedFile != nil && fromInode.StagedFile.FD != nil {
 			fs := fromInode.fs
-
 			oldStagedPath := fromInode.StagedFile.FD.Name()
 			newStagedDir := fs.flags.StagedWritePath + "/" + newParent.FullName()
 			newStagedPath := appendChildName(newStagedDir, to)
 
+			log.Debugf("Renaming staged file: inode=%v from=%v to=%v", fromInode.Id, fromInode.StagedFile.FD.Name(), newStagedPath)
 			if err := os.MkdirAll(newStagedDir, fs.flags.DirMode); err == nil {
 				err := os.Rename(oldStagedPath, newStagedPath)
 				if err == nil {

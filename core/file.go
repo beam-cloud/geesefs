@@ -864,6 +864,8 @@ func (inode *Inode) recordFlushError(err error) {
 }
 
 func (inode *Inode) TryFlush(priority int) bool {
+	log.Debugf("TryFlush: inode=%v", inode.FullName())
+
 	inode.mu.Lock()
 	stagedFile := inode.StagedFile
 	shouldFlush := false
@@ -872,7 +874,9 @@ func (inode *Inode) TryFlush(priority int) bool {
 	}
 	inode.mu.Unlock()
 
+	log.Debugf("TryFlush: inode=%v stagedFile=%v shouldFlush=%v", inode.FullName(), stagedFile, shouldFlush)
 	if stagedFile == nil || !shouldFlush {
+		log.Debugf("TryFlus returning: inode=%v stagedFile=%v shouldFlush=%v", inode.FullName(), stagedFile, shouldFlush)
 		return false
 	}
 
@@ -888,24 +892,30 @@ func (inode *Inode) TryFlush(priority int) bool {
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
 	if inode.Parent != parent {
+		log.Debugf("TryFlush: inode=%v parent=%v", inode.FullName(), inode.Parent.FullName())
 		return false
 	}
+
 	if inode.flushError != nil && time.Now().Sub(inode.flushErrorTime) < inode.fs.flags.RetryInterval {
+		log.Debugf("TryFlush: inode=%v flushError=%v", inode.FullName(), inode.flushError)
 		inode.fs.ScheduleRetryFlush()
 		return false
 	}
 	if inode.CacheState == ST_DELETED {
 		if inode.IsFlushing == 0 && (!inode.isDir() || atomic.LoadInt64(&inode.dir.ModifiedChildren) == 0) {
+			log.Debugf("TryFlush: inode=%v overDeleted=%v", inode.FullName(), overDeleted)
 			inode.SendDelete()
 			return true
 		}
 	} else if (inode.CacheState == ST_CREATED || inode.CacheState == ST_MODIFIED) && inode.isDir() {
 		if inode.IsFlushing == 0 && !overDeleted {
+			log.Debugf("TryFlush: inode=%v overDeleted=%v", inode.FullName(), overDeleted)
 			inode.SendMkDir()
 			return true
 		}
 	} else if inode.CacheState == ST_CREATED || inode.CacheState == ST_MODIFIED {
 		if overDeleted {
+			log.Debugf("TryFlush: inode=%v overDeleted=%v", inode.FullName(), overDeleted)
 			return false
 		}
 
