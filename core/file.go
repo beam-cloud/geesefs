@@ -1946,7 +1946,7 @@ func (inode *Inode) flushPart(part uint64) {
 
 	bufData, err := io.ReadAll(bufReader)
 	if err != nil {
-		log.Errorf("Failed to read buffer data for part %v (%v-%v) of object %v: %v", part, partOffset, partSize, key, err)
+		log.Errorf("BUG: Failed to read buffer data for part %v (%v-%v) of object %v: %v", part, partOffset, partSize, key, err)
 		return
 	}
 
