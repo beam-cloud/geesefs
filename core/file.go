@@ -139,6 +139,9 @@ func (inode *Inode) checkPauseWriters() {
 }
 
 func (fh *FileHandle) getOrCreateStagedFile() (err error) {
+	fh.inode.mu.Lock()
+	defer fh.inode.mu.Unlock()
+
 	if fh.inode.StagedFile != nil {
 		return nil
 	}
