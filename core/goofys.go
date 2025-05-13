@@ -848,7 +848,10 @@ func (fs *Goofys) StagedFileFlusher() {
 	for {
 		select {
 		case <-ticker.C:
+			stagedFilesExist := false
 			fs.stagedFiles.Range(func(key, value interface{}) bool {
+				stagedFilesExist = true
+
 				inode := value.(*Inode)
 				if inode.StagedFile != nil && inode.StagedFile.ReadyToFlush() {
 					select {
@@ -866,6 +869,10 @@ func (fs *Goofys) StagedFileFlusher() {
 				}
 				return true
 			})
+
+			if stagedFilesExist {
+				fs.WakeupFlusher()
+			}
 		case <-fs.shutdownCh:
 			return
 		}
