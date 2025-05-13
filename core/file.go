@@ -867,18 +867,24 @@ func (inode *Inode) TryFlush(priority int) bool {
 	log.Debugf("TryFlush: inode=%v", inode.FullName())
 
 	inode.mu.Lock()
-	stagedFile := inode.StagedFile
-	shouldFlush := false
-	if stagedFile != nil {
-		shouldFlush = stagedFile.shouldFlush
+	if sf := inode.StagedFile; sf != nil {
+		// if sf.Cancelled() {
+		// 	sf.Cleanup()
+		// 	inode.mu.Lock()
+		// 	inode.StagedFile = nil
+		// 	inode.fs.stagedFiles.Delete(inode.Id)
+		// 	inode.SetCacheState(ST_CACHED)
+		// 	inode.mu.Unlock()
+		// 	return false
+		// }
+
+		if !sf.shouldFlush {
+			log.Debugf("TryFlush, returning false: inode=%v stagedFile=%v shouldFlush=%v", inode.FullName(), sf, sf.shouldFlush)
+			inode.mu.Unlock()
+			return false
+		}
 	}
 	inode.mu.Unlock()
-
-	log.Debugf("TryFlush: inode=%v stagedFile=%v shouldFlush=%v", inode.FullName(), stagedFile, shouldFlush)
-	if stagedFile == nil || !shouldFlush {
-		log.Debugf("TryFlus returning: inode=%v stagedFile=%v shouldFlush=%v", inode.FullName(), stagedFile, shouldFlush)
-		return false
-	}
 
 	overDeleted := false
 	parent := inode.Parent
@@ -921,6 +927,7 @@ func (inode *Inode) TryFlush(priority int) bool {
 
 		return inode.sendUpload(priority)
 	}
+
 	return false
 }
 
@@ -2179,6 +2186,7 @@ func (inode *Inode) SyncFile() (err error) {
 	for {
 		inode.mu.Lock()
 		inode.forceFlush = false
+		log.Debugf("SyncFile: inode=%v CacheState=%v", inode.FullName(), inode.CacheState)
 		if inode.CacheState <= ST_DEAD {
 			inode.mu.Unlock()
 			break
@@ -2191,11 +2199,7 @@ func (inode *Inode) SyncFile() (err error) {
 		}
 		inode.forceFlush = true
 		inode.mu.Unlock()
-		flushed := inode.TryFlush(MAX_FLUSH_PRIORITY)
-		if !flushed {
-			log.Debugf("TryFlush: inode=%v not flushed", inode.FullName())
-		}
-
+		inode.TryFlush(MAX_FLUSH_PRIORITY)
 		inode.fs.flusherMu.Lock()
 		if inode.fs.flushPending == 0 {
 			inode.fs.flusherCond.Wait()
