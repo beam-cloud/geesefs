@@ -903,19 +903,19 @@ func (inode *Inode) TryFlush(priority int) bool {
 	}
 	if inode.CacheState == ST_DELETED {
 		if inode.IsFlushing == 0 && (!inode.isDir() || atomic.LoadInt64(&inode.dir.ModifiedChildren) == 0) {
-			log.Debugf("TryFlush: inode=%v overDeleted=%v", inode.FullName(), overDeleted)
+			log.Debugf("TryFlush: inode=%v overDeleted=%v, cached state deleted", inode.FullName(), overDeleted)
 			inode.SendDelete()
 			return true
 		}
 	} else if (inode.CacheState == ST_CREATED || inode.CacheState == ST_MODIFIED) && inode.isDir() {
 		if inode.IsFlushing == 0 && !overDeleted {
-			log.Debugf("TryFlush: inode=%v overDeleted=%v", inode.FullName(), overDeleted)
+			log.Debugf("TryFlush: inode=%v overDeleted=%v, not over deleted", inode.FullName(), overDeleted)
 			inode.SendMkDir()
 			return true
 		}
 	} else if inode.CacheState == ST_CREATED || inode.CacheState == ST_MODIFIED {
 		if overDeleted {
-			log.Debugf("TryFlush: inode=%v overDeleted=%v", inode.FullName(), overDeleted)
+			log.Debugf("TryFlush: inode=%v overDeleted=%v, created/modified, overdeleted... not sending upload", inode.FullName(), overDeleted)
 			return false
 		}
 
@@ -2191,7 +2191,11 @@ func (inode *Inode) SyncFile() (err error) {
 		}
 		inode.forceFlush = true
 		inode.mu.Unlock()
-		inode.TryFlush(MAX_FLUSH_PRIORITY)
+		flushed := inode.TryFlush(MAX_FLUSH_PRIORITY)
+		if !flushed {
+			log.Debugf("TryFlush: inode=%v not flushed", inode.FullName())
+		}
+
 		inode.fs.flusherMu.Lock()
 		if inode.fs.flushPending == 0 {
 			inode.fs.flusherCond.Wait()
