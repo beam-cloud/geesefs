@@ -972,13 +972,14 @@ func (inode *Inode) sendUpload(priority int) bool {
 	}
 
 	// Pick part(s) to flush
-	initiated, canComplete := inode.sendUploadParts(priority)
+	initiated, shouldComplete := inode.sendUploadParts(priority)
 	if initiated {
 		log.Debugf("sendUpload, sending upload parts, inode=%v, initiated, returning true", inode.FullName())
 		return true
 	}
 
-	canComplete = canComplete && !inode.IsRangeLocked(0, inode.Attributes.Size, true)
+	rangeLocked := inode.IsRangeLocked(0, inode.Attributes.Size, true)
+	canComplete := shouldComplete && !rangeLocked
 
 	if canComplete && (inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.wantFree) > 0) {
 		log.Debugf("sendUpload: inode=%v, can complete, completing multipart upload", inode.FullName())
@@ -1000,7 +1001,8 @@ func (inode *Inode) sendUpload(priority int) bool {
 		return true
 	}
 
-	log.Debugf("sendUpload, reached the end: inode=%v, returning false, canComplete=%v, inode.fileHandles=%d, inode.forceFlush=%v, inode.flushLimitsExceeded()=%v, wantFree=%v", inode.FullName(), canComplete, inode.fileHandles, inode.forceFlush, inode.flushLimitsExceeded(), atomic.LoadInt32(&inode.fs.wantFree))
+	log.Debugf("sendUpload, reached the end: inode=%v, initiated=%v, canComplete=%v, shouldComplete=%v, rangeLocked=%v, inode.fileHandles=%d, inode.forceFlush=%v, inode.flushLimitsExceeded()=%v, wantFree=%v", inode.FullName(), initiated, canComplete, shouldComplete, rangeLocked, inode.fileHandles, inode.forceFlush, inode.flushLimitsExceeded(), atomic.LoadInt32(&inode.fs.wantFree))
+
 	return false
 }
 
