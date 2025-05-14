@@ -120,6 +120,8 @@ func (stagedFile *StagedFile) Cleanup() {
 	fullPath := stagedFile.FD.Name()
 	stagedFile.FD.Close()
 	stagedFile.FD = nil
+	stagedFile.flushing = false
+	stagedFile.shouldFlush = false
 	stagedFile.mu.Unlock()
 
 	err := os.RemoveAll(fullPath)
@@ -136,20 +138,6 @@ func (stagedFile *StagedFile) Cleanup() {
 	}
 
 	log.Debugf("Removed staged file: %s", fh.inode.FullName())
-}
-
-func (sf *StagedFile) Cancelled() bool {
-	sf.mu.Lock()
-	defer sf.mu.Unlock()
-
-	now := time.Now()
-	if !sf.shouldFlush &&
-		now.Sub(sf.lastWriteAt) > 2*sf.debounce &&
-		now.Sub(sf.lastReadAt) > 2*sf.debounce {
-		return true
-	}
-
-	return false
 }
 
 type Inode struct {

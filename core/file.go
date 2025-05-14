@@ -868,16 +868,6 @@ func (inode *Inode) TryFlush(priority int) bool {
 
 	inode.mu.Lock()
 	if sf := inode.StagedFile; sf != nil {
-		// if sf.Cancelled() {
-		// 	sf.Cleanup()
-		// 	inode.mu.Lock()
-		// 	inode.StagedFile = nil
-		// 	inode.fs.stagedFiles.Delete(inode.Id)
-		// 	inode.SetCacheState(ST_CACHED)
-		// 	inode.mu.Unlock()
-		// 	return false
-		// }
-
 		if !sf.shouldFlush {
 			log.Debugf("TryFlush, returning false: inode=%v stagedFile=%v shouldFlush=%v", inode.FullName(), sf, sf.shouldFlush)
 			inode.mu.Unlock()
