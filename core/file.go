@@ -1279,11 +1279,13 @@ func (inode *Inode) sendUploadParts(priority int) (bool, bool) {
 	inode.buffers.IterateDirtyParts(func(partNum uint64) bool {
 		partOffset, partSize := inode.fs.partRange(partNum)
 		if inode.IsRangeLocked(partOffset, partSize, true) {
+			log.Debugf("sendUploadParts: inode=%v, part %d is locked, skipping", inode.FullName(), partNum)
 			// Don't flush parts being currently flushed
 			shouldComplete = false
 			return true
 		}
 		if partNum == inode.fs.partNum(inode.lastWriteEnd) && !flushInode && !wantFree {
+			log.Debugf("sendUploadParts: inode=%v, part %d is the last part, skipping, flushInode=%v, wantFree=%v", inode.FullName(), partNum, flushInode, wantFree)
 			// Don't write out the last part which is still written to (if not under memory pressure)
 			shouldComplete = false
 			return true
@@ -1317,14 +1319,17 @@ func (inode *Inode) sendUploadParts(priority int) (bool, bool) {
 				partlyZero = append(partlyZero, partNum)
 			}
 			shouldComplete = false
+			log.Debugf("sendUploadParts: inode=%v, part %d is empty, skipping (partNonZero=%v, priority=%d), flushInode=%v, wantFree=%v", inode.FullName(), partNum, partNonZero, priority, flushInode, wantFree)
 		} else {
 			shouldComplete = false
 			if inode.goFlushPart(partNum, partOffset, partSize, 1) {
 				initiated = true
 				if inode.flushLimitsExceeded() {
+					log.Debugf("sendUploadParts: inode=%v, part %d is dirty, flush limits exceeded (partNonZero=%v, priority=%d), flushInode=%v, wantFree=%v", inode.FullName(), partNum, partNonZero, priority, flushInode, wantFree)
 					return false
 				}
 			}
+			log.Debugf("sendUploadParts: inode=%v, part %d is dirty, flushing (partNonZero=%v, priority=%d), flushInode=%v, wantFree=%v", inode.FullName(), partNum, partNonZero, priority, flushInode, wantFree)
 		}
 		return true
 	})
@@ -1333,11 +1338,14 @@ func (inode *Inode) sendUploadParts(priority int) (bool, bool) {
 			partOffset, partSize := inode.fs.partRange(partNum)
 			initiated = initiated || inode.goFlushPart(partNum, partOffset, partSize, 2)
 			if inode.flushLimitsExceeded() {
+				log.Debugf("sendUploadParts: inode=%v, part %d is dirty, flush limits exceeded (priority=%d), flushInode=%v, wantFree=%v", inode.FullName(), partNum, priority, flushInode, wantFree)
 				break
 			}
 		}
 	}
 	if !initiated && anyEvicted && len(fullyZero) > 0 {
+		log.Debugf("sendUploadParts: inode=%v, fullyzero >0, any evicted, flushing zero parts", inode.FullName())
+
 		for _, partNum := range partlyZero {
 			partOffset, partSize := inode.fs.partRange(partNum)
 			initiated = initiated || inode.goFlushPart(partNum, partOffset, partSize, 3)
@@ -1346,6 +1354,7 @@ func (inode *Inode) sendUploadParts(priority int) (bool, bool) {
 			}
 		}
 	}
+
 	return initiated, shouldComplete
 }
 
