@@ -918,6 +918,8 @@ func (inode *Inode) sendUpload(priority int) bool {
 	if inode.oldParent != nil && inode.IsFlushing == 0 && inode.mpu == nil {
 		// Rename file
 		inode.sendRename()
+
+		log.Debugf("sendUpload: inode=%v, sending rename", inode.FullName())
 		return true
 	}
 
@@ -925,6 +927,7 @@ func (inode *Inode) sendUpload(priority int) bool {
 		inode.oldParent == nil && inode.IsFlushing == 0 {
 		hasDirty := inode.buffers.AnyUnclean()
 		if !hasDirty {
+			log.Debugf("sendUpload: inode=%v, no dirty buffers, returning with update metadata", inode.FullName())
 			// Update metadata by COPYing into the same object
 			// It results in the optimized implementation in S3
 			inode.sendUpdateMeta()
@@ -933,6 +936,7 @@ func (inode *Inode) sendUpload(priority int) bool {
 	}
 
 	if inode.IsFlushing >= inode.fs.flags.MaxParallelParts {
+		log.Debugf("sendUpload: inode=%v, max parallel parts=%d, returning false", inode.FullName(), inode.IsFlushing)
 		return false
 	}
 
@@ -949,10 +953,12 @@ func (inode *Inode) sendUpload(priority int) bool {
 		inode.knownSize <= inode.Attributes.Size
 
 	if canPatch {
+		log.Debugf("sendUpload: inode=%v, can patch, patching object ranges", inode.FullName())
 		return inode.patchObjectRanges()
 	}
 
 	if smallFile && inode.mpu == nil {
+		log.Debugf("sendUpload: inode=%v, small file, mpu is nil, flushing small object", inode.FullName())
 		// Don't flush small files with active file handles (if not under memory pressure)
 		if inode.IsFlushing == 0 && (inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.wantFree) > 0) {
 			// Don't accidentally trigger a parallel multipart flush
@@ -960,15 +966,20 @@ func (inode *Inode) sendUpload(priority int) bool {
 			atomic.AddInt64(&inode.fs.stats.flushes, 1)
 			atomic.AddInt64(&inode.fs.activeFlushers, 1)
 			go inode.flushSmallObject()
+			log.Debugf("sendUpload: inode=%v, flushing small object", inode.FullName())
 			return true
 		}
+
+		log.Debugf("sendUpload: inode=%v, small file, mpu is nil, returning false", inode.FullName())
 		return false
 	}
 
 	// Initiate multipart upload, if not yet
 	if inode.mpu == nil {
+		log.Debugf("sendUpload: inode=%v, mpu is nil, initiating multipart upload", inode.FullName())
 		// Wait for other updates to complete.
 		if inode.IsFlushing > 0 {
+			log.Debugf("sendUpload: inode=%v, mpu is nil, is flushing, returning false", inode.FullName())
 			return false
 		}
 
@@ -983,18 +994,22 @@ func (inode *Inode) sendUpload(priority int) bool {
 	// Pick part(s) to flush
 	initiated, canComplete := inode.sendUploadParts(priority)
 	if initiated {
+		log.Debugf("sendUpload, sending upload parts, inode=%v, initiated, returning true", inode.FullName())
 		return true
 	}
 
 	canComplete = canComplete && !inode.IsRangeLocked(0, inode.Attributes.Size, true)
 
 	if canComplete && (inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.wantFree) > 0) {
+		log.Debugf("sendUpload: inode=%v, can complete, completing multipart upload", inode.FullName())
+
 		// Complete the multipart upload
 		inode.IsFlushing += inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.stats.flushes, 1)
 		atomic.AddInt64(&inode.fs.activeFlushers, 1)
 
 		go func() {
+			log.Debugf("sendUpload: inode=%v, completing multipart upload", inode.FullName())
 			inode.mu.Lock()
 			inode.completeMultipart()
 			inode.IsFlushing -= inode.fs.flags.MaxParallelParts
@@ -1006,6 +1021,7 @@ func (inode *Inode) sendUpload(priority int) bool {
 		return true
 	}
 
+	log.Debugf("sendUpload, reached the end: inode=%v, returning false", inode.FullName())
 	return false
 }
 
