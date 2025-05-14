@@ -897,11 +897,12 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	}
 
 	defer func(stagedFile *StagedFile) {
-		stagedFile.Cleanup()
 		inode.mu.Lock()
 		inode.StagedFile = nil
 		inode.fs.stagedFiles.Delete(inode.Id)
 		inode.mu.Unlock()
+
+		stagedFile.Cleanup()
 	}(stagedFile)
 
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
