@@ -982,8 +982,6 @@ func (inode *Inode) sendUpload(priority int) bool {
 	canComplete := shouldComplete && !rangeLocked
 
 	if canComplete && (inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.wantFree) > 0) {
-		log.Debugf("sendUpload: inode=%v, can complete, completing multipart upload", inode.FullName())
-
 		// Complete the multipart upload
 		inode.IsFlushing += inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.stats.flushes, 1)
