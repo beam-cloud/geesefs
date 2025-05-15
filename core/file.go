@@ -318,6 +318,7 @@ func (inode *Inode) OpenCacheFD() error {
 func (inode *Inode) loadFromServer(readRanges []Range, readAheadSize uint64, ignoreMemoryLimit bool) {
 	// Add readahead & merge adjacent requests
 	readRanges = mergeRA(readRanges, readAheadSize, inode.fs.flags.ReadMergeKB*1024)
+	log.Debugf("loadFromServer, readRanges: %+v", readRanges)
 	last := &readRanges[len(readRanges)-1]
 	if last.End > inode.knownSize {
 		last.End = inode.knownSize
@@ -325,6 +326,7 @@ func (inode *Inode) loadFromServer(readRanges []Range, readAheadSize uint64, ign
 
 	// Split very large requests into smaller chunks to read in parallel
 	readRanges = splitRA(readRanges, inode.fs.flags.ReadAheadParallelKB*1024)
+	log.Debugf("loadFromServer, readRanges after split: %+v", readRanges)
 
 	// Mark new ranges as being loaded from the server
 	for _, rr := range readRanges {
@@ -501,6 +503,8 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 }
 
 func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uint64, ignoreMemoryLimit bool) {
+	log.Debugf("retryRead, offset: %v, size: %v, key: %v", offset, size, key)
+
 	// Maybe free some buffers first
 	if inode.fs.flags.UseEnomem {
 		err := inode.fs.bufferPool.Use(int64(size), ignoreMemoryLimit)
