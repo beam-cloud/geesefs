@@ -48,7 +48,22 @@ func TestHashFlushedPart_Order(t *testing.T) {
 	}
 
 	for i := 0; i < numParts; i++ {
-		if err := inode.hashFlushedPart(uint64(i)*partSize, partSize); err != nil {
+		reader, _, err := inode.getMultiReader(uint64(i)*partSize, partSize)
+		if err != nil {
+			t.Fatalf("in-order: error getting multi reader: %v", err)
+		}
+
+		data := make([]byte, partSize)
+		n, err := reader.Read(data)
+		if err != nil {
+			t.Fatalf("in-order: error reading part %d: %v", i, err)
+		}
+
+		if n != int(partSize) {
+			t.Fatalf("in-order: read part %d: got %d bytes, want %d", i, n, partSize)
+		}
+
+		if err := inode.hashFlushedPart(uint64(i)*partSize, partSize, data); err != nil {
 			t.Fatalf("in-order: error hashing part %d: %v", i, err)
 		}
 	}
@@ -68,8 +83,18 @@ func TestHashFlushedPart_Order(t *testing.T) {
 	}
 	order := []int{3, 0, 2, 1, 4, 5, 6, 7, 8, 9}
 	for _, i := range order {
-		if err := inode.hashFlushedPart(uint64(i)*partSize, partSize); err != nil {
-			t.Fatalf("out-of-order: error hashing part %d: %v", i, err)
+		reader, _, err := inode.getMultiReader(uint64(i)*partSize, partSize)
+		if err != nil {
+			t.Fatalf("out-of-order: error getting multi reader: %v", err)
+		}
+		data := make([]byte, partSize)
+		_, err = reader.Read(data)
+		if err != nil {
+			t.Fatalf("out-of-order: error reading part %d: %v", i, err)
+		}
+
+		if err := inode.hashFlushedPart(uint64(i)*partSize, partSize, data); err != nil {
+			t.Fatalf("in-order: error hashing part %d: %v", i, err)
 		}
 	}
 
@@ -117,7 +142,17 @@ func TestHashFlushedPart_KnownHash(t *testing.T) {
 		buffers:    newPatternBufferList(),
 	}
 	for i := 0; i < numParts; i++ {
-		if err := inode.hashFlushedPart(uint64(i)*partSize, partSize); err != nil {
+		reader, _, err := inode.getMultiReader(uint64(i)*partSize, partSize)
+		if err != nil {
+			t.Fatalf("sha1 in-order: error getting multi reader: %v", err)
+		}
+
+		data := make([]byte, partSize)
+		_, err = reader.Read(data)
+		if err != nil {
+			t.Fatalf("sha1 in-order: error reading part %d: %v", i, err)
+		}
+		if err := inode.hashFlushedPart(uint64(i)*partSize, partSize, data); err != nil {
 			t.Fatalf("sha1 in-order: error hashing part %d: %v", i, err)
 		}
 	}
@@ -125,6 +160,7 @@ func TestHashFlushedPart_KnownHash(t *testing.T) {
 	inode.hashLock.Lock()
 	gotSHA256 := inode.hashInProgress.Sum(nil)
 	inode.hashLock.Unlock()
+
 	if hex.EncodeToString(gotSHA256) != hex.EncodeToString(expectedSHA256[:]) {
 		t.Errorf("sha256 in-order: hash mismatch: got %x, want %x", gotSHA256, expectedSHA256)
 	}
@@ -136,7 +172,18 @@ func TestHashFlushedPart_KnownHash(t *testing.T) {
 	}
 	order := []int{2, 0, 1, 4, 3}
 	for _, i := range order {
-		if err := inode.hashFlushedPart(uint64(i)*partSize, partSize); err != nil {
+		reader, _, err := inode.getMultiReader(uint64(i)*partSize, partSize)
+		if err != nil {
+			t.Fatalf("sha1 out-of-order: error getting multi reader: %v", err)
+		}
+
+		data := make([]byte, partSize)
+		_, err = reader.Read(data)
+		if err != nil {
+			t.Fatalf("sha1 out-of-order: error reading part %d: %v", i, err)
+		}
+
+		if err := inode.hashFlushedPart(uint64(i)*partSize, partSize, data); err != nil {
 			t.Fatalf("sha1 out-of-order: error hashing part %d: %v", i, err)
 		}
 	}

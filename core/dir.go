@@ -1652,8 +1652,8 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 	} else {
 		// Handle staged file renames
 		if fromInode.StagedFile != nil && fromInode.StagedFile.FD != nil {
-			fs := fromInode.fs
 
+			fs := fromInode.fs
 			oldStagedPath := fromInode.StagedFile.FD.Name()
 			newStagedDir := fs.flags.StagedWritePath + "/" + newParent.FullName()
 			newStagedPath := appendChildName(newStagedDir, to)

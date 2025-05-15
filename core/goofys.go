@@ -638,7 +638,7 @@ func (fs *Goofys) FreeSomeCleanBuffers(origSize int64) (int64, bool) {
 		buf := inode.buffers.Get(cleanEnd)
 		// Never evict buffers flushed in an incomplete (last) part
 		if buf != nil && (buf.state == BUF_CLEAN || buf.state == BUF_FLUSHED_FULL) &&
-			buf.ptr != nil && !inode.IsAnyRangeLocked(buf.offset, buf.length) {
+			buf.ptr != nil && !inode.IsRangeLocked(buf.offset, buf.length, false) {
 			fs.tryEvictToDisk(inode, buf, &toFs)
 			allocated, _ := inode.buffers.EvictFromMemory(buf)
 			if allocated != 0 {
@@ -897,19 +897,21 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	}
 
 	defer func(stagedFile *StagedFile) {
-		stagedFile.Cleanup()
 		inode.mu.Lock()
 		inode.StagedFile = nil
 		inode.fs.stagedFiles.Delete(inode.Id)
 		inode.mu.Unlock()
+
+		stagedFile.Cleanup()
 	}(stagedFile)
 
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
-	inode.mu.Unlock()
 
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
 	stagedFile.mu.Unlock()
+
+	inode.mu.Unlock()
 
 	fs.WakeupFlusher()
 	offset := int64(0)
@@ -921,7 +923,9 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		}
 
 		// Lock this part's range while we're reading / flushing it
+		inode.mu.Lock()
 		inode.LockRange(uint64(offset), chunkSize, true)
+		inode.mu.Unlock()
 
 		var n int
 		var err error
@@ -933,27 +937,34 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 
 			if err != nil && err != io.EOF {
 				log.Errorf("Error reading from staged file: %v", err)
+				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
-				break
-			}
-			if n == 0 {
-				inode.UnlockRange(uint64(offset), chunkSize, true)
+				inode.mu.Unlock()
 				break
 			}
 
-			fh := stagedFile.FH
+			if n == 0 {
+				inode.mu.Lock()
+				inode.UnlockRange(uint64(offset), chunkSize, true)
+				inode.mu.Unlock()
+				break
+			}
 
 			copyData := len(buf) < cap(buf)-4096
-			err = fh.WriteFile(offset, buf[:n], copyData)
+			err = stagedFile.FH.WriteFile(offset, buf[:n], copyData)
 			if err != nil {
 				log.Errorf("Error writing staged data data for flush: %v", err)
+				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
+				inode.mu.Unlock()
 				break
 			}
 		}
 
 		// Unlock this part's range after it's ready to flush
+		inode.mu.Lock()
 		inode.UnlockRange(uint64(offset), chunkSize, true)
+		inode.mu.Unlock()
 
 		offset += int64(n)
 		if err == io.EOF {

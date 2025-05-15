@@ -642,15 +642,6 @@ func (inode *Inode) IsRangeLocked(offset uint64, size uint64, onlyFlushing bool)
 	return false
 }
 
-func (inode *Inode) IsAnyRangeLocked(offset uint64, size uint64) bool {
-	for _, r := range inode.readRanges {
-		if r.Offset < offset+size && r.Offset+r.Size > offset {
-			return true
-		}
-	}
-	return false
-}
-
 func (inode *Inode) CheckLoadRange(offset, size, readAheadSize uint64, ignoreMemoryLimit bool) (bool, error) {
 	miss, err := inode.LoadRange(offset, size, readAheadSize, ignoreMemoryLimit)
 	if err == syscall.ESPIPE {
@@ -865,16 +856,13 @@ func (inode *Inode) recordFlushError(err error) {
 
 func (inode *Inode) TryFlush(priority int) bool {
 	inode.mu.Lock()
-	stagedFile := inode.StagedFile
-	shouldFlush := false
-	if stagedFile != nil {
-		shouldFlush = stagedFile.shouldFlush
+	if sf := inode.StagedFile; sf != nil {
+		if !sf.shouldFlush {
+			inode.mu.Unlock()
+			return false
+		}
 	}
 	inode.mu.Unlock()
-
-	if stagedFile == nil || !shouldFlush {
-		return false
-	}
 
 	overDeleted := false
 	parent := inode.Parent
@@ -890,6 +878,7 @@ func (inode *Inode) TryFlush(priority int) bool {
 	if inode.Parent != parent {
 		return false
 	}
+
 	if inode.flushError != nil && time.Now().Sub(inode.flushErrorTime) < inode.fs.flags.RetryInterval {
 		inode.fs.ScheduleRetryFlush()
 		return false
@@ -911,6 +900,7 @@ func (inode *Inode) TryFlush(priority int) bool {
 
 		return inode.sendUpload(priority)
 	}
+
 	return false
 }
 
@@ -918,6 +908,7 @@ func (inode *Inode) sendUpload(priority int) bool {
 	if inode.oldParent != nil && inode.IsFlushing == 0 && inode.mpu == nil {
 		// Rename file
 		inode.sendRename()
+
 		return true
 	}
 
@@ -981,12 +972,13 @@ func (inode *Inode) sendUpload(priority int) bool {
 	}
 
 	// Pick part(s) to flush
-	initiated, canComplete := inode.sendUploadParts(priority)
+	initiated, shouldComplete := inode.sendUploadParts(priority)
 	if initiated {
 		return true
 	}
 
-	canComplete = canComplete && !inode.IsRangeLocked(0, inode.Attributes.Size, true)
+	rangeLocked := inode.IsRangeLocked(0, inode.Attributes.Size, true)
+	canComplete := shouldComplete && !rangeLocked
 
 	if canComplete && (inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.wantFree) > 0) {
 		// Complete the multipart upload
@@ -1338,6 +1330,7 @@ func (inode *Inode) sendUploadParts(priority int) (bool, bool) {
 			}
 		}
 	}
+
 	return initiated, shouldComplete
 }
 
