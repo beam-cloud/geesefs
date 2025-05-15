@@ -999,6 +999,7 @@ func (inode *Inode) sendUpload(priority int) bool {
 		return true
 	}
 
+	log.Debugf("sendUpload, reached the end: inode=%v, initiated=%v, canComplete=%v, shouldComplete=%v, rangeLocked=%v, inode.fileHandles=%d, inode.forceFlush=%v, inode.flushLimitsExceeded()=%v, wantFree=%v", inode.FullName(), initiated, canComplete, shouldComplete, rangeLocked, inode.fileHandles, inode.forceFlush, inode.flushLimitsExceeded(), atomic.LoadInt32(&inode.fs.wantFree))
 	return false
 }
 
