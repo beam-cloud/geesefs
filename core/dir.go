@@ -1651,7 +1651,6 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 		renameRecursive(fromInode, newParent, to)
 	} else {
 		// Handle staged file renames
-		fromInode.mu.Lock()
 		if fromInode.StagedFile != nil && fromInode.StagedFile.FD != nil {
 
 			fs := fromInode.fs
@@ -1672,7 +1671,6 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 				}
 			}
 		}
-		fromInode.mu.Unlock()
 
 		renameInCache(fromInode, newParent, to)
 	}
