@@ -771,8 +771,10 @@ func (l *BufferList) GetData(offset, size uint64, returnIds bool) (data [][]byte
 	if returnIds {
 		ids = make(map[uint64]bool)
 	}
+
 	curOffset := offset
 	endOffset := offset + size
+
 	l.at.Ascend(curOffset+1, func(end uint64, b *FileBuffer) bool {
 		if b.offset > curOffset {
 			// hole
@@ -780,13 +782,16 @@ func (l *BufferList) GetData(offset, size uint64, returnIds bool) (data [][]byte
 			err = ErrBufferIsMissing
 			return false
 		}
+
 		if b.offset >= endOffset {
 			return false
 		}
+
 		curEnd := min(endOffset, b.offset+b.length)
 		if returnIds && b.dirtyID != 0 {
 			ids[b.dirtyID] = true
 		}
+
 		if b.loading {
 			// tried to read a loading buffer
 			data = nil
@@ -797,14 +802,17 @@ func (l *BufferList) GetData(offset, size uint64, returnIds bool) (data [][]byte
 		} else {
 			data = append(data, b.data[curOffset-b.offset:curEnd-b.offset])
 		}
+
 		curOffset = curEnd
 		return curOffset < endOffset
 	})
+
 	if err == nil && curOffset < endOffset {
 		data = nil
 		err = ErrBufferIsMissing
 		return
 	}
+
 	return
 }
 

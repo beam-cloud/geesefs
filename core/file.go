@@ -742,8 +742,14 @@ func (fh *FileHandle) shouldRetrieveHash() bool {
 }
 
 func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesRead int, err error) {
+	start := time.Now()
+	last := start
+	log.Debugf("ReadFile: start offset=%v size=%v inode=%v", sOffset, sLen, fh.inode.FullName())
+
 	offset := uint64(sOffset)
 	size := uint64(sLen)
+
+	log.Debugf("ReadFile, offset: %v, size: %v", offset, size)
 
 	fh.inode.logFuse("ReadFile", offset, size)
 	defer func() {
@@ -753,6 +759,7 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 				err = nil
 			}
 		}
+		log.Debugf("ReadFile: end, total elapsed=%v", time.Since(start))
 	}()
 
 	if fh.shouldRetrieveHash() {
@@ -766,31 +773,43 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 			log.Errorf("Error getting head blob: %v", err)
 		}
 	}
+	log.Debugf("ReadFile: after shouldRetrieveHash, elapsed=%v", time.Since(last))
+	last = time.Now()
 
 	// Lock inode
 	fh.inode.mu.Lock()
+	log.Debugf("ReadFile: after inode lock, elapsed=%v", time.Since(last))
+	last = time.Now()
 	defer fh.inode.mu.Unlock()
 
 	if offset >= fh.inode.Attributes.Size {
 		// nothing to read
 		err = io.EOF
+		log.Debugf("ReadFile: offset >= size, elapsed=%v", time.Since(last))
 		return
 	}
 	if offset+size > fh.inode.Attributes.Size {
 		size = fh.inode.Attributes.Size - offset
 	}
+	log.Debugf("ReadFile: after size check, elapsed=%v", time.Since(last))
+	last = time.Now()
 
 	// Guard buffers against eviction
 	fh.inode.LockRange(offset, size, false)
+	log.Debugf("ReadFile: after LockRange, elapsed=%v", time.Since(last))
+	last = time.Now()
 	defer fh.inode.UnlockRange(offset, size, false)
 
 	// Check if anything requires to be loaded from the server
 	ra := fh.getReadAhead()
 	fh.trackRead(offset, size)
 	miss, requestErr := fh.inode.CheckLoadRange(offset, size, ra, false)
+	log.Debugf("ReadFile: after CheckLoadRange (miss=%v), elapsed=%v", miss, time.Since(last))
+	last = time.Now()
 	if !miss {
 		atomic.AddInt64(&fh.inode.fs.stats.readHits, 1)
 	}
+
 	mappedErr := mapAwsError(requestErr)
 	if requestErr != nil {
 		err = requestErr
@@ -799,28 +818,43 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 			log.Warnf("File %v is deleted or resized remotely, discarding local changes", fh.inode.FullName())
 			fh.inode.resetCache()
 		}
+		log.Debugf("ReadFile: after error handling, elapsed=%v", time.Since(last))
 		return
 	}
 
 	// return cached buffers directly without copying
+	getDataStart := time.Now()
+
 	data, _, err = fh.inode.buffers.GetData(offset, size, false)
+	getDataElapsed := time.Since(getDataStart)
+	log.Debugf("ReadFile: after GetData, elapsed=%v", getDataElapsed)
 	if err != nil && requestErr != nil {
 		return nil, 0, requestErr
 	} else if err != nil {
 		return nil, 0, syscall.EIO
 	}
 
+	// Buffer details
+	totalBytes := 0
+	for i, buf := range data {
+		log.Debugf("ReadFile: buffer %d size=%d", i, len(buf))
+		totalBytes += len(buf)
+	}
+	log.Debugf("ReadFile: buffers returned=%d, totalBytes=%d", len(data), totalBytes)
+
 	// Don't exceed IOV_MAX-1 for writev.
 	if len(data) > IOV_MAX-1 {
+		mergeStart := time.Now()
 		var tail []byte
 		for i := IOV_MAX - 2; i < len(data); i++ {
 			tail = append(tail, data[i]...)
 		}
 		data = append(data[0:IOV_MAX-2], tail)
+		log.Debugf("ReadFile: IOV_MAX merge, merged %d buffers into tail, elapsed=%v", len(data)-(IOV_MAX-2), time.Since(mergeStart))
 	}
 
 	bytesRead = int(size)
-
+	log.Debugf("ReadFile: done, total elapsed=%v", time.Since(start))
 	return
 }
 
