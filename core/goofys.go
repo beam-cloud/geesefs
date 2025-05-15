@@ -906,11 +906,12 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	}(stagedFile)
 
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
-	inode.mu.Unlock()
 
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
 	stagedFile.mu.Unlock()
+
+	inode.mu.Unlock()
 
 	fs.WakeupFlusher()
 	offset := int64(0)
@@ -933,14 +934,13 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 				log.Errorf("Error reading from staged file: %v", err)
 				break
 			}
+
 			if n == 0 {
 				break
 			}
 
-			fh := stagedFile.FH
-
 			copyData := len(buf) < cap(buf)-4096
-			err = fh.WriteFile(offset, buf[:n], copyData)
+			err = stagedFile.FH.WriteFile(offset, buf[:n], copyData)
 			if err != nil {
 				log.Errorf("Error writing staged data data for flush: %v", err)
 				break
