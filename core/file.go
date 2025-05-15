@@ -974,7 +974,6 @@ func (inode *Inode) sendUpload(priority int) bool {
 	// Pick part(s) to flush
 	initiated, shouldComplete := inode.sendUploadParts(priority)
 	if initiated {
-		log.Debugf("sendUpload, sending upload parts, inode=%v, initiated, returning true", inode.FullName())
 		return true
 	}
 
@@ -999,7 +998,6 @@ func (inode *Inode) sendUpload(priority int) bool {
 		return true
 	}
 
-	log.Debugf("sendUpload, reached the end: inode=%v, initiated=%v, canComplete=%v, shouldComplete=%v, rangeLocked=%v, inode.fileHandles=%d, inode.forceFlush=%v, inode.flushLimitsExceeded()=%v, wantFree=%v", inode.FullName(), initiated, canComplete, shouldComplete, rangeLocked, inode.fileHandles, inode.forceFlush, inode.flushLimitsExceeded(), atomic.LoadInt32(&inode.fs.wantFree))
 	return false
 }
 
