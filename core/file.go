@@ -769,6 +769,12 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 		}
 	}
 
+	// return cached buffers directly without locking
+	data, _, err = fh.inode.buffers.GetData(offset, size, false)
+	if err == nil {
+		return data, int(size), nil
+	}
+
 	// Lock inode
 	fh.inode.mu.Lock()
 	defer fh.inode.mu.Unlock()
