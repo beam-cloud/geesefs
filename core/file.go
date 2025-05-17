@@ -528,7 +528,9 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	allocated := int64(0)
 	curOffset, curSize := offset, size
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
-		hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
+		// hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
+		hashFound := true
+		hash := "8008447d92896052e820617226bcda6959d3c66cecb1abab417605a8ba50eb4c"
 
 		var alloc int64 = 0
 		var done uint64 = 0
@@ -759,15 +761,15 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 
 	// TODO: can we do this opportunistically when the filesystem is loaded
 	if fh.shouldRetrieveHash() {
-		fh.inode.mu.Lock()
-		cloud, path := fh.inode.cloud()
-		head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
-		if err == nil {
-			fh.inode.setMetadata(head.Metadata)
-			fh.inode.mu.Unlock()
-		} else {
-			log.Errorf("Error getting head blob: %v", err)
-		}
+		// fh.inode.mu.Lock()
+		// cloud, path := fh.inode.cloud()
+		// head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
+		// if err == nil {
+		// 	fh.inode.setMetadata(head.Metadata)
+		// 	fh.inode.mu.Unlock()
+		// } else {
+		// 	log.Errorf("Error getting head blob: %v", err)
+		// }
 	}
 
 	// TODO: can we implement this without locking?
