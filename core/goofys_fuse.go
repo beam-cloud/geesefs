@@ -479,8 +479,12 @@ func (fs *GoofysFuse) ReadFile(
 
 	atomic.AddInt64(&fs.stats.reads, 1)
 
-	op.Data = [][]byte{make([]byte, op.Size)}
-	op.BytesRead = int(op.Size)
+	fs.mu.RLock()
+	fh := fs.fileHandles[op.Handle]
+	fs.mu.RUnlock()
+
+	op.Data, op.BytesRead, err = fh.ReadFile(op.Offset, op.Size)
+	err = mapAwsError(err)
 
 	return
 }
@@ -1046,5 +1050,6 @@ func TryUnmount(mountPoint string) (err error) {
 			break
 		}
 	}
+
 	return
 }
