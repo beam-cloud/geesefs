@@ -503,8 +503,6 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 }
 
 func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uint64, ignoreMemoryLimit bool) {
-	log.Debugf("retryRead, offset: %v, size: %v, key: %v", offset, size, key)
-
 	// Maybe free some buffers first
 	if inode.fs.flags.UseEnomem {
 		err := inode.fs.bufferPool.Use(int64(size), ignoreMemoryLimit)
@@ -528,9 +526,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	allocated := int64(0)
 	curOffset, curSize := offset, size
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
-		// hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
-		hashFound := true
-		hash := "8008447d92896052e820617226bcda6959d3c66cecb1abab417605a8ba50eb4c"
+		hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
 
 		var alloc int64 = 0
 		var done uint64 = 0
@@ -759,21 +755,20 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 		}
 	}()
 
-	// TODO: can we do this opportunistically when the filesystem is loaded
 	if fh.shouldRetrieveHash() {
-		// fh.inode.mu.Lock()
-		// cloud, path := fh.inode.cloud()
-		// head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
-		// if err == nil {
-		// 	fh.inode.setMetadata(head.Metadata)
-		// 	fh.inode.mu.Unlock()
-		// } else {
-		// 	log.Errorf("Error getting head blob: %v", err)
-		// }
+		fh.inode.mu.Lock()
+		cloud, path := fh.inode.cloud()
+		head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
+		if err == nil {
+			fh.inode.setMetadata(head.Metadata)
+			fh.inode.mu.Unlock()
+		} else {
+			log.Errorf("Error getting head blob: %v", err)
+		}
 	}
 
-	// TODO: can we implement this without locking?
 	// return cached buffers directly without locking
+	// this only works well if readahead is large
 	data, _, err = fh.inode.buffers.GetData(offset, size, false)
 	if err == nil {
 		return data, int(size), nil
