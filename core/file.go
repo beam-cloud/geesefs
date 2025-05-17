@@ -757,6 +757,7 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 		}
 	}()
 
+	// TODO: can we do this opportunistically when the filesystem is loaded
 	if fh.shouldRetrieveHash() {
 		fh.inode.mu.Lock()
 		cloud, path := fh.inode.cloud()
@@ -769,6 +770,7 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 		}
 	}
 
+	// TODO: can we implement this without locking?
 	// return cached buffers directly without locking
 	data, _, err = fh.inode.buffers.GetData(offset, size, false)
 	if err == nil {
