@@ -1050,5 +1050,6 @@ func TryUnmount(mountPoint string) (err error) {
 			break
 		}
 	}
+
 	return
 }

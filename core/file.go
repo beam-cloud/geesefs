@@ -711,6 +711,7 @@ func (fh *FileHandle) getReadAhead() uint64 {
 			ra = fh.inode.fs.flags.ReadAheadSmallKB * 1024
 		}
 	}
+
 	return ra
 }
 
@@ -763,6 +764,13 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 		}
 	}
 
+	// return cached buffers directly without locking
+	// this only works well if readahead is large
+	data, _, err = fh.inode.buffers.GetData(offset, size, false)
+	if err == nil {
+		return data, int(size), nil
+	}
+
 	// Lock inode
 	fh.inode.mu.Lock()
 	defer fh.inode.mu.Unlock()
@@ -787,6 +795,7 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 	if !miss {
 		atomic.AddInt64(&fh.inode.fs.stats.readHits, 1)
 	}
+
 	mappedErr := mapAwsError(requestErr)
 	if requestErr != nil {
 		err = requestErr
@@ -816,7 +825,6 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 	}
 
 	bytesRead = int(size)
-
 	return
 }
 

@@ -17,6 +17,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/tidwall/btree"
 )
@@ -84,7 +85,7 @@ type FileBuffer struct {
 	// 4 = flushed, not finalized, but removed from memory
 	state BufferState
 	// Loading from server or from disk
-	loading bool
+	loading atomic.Bool
 	// Latest chunk data is written to the disk cache
 	onDisk bool
 	// Chunk only contains zeroes, data and ptr are nil
@@ -572,10 +573,11 @@ func (l *BufferList) AddLoading(offset, size uint64) {
 			length:  curEnd - curOffset,
 			dirtyID: 0,
 			state:   BUF_CLEAN,
-			loading: true,
+			loading: atomic.Bool{},
 			onDisk:  false,
 			zero:    false,
 		}
+		b.loading.Store(true)
 		l.at.Set(curEnd, b)
 		l.queue(b)
 	})
@@ -587,7 +589,8 @@ func (l *BufferList) AddLoadingFromDisk(offset, size uint64) (readRanges []Range
 		if b.offset >= endOffset {
 			return
 		}
-		if b.data == nil && b.onDisk && !b.loading {
+		loading := b.loading.Load()
+		if b.data == nil && b.onDisk && !loading {
 			if b.offset < offset {
 				_, b = l.split(b, offset)
 				changed = true
@@ -596,7 +599,7 @@ func (l *BufferList) AddLoadingFromDisk(offset, size uint64) (readRanges []Range
 				b, _ = l.split(b, endOffset)
 				changed = true
 			}
-			b.loading = true
+			b.loading.Store(true)
 			readRanges = append(readRanges, Range{b.offset, b.offset + b.length})
 		}
 		cont = true
@@ -607,13 +610,14 @@ func (l *BufferList) AddLoadingFromDisk(offset, size uint64) (readRanges []Range
 
 func (l *BufferList) ReviveFromStagedFile(offset uint64, data []byte) {
 	l.at.Ascend(offset+1, func(end uint64, b *FileBuffer) bool {
-		if b.offset == offset && b.length == uint64(len(data)) && b.loading {
+		loading := b.loading.Load()
+		if b.offset == offset && b.length == uint64(len(data)) && loading {
 			b.data = data
 			b.ptr = &BufferPointer{
 				mem:  data,
 				refs: 1,
 			}
-			b.loading = false
+			b.loading.Store(false)
 			if b.state == BUF_FL_CLEARED {
 				l.unqueue(b)
 				b.state = BUF_FLUSHED_FULL
@@ -626,13 +630,14 @@ func (l *BufferList) ReviveFromStagedFile(offset uint64, data []byte) {
 
 func (l *BufferList) ReviveFromDisk(offset uint64, data []byte) {
 	l.at.Ascend(offset+1, func(end uint64, b *FileBuffer) bool {
-		if b.offset == offset && b.length == uint64(len(data)) && b.loading && b.onDisk {
+		loading := b.loading.Load()
+		if b.offset == offset && b.length == uint64(len(data)) && loading && b.onDisk {
 			b.data = data
 			b.ptr = &BufferPointer{
 				mem:  data,
 				refs: 1,
 			}
-			b.loading = false
+			b.loading.Store(false)
 			if b.state == BUF_FL_CLEARED {
 				l.unqueue(b)
 				b.state = BUF_FLUSHED_FULL
@@ -644,7 +649,10 @@ func (l *BufferList) ReviveFromDisk(offset uint64, data []byte) {
 }
 
 func (l *BufferList) RemoveLoading(offset, size uint64) {
-	l.RemoveRange(offset, size, func(b *FileBuffer) bool { return !b.onDisk && b.loading })
+	l.RemoveRange(offset, size, func(b *FileBuffer) bool {
+		loading := b.loading.Load()
+		return !b.onDisk && loading
+	})
 }
 
 func (l *BufferList) split(b *FileBuffer, offset uint64) (left, right *FileBuffer) {
@@ -673,7 +681,8 @@ func (l *BufferList) Dump(offset, size uint64) string {
 			return false
 		}
 		l := 0
-		if b.loading {
+		loading := b.loading.Load()
+		if loading {
 			l = 1
 		}
 		z := 0
@@ -757,7 +766,7 @@ func (l *BufferList) GetHoles(offset, size uint64) (holes []Range, loading bool,
 			curOffset = curEnd
 		}
 		curOffset = b.offset + b.length
-		loading = loading || b.loading
+		loading = loading || b.loading.Load()
 		flushCleared = flushCleared || b.state == BUF_FL_CLEARED
 		return true
 	})
@@ -771,8 +780,10 @@ func (l *BufferList) GetData(offset, size uint64, returnIds bool) (data [][]byte
 	if returnIds {
 		ids = make(map[uint64]bool)
 	}
+
 	curOffset := offset
 	endOffset := offset + size
+
 	l.at.Ascend(curOffset+1, func(end uint64, b *FileBuffer) bool {
 		if b.offset > curOffset {
 			// hole
@@ -780,14 +791,18 @@ func (l *BufferList) GetData(offset, size uint64, returnIds bool) (data [][]byte
 			err = ErrBufferIsMissing
 			return false
 		}
+
 		if b.offset >= endOffset {
 			return false
 		}
+
 		curEnd := min(endOffset, b.offset+b.length)
 		if returnIds && b.dirtyID != 0 {
 			ids[b.dirtyID] = true
 		}
-		if b.loading {
+
+		loading := b.loading.Load()
+		if loading {
 			// tried to read a loading buffer
 			data = nil
 			err = ErrBufferIsLoading
@@ -797,14 +812,17 @@ func (l *BufferList) GetData(offset, size uint64, returnIds bool) (data [][]byte
 		} else {
 			data = append(data, b.data[curOffset-b.offset:curEnd-b.offset])
 		}
+
 		curOffset = curEnd
 		return curOffset < endOffset
 	})
+
 	if err == nil && curOffset < endOffset {
 		data = nil
 		err = ErrBufferIsMissing
 		return
 	}
+
 	return
 }
 
