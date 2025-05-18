@@ -206,7 +206,6 @@ type Inode struct {
 	refcnt int64
 
 	// Cluster Mode
-
 	ownerMu    sync.RWMutex
 	ownerTerm  uint64
 	owner      NodeId

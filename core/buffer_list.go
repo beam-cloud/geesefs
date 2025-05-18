@@ -480,7 +480,9 @@ func (l *BufferList) insertOrAppend(offset uint64, data []byte, state BufferStat
 		length:  uint64(len(newData)),
 		data:    newData,
 		ptr:     dataPtr,
+		loading: atomic.Bool{},
 	}
+	newBuf.loading.Store(false)
 	l.at.Set(end, newBuf)
 	l.queue(newBuf)
 	return allocated
@@ -780,6 +782,12 @@ func (l *BufferList) GetData(offset, size uint64, returnIds bool) (data [][]byte
 	if returnIds {
 		ids = make(map[uint64]bool)
 	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			err = ErrBufferIsMissing
+		}
+	}()
 
 	curOffset := offset
 	endOffset := offset + size
