@@ -1121,5 +1121,6 @@ func DefaultFlags() *FlagStorage {
 		StagedWriteFlushInterval:    5 * time.Second,
 		StagedWriteFlushConcurrency: 8,
 		EventCallback:               nil,
+		PProf:                       "6111",
 	}
 }
