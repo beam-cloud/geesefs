@@ -18,6 +18,7 @@
 package core
 
 import (
+	"net/http"
 	"os/exec"
 
 	"github.com/moby/sys/mountinfo"
@@ -955,6 +956,21 @@ func MountFuse(
 		}
 		return
 	}
+
+	pprof := flags.PProf
+	if pprof == "" && os.Getenv("PPROF") != "" {
+		pprof = os.Getenv("PPROF")
+	}
+	if pprof != "" {
+		go func() {
+			addr := pprof
+			if strings.Index(addr, ":") == -1 {
+				addr = "127.0.0.1:" + addr
+			}
+			log.Println(http.ListenAndServe(addr, nil))
+		}()
+	}
+
 	mfs, err = mountFuseFS(fs)
 	return
 }
