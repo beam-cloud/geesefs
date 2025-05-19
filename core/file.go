@@ -395,10 +395,13 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 		return 0, 0, errContentNotFound
 	}
 
-	var buf []byte
+	var b bytes.Buffer
+
 	for chunk := range contentChan {
-		buf = append(buf, chunk...)
+		b.Write(chunk)
 	}
+
+	buf := b.Bytes()
 
 	if len(buf) == 0 {
 		inode.fs.CacheFileInExternalCache(inode)
