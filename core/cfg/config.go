@@ -64,10 +64,11 @@ type FlagStorage struct {
 	StagedWriteFlushConcurrency int
 
 	// External Caching
-	ExternalCacheClient  ContentCache
-	HashAttr             string
-	HashTimeout          time.Duration
-	MinFileSizeForHashKB uint64
+	ExternalCacheClient           ContentCache
+	ExternalCacheStreamingEnabled bool
+	HashAttr                      string
+	HashTimeout                   time.Duration
+	MinFileSizeForHashKB          uint64
 
 	// Events
 	EventCallback func(event EventType, data map[string]interface{})

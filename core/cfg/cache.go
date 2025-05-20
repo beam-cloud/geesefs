@@ -2,6 +2,9 @@ package cfg
 
 type ContentCache interface {
 	GetContent(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]byte, error)
+	GetContentStream(hash string, offset int64, length int64, opts struct {
+		RoutingKey string
+	}) (chan []byte, error)
 	StoreContent(chunks chan []byte, hash string, opts struct{ RoutingKey string }) (string, error)
 	StoreContentFromS3(source struct {
 		Path        string

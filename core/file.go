@@ -389,10 +389,30 @@ func (inode *Inode) loadFromStagedFile(diskRanges []Range) (allocated int64, err
 }
 
 func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash string) (allocated int64, totalDone uint64, err error) {
-	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
-	if err != nil || buf == nil {
-		inode.fs.CacheFileInExternalCache(inode)
-		return 0, 0, errContentNotFound
+	var buf []byte
+
+	if inode.fs.flags.ExternalCacheStreamingEnabled {
+		contentChan, err := inode.fs.flags.ExternalCacheClient.GetContentStream(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
+		if err != nil || contentChan == nil {
+			inode.fs.CacheFileInExternalCache(inode)
+			return 0, 0, errContentNotFound
+		}
+
+		buf = make([]byte, 0, size)
+		for chunk := range contentChan {
+			buf = append(buf, chunk...)
+		}
+
+		if len(buf) == 0 {
+			inode.fs.CacheFileInExternalCache(inode)
+			return 0, 0, errContentNotFound
+		}
+	} else {
+		buf, err = inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
+		if err != nil || buf == nil {
+			inode.fs.CacheFileInExternalCache(inode)
+			return 0, 0, errContentNotFound
+		}
 	}
 
 	totalDone = uint64(len(buf))
