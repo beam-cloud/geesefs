@@ -534,9 +534,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	allocated := int64(0)
 	curOffset, curSize := offset, size
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
-		// hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
-		hashFound := true
-		hash := "ebe4c635c852fad853162160b87beb2f7566e3b09e5083d201da2adbf73263d8"
+		hash, hashFound := inode.userMetadata[inode.fs.flags.HashAttr]
 
 		var alloc int64 = 0
 		var done uint64 = 0
@@ -765,15 +763,15 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 	}()
 
 	if fh.shouldRetrieveHash() {
-		// fh.inode.mu.Lock()
-		// cloud, path := fh.inode.cloud()
-		// head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
-		// if err == nil {
-		// 	fh.inode.setMetadata(head.Metadata)
-		// 	fh.inode.mu.Unlock()
-		// } else {
-		// 	log.Errorf("Error getting head blob: %v", err)
-		// }
+		fh.inode.mu.Lock()
+		cloud, path := fh.inode.cloud()
+		head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
+		if err == nil {
+			fh.inode.setMetadata(head.Metadata)
+			fh.inode.mu.Unlock()
+		} else {
+			log.Errorf("Error getting head blob: %v", err)
+		}
 	}
 
 	// return cached buffers directly without locking
