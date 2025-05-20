@@ -398,9 +398,12 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 			return 0, 0, errContentNotFound
 		}
 
-		buf = make([]byte, 0, size)
+		buf = make([]byte, size)
+
+		writeOffset := 0
 		for chunk := range contentChan {
-			buf = append(buf, chunk...)
+			n := copy(buf[writeOffset:], chunk)
+			writeOffset += n
 		}
 
 		if len(buf) == 0 {
