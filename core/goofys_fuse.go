@@ -970,6 +970,7 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 		UseVectoredRead:         true,
 		UseReadDirPlus:          true,
 		FuseImpl:                fuse.FUSEImplMacFUSE,
+		EnableAsyncReads:        true,
 	}
 
 	if fs.flags.DebugFuse {
