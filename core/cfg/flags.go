@@ -1118,6 +1118,7 @@ func DefaultFlags() *FlagStorage {
 		StagedWriteModeEnabled:        false,
 		StagedWritePath:               "",
 		StagedWriteDebounce:           30 * time.Second,
+		StagedWriteFlushTimeout:       15 * time.Minute,
 		StagedWriteFlushSize:          16 * 1024 * 1024,
 		StagedWriteFlushInterval:      5 * time.Second,
 		StagedWriteFlushConcurrency:   8,

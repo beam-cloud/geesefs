@@ -59,6 +59,7 @@ type FlagStorage struct {
 	StagedWriteModeEnabled      bool
 	StagedWritePath             string
 	StagedWriteDebounce         time.Duration
+	StagedWriteFlushTimeout     time.Duration
 	StagedWriteFlushSize        uint64
 	StagedWriteFlushInterval    time.Duration
 	StagedWriteFlushConcurrency int

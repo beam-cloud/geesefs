@@ -980,7 +980,12 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 }
 
 func (fs *Goofys) WaitForFlush() {
+	timeout := fs.flags.StagedWriteFlushTimeout
+
 	if fs.flags.StagedWriteModeEnabled {
+		timeoutTimer := time.NewTimer(timeout)
+		defer timeoutTimer.Stop()
+
 		for {
 			hasStaged := false
 			anyFlushing := false
@@ -999,14 +1004,12 @@ func (fs *Goofys) WaitForFlush() {
 					)
 
 					hasStaged = true
-
 					if stagedFile.flushing {
 						anyFlushing = true
 					} else if stagedFile.ReadyToFlush() {
 						fs.flushStagedFile(inode)
 						return true
 					}
-
 				}
 
 				return true
@@ -1016,7 +1019,13 @@ func (fs *Goofys) WaitForFlush() {
 				break
 			}
 
-			time.Sleep(1 * time.Second)
+			select {
+			case <-timeoutTimer.C:
+				log.Warnf("Flush did not complete within timeout of %v", timeout)
+				return
+			case <-time.After(1 * time.Second):
+				// Continue waiting
+			}
 		}
 	}
 }
