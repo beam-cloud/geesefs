@@ -502,6 +502,10 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 
 	// Wait for the data to load
 	if len(readRanges) > 0 || loading {
+		// Ensure readCond is initialized before waiting
+		if inode.readCond == nil {
+			inode.readCond = sync.NewCond(&inode.mu)
+		}
 		for {
 			_, _, err := inode.buffers.GetData(offset, size, false)
 			if err == ErrBufferIsLoading {
@@ -1928,7 +1932,9 @@ func (inode *Inode) flushPart(part uint64) {
 	}
 
 	// Load part from the server if we have to read-modify-write it
-	if inode.CacheState == ST_MODIFIED {
+	// Skip RMW for new files that don't exist on the server yet (knownETag is empty)
+	// Also skip if this is a renamed file that was originally created locally (oldParent + empty knownETag)
+	if inode.CacheState == ST_MODIFIED && inode.knownETag != "" {
 		// Ignore memory limit to not produce a deadlock when we need to free some memory
 		// by flushing objects, but we can't flush a part without allocating more memory
 		// for read-modify-write...
