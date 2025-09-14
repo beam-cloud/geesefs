@@ -1116,6 +1116,7 @@ func DefaultFlags() *FlagStorage {
 		ExternalCacheClient:           nil,
 		ExternalCacheStreamingEnabled: false,
 		StagedWriteModeEnabled:        false,
+		CacheThroughModeEnabled:       false,
 		StagedWritePath:               "",
 		StagedWriteDebounce:           30 * time.Second,
 		StagedWriteFlushTimeout:       15 * time.Minute,

@@ -2106,6 +2106,11 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
 		}
 
+		// If cache through mode is enabled, immediately cache the file in the external cache
+		if inode.fs.flags.CacheThroughModeEnabled {
+			inode.fs.CacheFileInExternalCache(inode)
+		}
+
 		inode.mpu = nil
 		inode.buffers.SetFlushedClean()
 

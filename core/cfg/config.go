@@ -64,6 +64,9 @@ type FlagStorage struct {
 	StagedWriteFlushInterval    time.Duration
 	StagedWriteFlushConcurrency int
 
+	// Cache through mode
+	CacheThroughModeEnabled bool
+
 	// External Caching
 	ExternalCacheClient           ContentCache
 	ExternalCacheStreamingEnabled bool
