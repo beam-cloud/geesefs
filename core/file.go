@@ -25,6 +25,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -136,6 +137,14 @@ func (inode *Inode) checkPauseWriters() {
 		}
 		inode.readCond.Wait()
 	}
+}
+
+func (inode *Inode) checkPauseWritersInterruptible() bool {
+	if inode.pauseWriters > 0 {
+		// Don't wait - return false to indicate we should yield to readers
+		return false
+	}
+	return true
 }
 
 func (fh *FileHandle) getOrCreateStagedFile() (err error) {
@@ -899,9 +908,13 @@ func (inode *Inode) TryFlush(priority int) bool {
 	}
 	inode.mu.Unlock()
 
-	if strings.HasSuffix(inode.Name, ".incomplete") {
-		log.Debugf("DONT FLUSH INCOMPLETE: %v", inode.Name)
-		return false
+	// Check if the file has a suffix that is in the ignore list
+	ext := filepath.Ext(inode.Name)
+	if ext != "" {
+		if slices.Contains(inode.fs.flags.IgnoreFilesWithSuffix, ext) {
+			log.Debugf("Not flushing file with suffix: %v", inode.Name)
+			return false
+		}
 	}
 
 	overDeleted := false
