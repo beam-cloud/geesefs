@@ -899,6 +899,11 @@ func (inode *Inode) TryFlush(priority int) bool {
 	}
 	inode.mu.Unlock()
 
+	if strings.HasSuffix(inode.Name, ".incomplete") {
+		log.Debugf("DONT FLUSH INCOMPLETE: %v", inode.Name)
+		return false
+	}
+
 	overDeleted := false
 	parent := inode.Parent
 	if parent != nil {
