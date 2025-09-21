@@ -16,9 +16,6 @@
 package core
 
 import (
-	"path/filepath"
-	"slices"
-
 	"github.com/yandex-cloud/geesefs/core/cfg"
 
 	"context"
@@ -466,8 +463,6 @@ func (fs *Goofys) processCacheEvents() {
 }
 
 func (fs *Goofys) CacheFileInExternalCache(inode *Inode) {
-	log.Debugf("Submitting cache event for file: %v", inode.FullName())
-
 	hash, ok := inode.userMetadata[fs.flags.HashAttr]
 	if !ok {
 		log.Errorf("No hash found for inode, not caching inode in external cache: %v", inode.FullName())
@@ -491,6 +486,7 @@ func (fs *Goofys) CacheFileInExternalCache(inode *Inode) {
 	}
 
 	// Submit cache event
+	log.Debugf("Submitting cache event for file: %v", inode.FullName())
 	fs.cacheEventChan <- cacheEvent{inode: inode}
 }
 
@@ -886,15 +882,6 @@ func (fs *Goofys) StagedFileFlusher() {
 
 func (fs *Goofys) flushStagedFile(inode *Inode) {
 	inode.mu.Lock()
-
-	ext := filepath.Ext(inode.Name)
-	if ext != "" {
-		if slices.Contains(inode.fs.flags.IgnoreFilesWithSuffix, ext) {
-			log.Debugf("Not flushing file with suffix: %v", inode.Name)
-			inode.mu.Unlock()
-			return
-		}
-	}
 
 	stagedFile := inode.StagedFile
 	if stagedFile == nil {

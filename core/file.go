@@ -2211,9 +2211,21 @@ func (inode *Inode) updateFromFlush(size uint64, etag *string, lastModified *tim
 func (inode *Inode) SyncFile() (err error) {
 	inode.logFuse("SyncFile")
 
+	// First, trigger flush
+	inode.mu.Lock()
+	if inode.CacheState > ST_DEAD {
+		inode.forceFlush = true
+		inode.mu.Unlock()
+		inode.TryFlush(MAX_FLUSH_PRIORITY)
+		inode.fs.WakeupFlusher()
+	} else {
+		inode.mu.Unlock()
+		return nil
+	}
+
+	// Then wait for flush to complete
 	for {
 		inode.mu.Lock()
-		inode.forceFlush = false
 		if inode.CacheState <= ST_DEAD {
 			inode.mu.Unlock()
 			break
@@ -2224,14 +2236,15 @@ func (inode *Inode) SyncFile() (err error) {
 			inode.mu.Unlock()
 			break
 		}
-		inode.forceFlush = true
-		inode.mu.Unlock()
-		inode.TryFlush(MAX_FLUSH_PRIORITY)
-		inode.fs.flusherMu.Lock()
-		if inode.fs.flushPending == 0 {
-			inode.fs.flusherCond.Wait()
+		// Check if flush is complete: no active flushes and no dirty data
+		if inode.IsFlushing == 0 && !inode.isStillDirty() {
+			inode.mu.Unlock()
+			break
 		}
-		inode.fs.flusherMu.Unlock()
+		inode.mu.Unlock()
+
+		// Wait a bit before checking again
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	inode.logFuse("Done SyncFile")
