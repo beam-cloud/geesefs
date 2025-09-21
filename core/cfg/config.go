@@ -64,6 +64,9 @@ type FlagStorage struct {
 	StagedWriteFlushInterval    time.Duration
 	StagedWriteFlushConcurrency int
 
+	// Don't flush files with these suffixes
+	IgnoreFilesWithSuffix []string
+
 	// Cache through mode
 	CacheThroughModeEnabled bool
 

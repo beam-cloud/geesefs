@@ -25,6 +25,8 @@ import (
 	"hash"
 	"net/url"
 	"os"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -107,6 +109,14 @@ func (stagedFile *StagedFile) ReadyToFlush() bool {
 
 	if time.Since(stagedFile.lastReadAt) < stagedFile.debounce {
 		return false
+	}
+
+	inode := stagedFile.FH.inode
+	ext := filepath.Ext(stagedFile.FH.inode.Name)
+	if ext != "" {
+		if slices.Contains(inode.fs.flags.IgnoreFilesWithSuffix, ext) {
+			return false
+		}
 	}
 
 	return true

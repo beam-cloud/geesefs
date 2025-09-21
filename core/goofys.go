@@ -463,8 +463,6 @@ func (fs *Goofys) processCacheEvents() {
 }
 
 func (fs *Goofys) CacheFileInExternalCache(inode *Inode) {
-	log.Debugf("Submitting cache event for file: %v", inode.FullName())
-
 	hash, ok := inode.userMetadata[fs.flags.HashAttr]
 	if !ok {
 		log.Errorf("No hash found for inode, not caching inode in external cache: %v", inode.FullName())
@@ -488,6 +486,7 @@ func (fs *Goofys) CacheFileInExternalCache(inode *Inode) {
 	}
 
 	// Submit cache event
+	log.Debugf("Submitting cache event for file: %v", inode.FullName())
 	fs.cacheEventChan <- cacheEvent{inode: inode}
 }
 
@@ -898,13 +897,16 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		return
 	}
 
+	var shouldCleanup = true
 	defer func(stagedFile *StagedFile) {
-		inode.mu.Lock()
-		inode.StagedFile = nil
-		inode.fs.stagedFiles.Delete(inode.Id)
-		inode.mu.Unlock()
+		if shouldCleanup {
+			inode.mu.Lock()
+			inode.StagedFile = nil
+			inode.fs.stagedFiles.Delete(inode.Id)
+			inode.mu.Unlock()
 
-		stagedFile.Cleanup()
+			stagedFile.Cleanup()
+		}
 	}(stagedFile)
 
 	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
@@ -951,6 +953,25 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 				inode.mu.Unlock()
 				break
 			}
+
+			// Check if readers want to interrupt this flush
+			inode.mu.Lock()
+			canProceed := inode.checkPauseWritersInterruptible()
+			if !canProceed {
+				// Readers are waiting - yield to them and retry later
+				log.Debugf("Staged file flush interrupted by readers for %s, will retry", inode.FullName())
+				inode.UnlockRange(uint64(offset), chunkSize, true)
+
+				// Reset flushing state so it can be retried
+				stagedFile.mu.Lock()
+				stagedFile.flushing = false
+				stagedFile.mu.Unlock()
+
+				shouldCleanup = false // Don't clean up, let it be retried
+				inode.mu.Unlock()
+				return // Exit and let readers proceed, staged file will be retried later
+			}
+			inode.mu.Unlock()
 
 			copyData := len(buf) < cap(buf)-4096
 			err = stagedFile.FH.WriteFile(offset, buf[:n], copyData)

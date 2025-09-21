@@ -1123,6 +1123,7 @@ func DefaultFlags() *FlagStorage {
 		StagedWriteFlushSize:          16 * 1024 * 1024,
 		StagedWriteFlushInterval:      5 * time.Second,
 		StagedWriteFlushConcurrency:   8,
+		IgnoreFilesWithSuffix:         []string{".incomplete", ".lock"},
 		EventCallback:                 nil,
 	}
 }
