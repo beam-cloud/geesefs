@@ -370,12 +370,15 @@ func (inode *Inode) loadFromDisk(diskRanges []Range) (allocated int64, err error
 	return
 }
 
-func (inode *Inode) loadFromStagedFile(diskRanges []Range) (allocated int64, err error) {
+func (inode *Inode) loadFromStagedFile(diskRanges []Range) (buffers []struct {
+	offset uint64
+	data   []byte
+}, allocated int64, err error) {
 	inode.StagedFile.mu.Lock()
 	defer inode.StagedFile.mu.Unlock()
 
 	if inode.StagedFile.FD == nil {
-		return 0, syscall.EAGAIN
+		return nil, 0, syscall.EAGAIN
 	}
 
 	inode.StagedFile.lastReadAt = time.Now()
@@ -384,12 +387,18 @@ func (inode *Inode) loadFromStagedFile(diskRanges []Range) (allocated int64, err
 		data := make([]byte, readSize)
 		n, err := inode.StagedFile.FD.ReadAt(data, int64(rr.Start))
 		if err != nil {
-			return 0, err
+			return nil, 0, err
 		}
 
 		if n > 0 {
 			allocated += int64(n)
-			inode.buffers.ReviveFromStagedFile(rr.Start, data)
+			buffers = append(buffers, struct {
+				offset uint64
+				data   []byte
+			}{
+				offset: rr.Start,
+				data:   data[:n],
+			})
 		}
 	}
 
@@ -476,16 +485,20 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 			}
 
 			if len(readRanges) > 0 {
-				allocated, err := inode.loadFromStagedFile(readRanges)
-
-				// Correct memory usage without the inode lock
+				// Unlock mutex before doing blocking I/O
 				inode.mu.Unlock()
+				buffers, allocated, err := inode.loadFromStagedFile(readRanges)
 				inode.fs.bufferPool.Use(allocated, true)
 				inode.mu.Lock()
 
 				// Return on error
 				if err != nil {
 					return miss, err
+				}
+
+				// Apply the loaded buffers while holding the mutex
+				for _, buf := range buffers {
+					inode.buffers.ReviveFromStagedFile(buf.offset, buf.data)
 				}
 			}
 		} else {
@@ -1716,6 +1729,16 @@ func (inode *Inode) resetCache() {
 			inode.OnDisk = false
 		}
 	}
+
+	// Clean up staged file if present
+	if inode.StagedFile != nil {
+		inode.fs.stagedFiles.Delete(inode.Id)
+		if inode.StagedFile.FD != nil {
+			inode.StagedFile.Cleanup()
+		}
+		inode.StagedFile = nil
+	}
+
 	// And abort multipart upload, too
 	if inode.mpu != nil {
 		inode.abortMultipart()
@@ -2211,37 +2234,36 @@ func (inode *Inode) updateFromFlush(size uint64, etag *string, lastModified *tim
 func (inode *Inode) SyncFile() (err error) {
 	inode.logFuse("SyncFile")
 
-	// First, trigger flush
-	inode.mu.Lock()
-	if inode.CacheState > ST_DEAD {
-		inode.forceFlush = true
-		inode.mu.Unlock()
-		inode.TryFlush(MAX_FLUSH_PRIORITY)
-		inode.fs.WakeupFlusher()
-	} else {
-		inode.mu.Unlock()
-		return nil
-	}
-
-	// Then wait for flush to complete
+	// Keep triggering flushes until the file is clean
 	for {
 		inode.mu.Lock()
+
+		// Check if we're done
 		if inode.CacheState <= ST_DEAD {
 			inode.mu.Unlock()
 			break
 		}
+
+		// Return any flush error
 		if inode.flushError != nil {
-			// Return the error to user
 			err = inode.flushError
 			inode.mu.Unlock()
 			break
 		}
-		// Check if flush is complete: no active flushes and no dirty data
+
+		// Check if already clean
 		if inode.IsFlushing == 0 && !inode.isStillDirty() {
 			inode.mu.Unlock()
 			break
 		}
+
+		// Mark for forced flush
+		inode.forceFlush = true
 		inode.mu.Unlock()
+
+		// Trigger flush without holding the lock
+		inode.TryFlush(MAX_FLUSH_PRIORITY)
+		inode.fs.WakeupFlusher()
 
 		// Wait a bit before checking again
 		time.Sleep(10 * time.Millisecond)
