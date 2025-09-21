@@ -859,9 +859,7 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 
 	// return cached buffers directly without copying
 	data, _, err = fh.inode.buffers.GetData(offset, size, false)
-	if err != nil && requestErr != nil {
-		return nil, 0, requestErr
-	} else if err != nil {
+	if err != nil {
 		return nil, 0, syscall.EIO
 	}
 

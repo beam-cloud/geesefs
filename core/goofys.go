@@ -691,14 +691,11 @@ func (fs *Goofys) tryEvictToDisk(inode *Inode, buf *FileBuffer, toFs *int) {
 
 func (fs *Goofys) WakeupFlusherAndWait(wait bool) {
 	fs.flusherMu.Lock()
-	if fs.flushPending == 0 {
-		fs.flushPending = 1
-		fs.flusherCond.Broadcast()
-	}
-	if wait {
-		// Wait for any result
-		fs.flusherCond.Wait()
-	}
+	fs.flushPending = 1
+	fs.flusherCond.Broadcast()
+	// Note: waiting here is not reliable as we might wake up on someone else's signal
+	// The caller should implement their own synchronization if they need to wait
+	// for a specific flush to complete
 	fs.flusherMu.Unlock()
 }
 
@@ -735,7 +732,8 @@ func (fs *Goofys) Flusher() {
 	priority := 1
 	for atomic.LoadInt32(&fs.shutdown) == 0 {
 		fs.flusherMu.Lock()
-		if fs.flushPending == 0 {
+		// Wait only if there's no work to do
+		for fs.flushPending == 0 && atomic.LoadInt32(&fs.shutdown) == 0 {
 			fs.flusherCond.Wait()
 		}
 		fs.flushPending = 0
