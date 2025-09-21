@@ -16,6 +16,9 @@
 package core
 
 import (
+	"path/filepath"
+	"slices"
+
 	"github.com/yandex-cloud/geesefs/core/cfg"
 
 	"context"
@@ -883,6 +886,15 @@ func (fs *Goofys) StagedFileFlusher() {
 
 func (fs *Goofys) flushStagedFile(inode *Inode) {
 	inode.mu.Lock()
+
+	ext := filepath.Ext(inode.Name)
+	if ext != "" {
+		if slices.Contains(inode.fs.flags.IgnoreFilesWithSuffix, ext) {
+			log.Debugf("Not flushing file with suffix: %v", inode.Name)
+			inode.mu.Unlock()
+			return
+		}
+	}
 
 	stagedFile := inode.StagedFile
 	if stagedFile == nil {

@@ -25,7 +25,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -457,9 +456,11 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 		raSize = inode.Attributes.Size - offset
 	}
 
+	isStagedFile := inode.fs.flags.StagedWriteModeEnabled && inode.StagedFile != nil
+
 	// Collect requests to the server and disk
 	readRanges, loading, flushCleared := inode.buffers.GetHoles(offset, raSize)
-	if flushCleared {
+	if flushCleared && !isStagedFile {
 		// One of the buffers is saved as a part and then removed
 		// We must complete multipart upload to be able to read it back
 		return true, syscall.ESPIPE
@@ -469,7 +470,7 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 		miss = true
 
 		// If staged write mode is enabled, try to load from the staged file
-		if inode.fs.flags.StagedWriteModeEnabled && inode.StagedFile != nil {
+		if isStagedFile {
 			for _, rr := range readRanges {
 				inode.buffers.AddLoading(rr.Start, rr.End-rr.Start)
 			}
@@ -907,15 +908,6 @@ func (inode *Inode) TryFlush(priority int) bool {
 		}
 	}
 	inode.mu.Unlock()
-
-	// Check if the file has a suffix that is in the ignore list
-	ext := filepath.Ext(inode.Name)
-	if ext != "" {
-		if slices.Contains(inode.fs.flags.IgnoreFilesWithSuffix, ext) {
-			log.Debugf("Not flushing file with suffix: %v", inode.Name)
-			return false
-		}
-	}
 
 	overDeleted := false
 	parent := inode.Parent
