@@ -63,8 +63,9 @@ type Goofys struct {
 
 	rootAttrs InodeAttributes
 
-	bufferPool *BufferPool
-	wantFree   int32
+	bufferPool      *BufferPool
+	cacheBufferPool *CacheBufferPool
+	wantFree        int32
 
 	shutdown   int32
 	shutdownCh chan struct{}
@@ -364,6 +365,7 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 	fs.bufferPool.FreeSomeCleanBuffers = func(size int64) (int64, bool) {
 		return fs.FreeSomeCleanBuffers(size)
 	}
+	fs.cacheBufferPool = NewCacheBufferPool()
 
 	fs.nextInodeID = fuseops.RootInodeID + 1
 	fs.inodes = make(map[fuseops.InodeID]*Inode)

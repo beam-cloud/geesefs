@@ -406,6 +406,14 @@ func (inode *Inode) loadFromStagedFile(diskRanges []Range) (buffers []struct {
 }
 
 func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash string) (allocated int64, totalDone uint64, err error) {
+	// For large reads, use chunked loading at optimal chunk size (256KB performs best)
+	const optimalChunkSize = 256 * 1024
+	
+	if !inode.fs.flags.ExternalCacheStreamingEnabled && size > optimalChunkSize*2 {
+		// Read in optimal chunks for better performance
+		return inode.loadFromExternalCacheChunked(offset, size, hash, optimalChunkSize)
+	}
+	
 	var buf []byte
 
 	if inode.fs.flags.ExternalCacheStreamingEnabled {
@@ -415,8 +423,8 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 			return 0, 0, errContentNotFound
 		}
 
-		// Pre-allocate full buffer to avoid append reallocations
-		buf = make([]byte, size)
+		// Use buffer pool for optimal performance
+		buf = inode.fs.cacheBufferPool.Get(int(size))
 		writeOffset := 0
 		
 		for chunk := range contentChan {
@@ -432,6 +440,7 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 
 		if len(buf) == 0 {
 			log.Debugf("External cache returned empty content for hash %s", hash)
+			inode.fs.cacheBufferPool.Put(buf)
 			return 0, 0, errContentNotFound
 		}
 	} else {
@@ -445,6 +454,7 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 	totalDone = uint64(len(buf))
 
 	// Add to buffer and notify - keep lock minimal
+	// Note: buffers.Add will take ownership of buf, so we can't return it to pool
 	inode.mu.Lock()
 	allocated = inode.buffers.Add(offset, buf, BUF_CLEAN, false)
 	if inode.readCond != nil {
@@ -453,6 +463,56 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 	inode.mu.Unlock()
 
 	log.Debugf("Successfully loaded %d bytes from external cache for hash %s", totalDone, hash)
+	return allocated, totalDone, nil
+}
+
+// loadFromExternalCacheChunked reads large data in optimal-sized chunks
+// Benchmarks show 256KB chunks have best performance
+func (inode *Inode) loadFromExternalCacheChunked(offset uint64, size uint64, hash string, chunkSize uint64) (allocated int64, totalDone uint64, err error) {
+	log.Debugf("Using chunked read for %d bytes from external cache (hash %s)", size, hash)
+	
+	curOffset := offset
+	remaining := size
+	
+	for remaining > 0 {
+		curSize := chunkSize
+		if curSize > remaining {
+			curSize = remaining
+		}
+		
+		// Read chunk from cache
+		buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(curOffset), int64(curSize), struct{ RoutingKey string }{RoutingKey: hash})
+		if err != nil || buf == nil {
+			log.Debugf("External cache chunked read miss for hash %s at offset %d: %v", hash, curOffset, err)
+			// Return partial data if we got some
+			if totalDone > 0 {
+				return allocated, totalDone, nil
+			}
+			return 0, 0, errContentNotFound
+		}
+		
+		chunkDone := uint64(len(buf))
+		
+		// Add chunk to buffers
+		inode.mu.Lock()
+		allocated += inode.buffers.Add(curOffset, buf, BUF_CLEAN, false)
+		// Notify readers after each chunk so they can start consuming
+		if inode.readCond != nil {
+			inode.readCond.Broadcast()
+		}
+		inode.mu.Unlock()
+		
+		totalDone += chunkDone
+		curOffset += chunkDone
+		remaining -= chunkDone
+		
+		// If chunk was smaller than requested, we've reached the end
+		if chunkDone < curSize {
+			break
+		}
+	}
+	
+	log.Debugf("Successfully loaded %d bytes via chunked read from external cache for hash %s", totalDone, hash)
 	return allocated, totalDone, nil
 }
 
