@@ -424,42 +424,27 @@ func (fs *Goofys) processCacheEvents() {
 				continue
 			}
 
-			if inode.Attributes.Size > 0 {
-				// Try to extract S3 config for caching
-				var region, accessKey, secretKey string
-				
-				// Check if backend is S3-compatible
-				if s3, ok := flags.Backend.(*cfg.S3Config); ok {
-					region = s3.Region
-					accessKey = s3.AccessKey
-					secretKey = s3.SecretKey
-				} else {
-					// For non-S3 backends, use empty credentials
-					// The cache client should handle authentication appropriately
-					region = ""
-					accessKey = ""
-					secretKey = ""
-					log.Debugf("Non-S3 backend detected for %v, using default auth", inode.FullName())
-				}
+		if inode.Attributes.Size > 0 {
+			s3Config := flags.Backend.(*cfg.S3Config)
 
-				hash, err := fs.flags.ExternalCacheClient.StoreContentFromS3(struct {
-					Path        string
-					BucketName  string
-					Region      string
-					EndpointURL string
-					AccessKey   string
-					SecretKey   string
-				}{
-					Path:        inode.FullName(),
-					BucketName:  fs.bucket,
-					Region:      region,
-					EndpointURL: flags.Endpoint,
-					AccessKey:   accessKey,
-					SecretKey:   secretKey,
-				}, struct {
-					RoutingKey string
-					Lock       bool
-				}{RoutingKey: string(knownHash), Lock: true})
+			hash, err := fs.flags.ExternalCacheClient.StoreContentFromS3(struct {
+				Path        string
+				BucketName  string
+				Region      string
+				EndpointURL string
+				AccessKey   string
+				SecretKey   string
+			}{
+				Path:        inode.FullName(),
+				BucketName:  fs.bucket,
+				Region:      s3Config.Region,
+				EndpointURL: flags.Endpoint,
+				AccessKey:   s3Config.AccessKey,
+				SecretKey:   s3Config.SecretKey,
+			}, struct {
+				RoutingKey string
+				Lock       bool
+			}{RoutingKey: string(knownHash), Lock: true})
 				if err != nil {
 					log.Debugf("Failed to store content from source: %v", err)
 				} else if hash != string(knownHash) {
