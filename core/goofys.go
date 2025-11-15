@@ -963,10 +963,17 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 				// Reset flushing state so it can be retried
 				stagedFile.mu.Lock()
 				stagedFile.flushing = false
+				stagedFile.shouldFlush = false
 				stagedFile.mu.Unlock()
 
 				shouldCleanup = false // Don't clean up, let it be retried
 				inode.mu.Unlock()
+				
+				// Schedule a retry after a short delay
+				go func() {
+					time.Sleep(100 * time.Millisecond)
+					fs.WakeupFlusher()
+				}()
 				return // Exit and let readers proceed, staged file will be retried later
 			}
 			inode.mu.Unlock()
@@ -974,11 +981,26 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 			copyData := len(buf) < cap(buf)-4096
 			err = stagedFile.FH.WriteFile(offset, buf[:n], copyData)
 			if err != nil {
-				log.Errorf("Error writing staged data data for flush: %v", err)
+				log.Errorf("Error writing staged data for flush at offset %d: %v", offset, err)
 				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
 				inode.mu.Unlock()
-				break
+				
+				// Reset flushing state for retry
+				stagedFile.mu.Lock()
+				stagedFile.flushing = false
+				stagedFile.shouldFlush = false
+				stagedFile.mu.Unlock()
+				
+				shouldCleanup = false
+				
+				// Schedule a retry after delay
+				go func() {
+					time.Sleep(1 * time.Second)
+					log.Debugf("Retrying flush for %s after error", inode.FullName())
+					fs.WakeupFlusher()
+				}()
+				return
 			}
 		}
 
@@ -996,17 +1018,56 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 	err := inode.SyncFile()
 	if err != nil {
 		log.Errorf("Error syncing staged file: %v", err)
+		
+		// Reset flushing state for retry on sync error
+		stagedFile.mu.Lock()
+		stagedFile.flushing = false
+		stagedFile.shouldFlush = false
+		stagedFile.mu.Unlock()
+		
+		shouldCleanup = false
+		
+		// Schedule a retry after delay
+		go func() {
+			time.Sleep(1 * time.Second)
+			log.Debugf("Retrying flush for %s after sync error", inode.FullName())
+			fs.WakeupFlusher()
+		}()
 		return
 	}
+	
+	// Mark flush as complete
+	log.Debugf("Successfully flushed staged file: %s", inode.FullName())
 }
 
-func (fs *Goofys) WaitForFlush() {
-	timeout := fs.flags.StagedWriteFlushTimeout
+func (fs *Goofys) WaitForFlush(timeout time.Duration) {
+	if timeout == 0 {
+		timeout = fs.flags.StagedWriteFlushTimeout
+	}
 
 	if fs.flags.StagedWriteModeEnabled {
 		timeoutTimer := time.NewTimer(timeout)
 		defer timeoutTimer.Stop()
 
+		// First pass: force flush of all staged files that aren't already flushing
+		fs.stagedFiles.Range(func(key, value interface{}) bool {
+			inode := value.(*Inode)
+			if inode.StagedFile != nil {
+				stagedFile := inode.StagedFile
+				stagedFile.mu.Lock()
+				// Force flush even if not ready (but only if not already flushing)
+				if !stagedFile.flushing {
+					stagedFile.mu.Unlock()
+					log.Debugf("Force flushing staged file during WaitForFlush: %s", inode.FullName())
+					go fs.flushStagedFile(inode)
+				} else {
+					stagedFile.mu.Unlock()
+				}
+			}
+			return true
+		})
+
+		// Second pass: wait for all flushes to complete
 		for {
 			hasStaged := false
 			anyFlushing := false
@@ -1027,9 +1088,6 @@ func (fs *Goofys) WaitForFlush() {
 					hasStaged = true
 					if stagedFile.flushing {
 						anyFlushing = true
-					} else if stagedFile.ReadyToFlush() {
-						fs.flushStagedFile(inode)
-						return true
 					}
 				}
 
@@ -1043,11 +1101,25 @@ func (fs *Goofys) WaitForFlush() {
 			select {
 			case <-timeoutTimer.C:
 				log.Warnf("Flush did not complete within timeout of %v", timeout)
+				// Force cleanup of remaining staged files
+				fs.stagedFiles.Range(func(key, value interface{}) bool {
+					inode := value.(*Inode)
+					if inode.StagedFile != nil {
+						log.Warnf("Force cleaning up staged file that didn't flush in time: %s", inode.FullName())
+						inode.mu.Lock()
+						inode.StagedFile = nil
+						inode.mu.Unlock()
+						fs.stagedFiles.Delete(key)
+					}
+					return true
+				})
 				return
-			case <-time.After(1 * time.Second):
+			case <-time.After(500 * time.Millisecond):
 				// Continue waiting
 			}
 		}
+		
+		log.Debugf("All staged files flushed successfully")
 	}
 }
 

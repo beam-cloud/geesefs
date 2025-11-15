@@ -411,39 +411,42 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 	if inode.fs.flags.ExternalCacheStreamingEnabled {
 		contentChan, err := inode.fs.flags.ExternalCacheClient.GetContentStream(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 		if err != nil || contentChan == nil {
-			inode.fs.CacheFileInExternalCache(inode)
+			log.Debugf("External cache streaming miss for hash %s: %v", hash, err)
+			// Don't trigger caching here - let the caller handle it to avoid duplicate requests
 			return 0, 0, errContentNotFound
 		}
 
-		buf = make([]byte, size)
+		buf = make([]byte, 0, size)
 
-		writeOffset := 0
 		for chunk := range contentChan {
-			n := copy(buf[writeOffset:], chunk)
-			writeOffset += n
+			buf = append(buf, chunk...)
 		}
 
 		if len(buf) == 0 {
-			inode.fs.CacheFileInExternalCache(inode)
+			log.Debugf("External cache returned empty content for hash %s", hash)
 			return 0, 0, errContentNotFound
 		}
 	} else {
 		buf, err = inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 		if err != nil || buf == nil {
-			inode.fs.CacheFileInExternalCache(inode)
+			log.Debugf("External cache miss for hash %s: %v", hash, err)
+			// Don't trigger caching here - let the caller handle it to avoid duplicate requests
 			return 0, 0, errContentNotFound
 		}
 	}
 
 	totalDone = uint64(len(buf))
 
-	// Cache the result
+	// Cache the result in memory
 	inode.mu.Lock()
 	allocated += inode.buffers.Add(offset, buf, BUF_CLEAN, false)
+	// Notify waiting readers
+	if inode.readCond != nil {
+		inode.readCond.Broadcast()
+	}
 	inode.mu.Unlock()
 
-	// Notify waiting readers
-	inode.readCond.Broadcast()
+	log.Debugf("Successfully loaded %d bytes from external cache for hash %s", totalDone, hash)
 	return allocated, totalDone, nil
 }
 
@@ -580,13 +583,43 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 		var done uint64 = 0
 		var err error = nil
 
-		if inode.fs.flags.ExternalCacheClient != nil && hashFound {
+		// Try external cache first if enabled and hash is available
+		if inode.fs.flags.ExternalCacheClient != nil && hashFound && len(hash) > 0 {
+			log.Debugf("Attempting to load from external cache for %s with hash %s", key, string(hash))
 			alloc, done, err = inode.loadFromExternalCache(curOffset, curSize, string(hash))
 			if err != nil {
+				// Cache miss - load from S3 and trigger caching
+				log.Debugf("External cache miss for %s, loading from S3 and caching", key)
 				alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
+				if err == nil && inode.Attributes.Size >= inode.fs.flags.MinFileSizeForHashKB*1024 {
+					// Trigger caching in background
+					go inode.fs.CacheFileInExternalCache(inode)
+				}
+			} else {
+				log.Debugf("External cache hit for %s", key)
 			}
 		} else {
+			// No hash or cache disabled - load directly from S3
 			alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
+			
+			// If we loaded successfully and file is eligible for caching, try to get hash
+			if err == nil && inode.fs.flags.ExternalCacheClient != nil && 
+			   inode.Attributes.Size >= inode.fs.flags.MinFileSizeForHashKB*1024 && !hashFound {
+				// Ensure metadata is loaded so we can check for hash
+				inode.mu.Lock()
+				if inode.userMetadata == nil {
+					inode.mu.Unlock()
+					_ = inode.fillXattr()
+					inode.mu.Lock()
+				}
+				// Re-check for hash after loading metadata
+				hash, hashFound = inode.userMetadata[inode.fs.flags.HashAttr]
+				if hashFound && len(hash) > 0 {
+					log.Debugf("Found hash for %s after metadata load, triggering cache", key)
+					go inode.fs.CacheFileInExternalCache(inode)
+				}
+				inode.mu.Unlock()
+			}
 		}
 
 		if err != nil && shouldRetry(err) {
@@ -609,10 +642,10 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	inode.buffers.RemoveLoading(offset, size)
 	inode.UnlockRange(offset, size, false)
 	inode.readError = err
-	inode.mu.Unlock()
-	if err != nil {
+	if err != nil && inode.readCond != nil {
 		inode.readCond.Broadcast()
 	}
+	inode.mu.Unlock()
 }
 
 func (inode *Inode) sendRead(cloud StorageBackend, key string, offset, size uint64) (allocated int64, totalDone uint64, err error) {
@@ -648,12 +681,14 @@ func (inode *Inode) sendRead(cloud StorageBackend, key string, offset, size uint
 			inode.fillXattrFromHead(&(*resp).HeadBlobOutput)
 		}
 		allocated += inode.buffers.Add(offset, buf, BUF_CLEAN, false)
+		// Notify waiting readers
+		if inode.readCond != nil {
+			inode.readCond.Broadcast()
+		}
 		inode.mu.Unlock()
 		size -= done
 		offset += done
 		totalDone += done
-		// Notify waiting readers
-		inode.readCond.Broadcast()
 	}
 	return allocated, totalDone, nil
 }
