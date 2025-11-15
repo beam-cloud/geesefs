@@ -19,6 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/yandex-cloud/geesefs/core"
 	"github.com/yandex-cloud/geesefs/core/cfg"
 )
@@ -31,6 +35,8 @@ type TestMockCache struct {
 	misses        int64
 	stores        int64
 	storeRequests []string
+	getContentCalls int64
+	getStreamCalls  int64
 }
 
 func NewTestMockCache() *TestMockCache {
@@ -41,12 +47,18 @@ func NewTestMockCache() *TestMockCache {
 }
 
 func (c *TestMockCache) GetContent(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]byte, error) {
+	atomic.AddInt64(&c.getContentCalls, 1)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	fmt.Printf("🔍 CACHE GetContent: hash=%s, offset=%d, length=%d\n", hash, offset, length)
 	data, ok := c.data[hash]
 	if !ok {
 		atomic.AddInt64(&c.misses, 1)
+		fmt.Printf("❌ CACHE MISS: hash=%s (have %d keys)\n", hash, len(c.data))
+		for k := range c.data {
+			fmt.Printf("  Available: %s\n", k)
+		}
 		return nil, fmt.Errorf("cache miss: %s", hash)
 	}
 
@@ -63,6 +75,7 @@ func (c *TestMockCache) GetContent(hash string, offset int64, length int64, opts
 
 	result := make([]byte, end-offset)
 	copy(result, data[offset:end])
+	fmt.Printf("✅ CACHE HIT: returned %d bytes\n", len(result))
 	return result, nil
 }
 
@@ -106,10 +119,47 @@ func (c *TestMockCache) StoreContentFromS3(source struct {
 }) (string, error) {
 	hash := opts.RoutingKey
 
+	fmt.Printf("📥 CACHE StoreContentFromS3:\\n")
+	fmt.Printf("  Path: %s, Hash: %s\\n", source.Path, hash)
+	fmt.Printf("  Bucket: %s, Endpoint: %s\\n", source.BucketName, source.EndpointURL)
+	
+	// ACTUALLY fetch the file from S3/Moto
+	// This simulates what a real cache would do
+	cfg := aws.NewConfig().
+		WithEndpoint(source.EndpointURL).
+		WithRegion(source.Region).
+		WithS3ForcePathStyle(true).
+		WithCredentials(credentials.NewStaticCredentials(source.AccessKey, source.SecretKey, ""))
+	
+	sess, err := session.NewSession(cfg)
+	if err != nil {
+		fmt.Printf("  ❌ Failed to create session: %v\\n", err)
+		return hash, err
+	}
+	
+	svc := s3.New(sess)
+	result, err := svc.GetObject(&s3.GetObjectInput{
+		Bucket: aws.String(source.BucketName),
+		Key:    aws.String(source.Path),
+	})
+	if err != nil {
+		fmt.Printf("  ❌ Failed to fetch from S3: %v\\n", err)
+		return hash, err
+	}
+	defer result.Body.Close()
+	
+	// Read the entire file
+	data, err := ioutil.ReadAll(result.Body)
+	if err != nil {
+		fmt.Printf("  ❌ Failed to read body: %v\\n", err)
+		return hash, err
+	}
+	
+	// Store in cache
 	c.mu.Lock()
 	c.storeRequests = append(c.storeRequests, fmt.Sprintf("s3:%s", source.Path))
-	// Store placeholder - real impl would fetch from S3
-	c.data[hash] = []byte(fmt.Sprintf("cached:%s", source.Path))
+	c.data[hash] = data
+	fmt.Printf("  ✅ Stored with key: %s (%d bytes - ACTUAL DATA!)\\n", hash, len(data))
 	c.mu.Unlock()
 
 	atomic.AddInt64(&c.stores, 1)
@@ -120,6 +170,20 @@ func (c *TestMockCache) Stats() (hits, misses, stores int64, requests []string) 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return atomic.LoadInt64(&c.hits), atomic.LoadInt64(&c.misses), atomic.LoadInt64(&c.stores), append([]string{}, c.storeRequests...)
+}
+
+func (c *TestMockCache) DetailedStats() {
+	fmt.Printf("📊 CACHE STATS:\n")
+	fmt.Printf("  GetContent calls: %d\n", atomic.LoadInt64(&c.getContentCalls))
+	fmt.Printf("  Hits: %d\n", atomic.LoadInt64(&c.hits))
+	fmt.Printf("  Misses: %d\n", atomic.LoadInt64(&c.misses))
+	fmt.Printf("  Stores: %d\n", atomic.LoadInt64(&c.stores))
+	c.mu.RLock()
+	fmt.Printf("  Keys in cache: %d\n", len(c.data))
+	for k, v := range c.data {
+		fmt.Printf("    [%s]: %d bytes\n", k, len(v))
+	}
+	c.mu.RUnlock()
 }
 
 // TestIntegrationWithMount tests using PUBLIC API and actual FUSE mount
@@ -327,9 +391,12 @@ func testWriteAndReadMounted(t *testing.T, mountPoint string, cache *TestMockCac
 		t.Logf("ℹ Staged file already flushed (this is ok)")
 	}
 
-	// Wait for flush
-	t.Log("Waiting for flush to S3...")
-	time.Sleep(3 * time.Second)
+	// Wait for flush and cache
+	t.Log("Waiting for flush to S3 and caching...")
+	time.Sleep(5 * time.Second)
+	
+	t.Log("Checking cache state before read...")
+	cache.DetailedStats()
 
 	// Read back through mounted filesystem
 	t.Log("Reading back...")
