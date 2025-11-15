@@ -1,6 +1,3 @@
-// Copyright 2025
-// Real integration test using PUBLIC API with FUSE mounting
-
 package test
 
 import (
@@ -51,14 +48,9 @@ func (c *TestMockCache) GetContent(hash string, offset int64, length int64, opts
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	fmt.Printf("🔍 CACHE GetContent: hash=%s, offset=%d, length=%d\n", hash, offset, length)
 	data, ok := c.data[hash]
 	if !ok {
 		atomic.AddInt64(&c.misses, 1)
-		fmt.Printf("❌ CACHE MISS: hash=%s (have %d keys)\n", hash, len(c.data))
-		for k := range c.data {
-			fmt.Printf("  Available: %s\n", k)
-		}
 		return nil, fmt.Errorf("cache miss: %s", hash)
 	}
 
@@ -75,7 +67,6 @@ func (c *TestMockCache) GetContent(hash string, offset int64, length int64, opts
 
 	result := make([]byte, end-offset)
 	copy(result, data[offset:end])
-	fmt.Printf("✅ CACHE HIT: returned %d bytes\n", len(result))
 	return result, nil
 }
 
@@ -118,13 +109,8 @@ func (c *TestMockCache) StoreContentFromS3(source struct {
 	Lock       bool
 }) (string, error) {
 	hash := opts.RoutingKey
-
-	fmt.Printf("📥 CACHE StoreContentFromS3:\\n")
-	fmt.Printf("  Path: %s, Hash: %s\\n", source.Path, hash)
-	fmt.Printf("  Bucket: %s, Endpoint: %s\\n", source.BucketName, source.EndpointURL)
 	
-	// ACTUALLY fetch the file from S3/Moto
-	// This simulates what a real cache would do
+	// Fetch file from S3 (simulates real cache behavior)
 	cfg := aws.NewConfig().
 		WithEndpoint(source.EndpointURL).
 		WithRegion(source.Region).
@@ -133,7 +119,6 @@ func (c *TestMockCache) StoreContentFromS3(source struct {
 	
 	sess, err := session.NewSession(cfg)
 	if err != nil {
-		fmt.Printf("  ❌ Failed to create session: %v\\n", err)
 		return hash, err
 	}
 	
@@ -143,23 +128,18 @@ func (c *TestMockCache) StoreContentFromS3(source struct {
 		Key:    aws.String(source.Path),
 	})
 	if err != nil {
-		fmt.Printf("  ❌ Failed to fetch from S3: %v\\n", err)
 		return hash, err
 	}
 	defer result.Body.Close()
 	
-	// Read the entire file
 	data, err := ioutil.ReadAll(result.Body)
 	if err != nil {
-		fmt.Printf("  ❌ Failed to read body: %v\\n", err)
 		return hash, err
 	}
 	
-	// Store in cache
 	c.mu.Lock()
 	c.storeRequests = append(c.storeRequests, fmt.Sprintf("s3:%s", source.Path))
 	c.data[hash] = data
-	fmt.Printf("  ✅ Stored with key: %s (%d bytes - ACTUAL DATA!)\\n", hash, len(data))
 	c.mu.Unlock()
 
 	atomic.AddInt64(&c.stores, 1)
@@ -172,19 +152,6 @@ func (c *TestMockCache) Stats() (hits, misses, stores int64, requests []string) 
 	return atomic.LoadInt64(&c.hits), atomic.LoadInt64(&c.misses), atomic.LoadInt64(&c.stores), append([]string{}, c.storeRequests...)
 }
 
-func (c *TestMockCache) DetailedStats() {
-	fmt.Printf("📊 CACHE STATS:\n")
-	fmt.Printf("  GetContent calls: %d\n", atomic.LoadInt64(&c.getContentCalls))
-	fmt.Printf("  Hits: %d\n", atomic.LoadInt64(&c.hits))
-	fmt.Printf("  Misses: %d\n", atomic.LoadInt64(&c.misses))
-	fmt.Printf("  Stores: %d\n", atomic.LoadInt64(&c.stores))
-	c.mu.RLock()
-	fmt.Printf("  Keys in cache: %d\n", len(c.data))
-	for k, v := range c.data {
-		fmt.Printf("    [%s]: %d bytes\n", k, len(v))
-	}
-	c.mu.RUnlock()
-}
 
 // TestIntegrationWithMount tests using PUBLIC API and actual FUSE mount
 func TestIntegrationWithMount(t *testing.T) {
@@ -392,11 +359,7 @@ func testWriteAndReadMounted(t *testing.T, mountPoint string, cache *TestMockCac
 	}
 
 	// Wait for flush and cache
-	t.Log("Waiting for flush to S3 and caching...")
-	time.Sleep(5 * time.Second)
-	
-	t.Log("Checking cache state before read...")
-	cache.DetailedStats()
+	time.Sleep(3 * time.Second)
 
 	// Read back through mounted filesystem
 	t.Log("Reading back...")
