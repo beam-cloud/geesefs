@@ -467,12 +467,20 @@ func testConcurrentAccessMounted(t *testing.T, mountPoint string) {
 }
 
 func checkLocalStackAvailable(t *testing.T, endpoint string) bool {
+	// Try LocalStack health endpoint first
 	cmd := exec.Command("curl", "-sf", endpoint+"/_localstack/health")
+	if err := cmd.Run(); err == nil {
+		t.Logf("✓ LocalStack available at %s", endpoint)
+		return true
+	}
+	
+	// Fall back to basic S3 endpoint check (for moto)
+	cmd = exec.Command("curl", "-sf", endpoint+"/")
 	if err := cmd.Run(); err != nil {
-		t.Logf("LocalStack not available at %s", endpoint)
+		t.Logf("S3-compatible service not available at %s", endpoint)
 		return false
 	}
-	t.Logf("✓ LocalStack available at %s", endpoint)
+	t.Logf("✓ S3-compatible service (moto) available at %s", endpoint)
 	return true
 }
 
