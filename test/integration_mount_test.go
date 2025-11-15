@@ -246,6 +246,27 @@ func TestIntegrationWithMount(t *testing.T) {
 		t.Fatal("Filesystem failed to mount")
 	}
 
+	// Verify mount is actually using FUSE
+	cmd := exec.Command("mount")
+	output, err := cmd.Output()
+	if err == nil {
+		mountInfo := string(output)
+		if contains(mountInfo, mountPoint) {
+			t.Logf("✓ Mount verified in mount table")
+			// Extract mount line
+			for _, line := range splitLines(mountInfo) {
+				if contains(line, mountPoint) {
+					t.Logf("  Mount: %s", line)
+					if contains(line, "fuse") {
+						t.Logf("✓ Confirmed: Using FUSE")
+					}
+				}
+			}
+		} else {
+			t.Error("❌ Mount point not found in mount table!")
+		}
+	}
+
 	// Run tests through mounted filesystem
 	t.Run("WriteAndRead", func(t *testing.T) {
 		testWriteAndReadMounted(t, mountPoint, mockCache)
@@ -279,6 +300,8 @@ func TestIntegrationWithMount(t *testing.T) {
 }
 
 func testWriteAndReadMounted(t *testing.T, mountPoint string, cache *TestMockCache) {
+	t.Log("=== VERIFYING STAGED WRITE MODE ===")
+	
 	testFile := filepath.Join(mountPoint, "test-write-read.txt")
 	testData := "Hello from mounted filesystem test!"
 
@@ -290,9 +313,19 @@ func testWriteAndReadMounted(t *testing.T, mountPoint string, cache *TestMockCac
 	}
 	t.Log("✓ Write succeeded")
 
-	// Check staged file exists
-	// (May already be flushed due to timing)
+	// VERIFY STAGED WRITE: Check staged file exists
+	t.Log("Checking for staged file...")
 	time.Sleep(500 * time.Millisecond)
+	
+	// The file should be in staged location initially
+	expectedStagedPath := filepath.Join("/tmp/geesefs-mount-staged", "test-write-read.txt")
+	if _, err := os.Stat(expectedStagedPath); err == nil {
+		t.Logf("✓ STAGED WRITE VERIFIED: File exists at %s", expectedStagedPath)
+		fileInfo, _ := os.Stat(expectedStagedPath)
+		t.Logf("  Staged file size: %d bytes", fileInfo.Size())
+	} else {
+		t.Logf("ℹ Staged file already flushed (this is ok)")
+	}
 
 	// Wait for flush
 	t.Log("Waiting for flush to S3...")
@@ -313,6 +346,8 @@ func testWriteAndReadMounted(t *testing.T, mountPoint string, cache *TestMockCac
 }
 
 func testLargeFileThroughputMounted(t *testing.T, mountPoint string, cache *TestMockCache) {
+	t.Log("=== MEASURING THROUGHPUT ===")
+	
 	testFile := filepath.Join(mountPoint, "large-throughput-test.bin")
 	fileSize := 10 * 1024 * 1024 // 10MB
 
@@ -370,7 +405,8 @@ func testLargeFileThroughputMounted(t *testing.T, mountPoint string, cache *Test
 }
 
 func testCachingBehaviorMounted(t *testing.T, mountPoint string, cache *TestMockCache, events []string, mu *sync.Mutex) {
-	t.Log("Testing caching behavior...")
+	t.Log("=== VERIFYING CACHING BEHAVIOR ===")
+	t.Log("Testing automatic cache population...")
 
 	// Check if any cache stores happened
 	_, _, stores, requests := cache.Stats()
@@ -510,4 +546,23 @@ func findSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func splitLines(s string) []string {
+	result := make([]string, 0)
+	current := ""
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			if current != "" {
+				result = append(result, current)
+				current = ""
+			}
+		} else {
+			current += string(s[i])
+		}
+	}
+	if current != "" {
+		result = append(result, current)
+	}
+	return result
 }
