@@ -70,17 +70,6 @@ func (c *TestMockCache) GetContent(hash string, offset int64, length int64, opts
 	return result, nil
 }
 
-func (c *TestMockCache) GetContentStream(hash string, offset int64, length int64, opts struct{ RoutingKey string }) (chan []byte, error) {
-	data, err := c.GetContent(hash, offset, length, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	ch := make(chan []byte, 1)
-	ch <- data
-	close(ch)
-	return ch, nil
-}
 
 func (c *TestMockCache) StoreContent(chunks chan []byte, hash string, opts struct{ RoutingKey string }) (string, error) {
 	var buffer []byte

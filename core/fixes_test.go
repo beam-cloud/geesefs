@@ -155,15 +155,6 @@ func (c *testCache) GetContent(hash string, offset int64, length int64, opts str
 	return nil, nil
 }
 
-func (c *testCache) GetContentStream(hash string, offset int64, length int64, opts struct{ RoutingKey string }) (chan []byte, error) {
-	data, _ := c.GetContent(hash, offset, length, opts)
-	ch := make(chan []byte, 1)
-	if data != nil {
-		ch <- data
-	}
-	close(ch)
-	return ch, nil
-}
 
 func (c *testCache) StoreContent(chunks chan []byte, hash string, opts struct{ RoutingKey string }) (string, error) {
 	var buffer []byte
