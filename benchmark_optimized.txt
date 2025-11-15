@@ -1,0 +1,16 @@
+goos: linux
+goarch: amd64
+pkg: github.com/yandex-cloud/geesefs/core
+cpu: Intel(R) Xeon(R) Processor
+BenchmarkCacheReadThroughput/Size_4KB-4   	 2689734	      1326 ns/op	3090.12 MB/s	       100.0 %cache_hit	    4096 B/op	       1 allocs/op
+BenchmarkCacheReadThroughput/Size_64KB-4  	  276752	     14456 ns/op	4533.39 MB/s	       100.0 %cache_hit	   65536 B/op	       1 allocs/op
+BenchmarkCacheReadThroughput/Size_1024KB-4         	    8240	    450279 ns/op	2328.72 MB/s	       100.0 %cache_hit	 1048577 B/op	       1 allocs/op
+BenchmarkCacheReadThroughput/Size_5120KB-4         	    2740	   1407948 ns/op	3723.77 MB/s	       100.0 %cache_hit	 5242884 B/op	       1 allocs/op
+BenchmarkCacheConcurrentReads/Concurrency_1-4      	   15951	    221785 ns/op	4727.89 MB/s	       100.0 %cache_hit	 1048578 B/op	       1 allocs/op
+BenchmarkCacheConcurrentReads/Concurrency_4-4      	   16086	    220933 ns/op	4746.13 MB/s	       100.0 %cache_hit	 1048577 B/op	       1 allocs/op
+BenchmarkCacheConcurrentReads/Concurrency_8-4      	   16656	    223657 ns/op	4688.33 MB/s	       100.0 %cache_hit	 1048577 B/op	       1 allocs/op
+BenchmarkCacheConcurrentReads/Concurrency_16-4     	   16322	    220596 ns/op	4753.38 MB/s	       100.0 %cache_hit	 1048577 B/op	       1 allocs/op
+BenchmarkCacheStreamingVsNonStreaming/NonStreaming-4         	    2347	   1448825 ns/op	3618.71 MB/s	 5242880 B/op	       1 allocs/op
+BenchmarkCacheStreamingVsNonStreaming/Streaming-4            	    2271	   1438322 ns/op	3645.14 MB/s	 5243002 B/op	       3 allocs/op
+PASS
+ok  	github.com/yandex-cloud/geesefs/core	50.202s

@@ -1,0 +1,20 @@
+goos: linux
+goarch: amd64
+pkg: github.com/yandex-cloud/geesefs/core
+cpu: Intel(R) Xeon(R) Processor
+BenchmarkLoadFromExternalCache/Size_64KB_Streaming_false-4         	  259884	     14909 ns/op	4395.78 MB/s	       100.0 %cache_hit	   65808 B/op	       9 allocs/op
+BenchmarkLoadFromExternalCache/Size_64KB_Streaming_true-4          	  112317	     29630 ns/op	2211.79 MB/s	       100.0 %cache_hit	  131464 B/op	      12 allocs/op
+BenchmarkLoadFromExternalCache/Size_1024KB_Streaming_false-4       	    9462	    365108 ns/op	2871.96 MB/s	       100.0 %cache_hit	 1048849 B/op	       9 allocs/op
+BenchmarkLoadFromExternalCache/Size_1024KB_Streaming_true-4        	    4316	    812414 ns/op	1290.69 MB/s	       100.0 %cache_hit	 2097548 B/op	      12 allocs/op
+BenchmarkLoadFromExternalCache/Size_5120KB_Streaming_false-4       	    2229	   1492900 ns/op	3511.88 MB/s	       100.0 %cache_hit	 5243155 B/op	       9 allocs/op
+BenchmarkLoadFromExternalCache/Size_5120KB_Streaming_true-4        	    1017	   3640330 ns/op	1440.22 MB/s	       100.0 %cache_hit	10486156 B/op	      12 allocs/op
+BenchmarkLoadFromExternalCacheConcurrent/Concurrency_1_Streaming_false-4         	   20497	    176802 ns/op	5930.81 MB/s	       100.0 %cache_hit	 1048850 B/op	       9 allocs/op
+BenchmarkLoadFromExternalCacheConcurrent/Concurrency_4_Streaming_false-4         	   20312	    185692 ns/op	5646.85 MB/s	       100.0 %cache_hit	 1048850 B/op	       8 allocs/op
+BenchmarkLoadFromExternalCacheConcurrent/Concurrency_8_Streaming_false-4         	   19993	    184974 ns/op	5668.79 MB/s	       100.0 %cache_hit	 1048850 B/op	       8 allocs/op
+BenchmarkLoadFromExternalCacheConcurrent/Concurrency_16_Streaming_false-4        	   19683	    172716 ns/op	6071.09 MB/s	       100.0 %cache_hit	 1048850 B/op	       8 allocs/op
+BenchmarkLoadFromExternalCacheConcurrent/Concurrency_1_Streaming_true-4          	    8818	    373420 ns/op	2808.03 MB/s	       100.0 %cache_hit	 2097548 B/op	      12 allocs/op
+BenchmarkLoadFromExternalCacheConcurrent/Concurrency_4_Streaming_true-4          	    9086	    372787 ns/op	2812.80 MB/s	       100.0 %cache_hit	 2097548 B/op	      12 allocs/op
+BenchmarkLoadFromExternalCacheConcurrent/Concurrency_8_Streaming_true-4          	    8851	    368070 ns/op	2848.85 MB/s	       100.0 %cache_hit	 2097548 B/op	      12 allocs/op
+BenchmarkLoadFromExternalCacheConcurrent/Concurrency_16_Streaming_true-4         	   10000	    376635 ns/op	2784.06 MB/s	       100.0 %cache_hit	 2097548 B/op	      12 allocs/op
+PASS
+ok  	github.com/yandex-cloud/geesefs/core	58.029s

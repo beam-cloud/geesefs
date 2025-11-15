@@ -412,15 +412,23 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 		contentChan, err := inode.fs.flags.ExternalCacheClient.GetContentStream(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 		if err != nil || contentChan == nil {
 			log.Debugf("External cache streaming miss for hash %s: %v", hash, err)
-			// Don't trigger caching here - let the caller handle it to avoid duplicate requests
 			return 0, 0, errContentNotFound
 		}
 
-		buf = make([]byte, 0, size)
-
+		// Pre-allocate full buffer to avoid append reallocations
+		buf = make([]byte, size)
+		writeOffset := 0
+		
 		for chunk := range contentChan {
-			buf = append(buf, chunk...)
+			n := copy(buf[writeOffset:], chunk)
+			writeOffset += n
+			if writeOffset >= int(size) {
+				break
+			}
 		}
+		
+		// Trim to actual size received
+		buf = buf[:writeOffset]
 
 		if len(buf) == 0 {
 			log.Debugf("External cache returned empty content for hash %s", hash)
@@ -430,17 +438,15 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 		buf, err = inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 		if err != nil || buf == nil {
 			log.Debugf("External cache miss for hash %s: %v", hash, err)
-			// Don't trigger caching here - let the caller handle it to avoid duplicate requests
 			return 0, 0, errContentNotFound
 		}
 	}
 
 	totalDone = uint64(len(buf))
 
-	// Cache the result in memory
+	// Add to buffer and notify - keep lock minimal
 	inode.mu.Lock()
-	allocated += inode.buffers.Add(offset, buf, BUF_CLEAN, false)
-	// Notify waiting readers
+	allocated = inode.buffers.Add(offset, buf, BUF_CLEAN, false)
 	if inode.readCond != nil {
 		inode.readCond.Broadcast()
 	}
