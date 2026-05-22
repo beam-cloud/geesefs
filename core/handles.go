@@ -93,6 +93,7 @@ type StagedFile struct {
 	shouldFlush bool
 	flushing    bool
 	debounce    time.Duration
+	cachePath   string
 }
 
 func (stagedFile *StagedFile) ReadyToFlush() bool {
@@ -123,31 +124,60 @@ func (stagedFile *StagedFile) ReadyToFlush() bool {
 }
 
 func (stagedFile *StagedFile) Cleanup() {
-	log.Debugf("Cleaning up staged file: %s", stagedFile.FH.inode.FullName())
-
 	stagedFile.mu.Lock()
+	if stagedFile.FD == nil {
+		stagedFile.flushing = false
+		stagedFile.shouldFlush = false
+		stagedFile.mu.Unlock()
+		return
+	}
+
 	fh := stagedFile.FH
 	fullPath := stagedFile.FD.Name()
+	removePath := stagedFile.cachePath == ""
+	log.Debugf("Cleaning up staged file: %s", fh.inode.FullName())
 	stagedFile.FD.Close()
 	stagedFile.FD = nil
 	stagedFile.flushing = false
 	stagedFile.shouldFlush = false
 	stagedFile.mu.Unlock()
 
-	err := os.RemoveAll(fullPath)
-	if err != nil {
-		log.Warnf("Failed to remove staged file: %v", err)
-	}
-
-	if fh.inode.fs.flags.EventCallback != nil {
-		fh.inode.fs.flags.EventCallback(cfg.EventStagedFileUploaded, map[string]interface{}{
-			"inode": fh.inode.FullName(),
-			"hash":  fh.inode.userMetadata["hash"],
-			"size":  fh.inode.Attributes.Size,
-		})
+	if removePath {
+		err := os.RemoveAll(fullPath)
+		if err != nil {
+			log.Warnf("Failed to remove staged file: %v", err)
+		}
 	}
 
 	log.Debugf("Removed staged file: %s", fh.inode.FullName())
+}
+
+func (stagedFile *StagedFile) Path() (string, bool) {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
+	if stagedFile.FD == nil {
+		return "", false
+	}
+
+	return stagedFile.FD.Name(), true
+}
+
+func (stagedFile *StagedFile) PreserveForCache(path string) {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
+	stagedFile.cachePath = path
+}
+
+func (stagedFile *StagedFile) ResetFlushForRetry() {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
+	if stagedFile.FD != nil {
+		stagedFile.flushing = false
+		stagedFile.shouldFlush = true
+	}
 }
 
 type Inode struct {

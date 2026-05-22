@@ -557,7 +557,10 @@ func (fs *GoofysFuse) ReleaseFileHandle(
 	if fh.inode.fs.flags.FsyncOnClose {
 		// FIXME: This is a hack to ensure that we flush the staged file for outputs immediately
 		if fh.inode.StagedFile != nil && strings.HasPrefix(fh.inode.FullName(), "outputs/") {
-			fh.inode.fs.flushStagedFile(fh.inode)
+			err = fh.inode.fs.flushStagedFile(fh.inode)
+			if err != nil {
+				return err
+			}
 		} else {
 			err = fh.inode.SyncFile()
 			if err != nil {

@@ -50,7 +50,11 @@ import (
 // close-to-open.
 
 type cacheEvent struct {
-	inode *Inode
+	path             string
+	size             uint64
+	hash             string
+	localSourcePath  string
+	removeLocalAfter bool
 }
 
 type Goofys struct {
@@ -411,89 +415,173 @@ func (fs *Goofys) processCacheEvents() {
 		case <-fs.shutdownCh:
 			return
 		case cacheEvent := <-fs.cacheEventChan:
-			log.Debugf("Processing cache event for inode: %v", cacheEvent.inode.FullName())
+			log.Debugf("Processing cache event for inode: %v", cacheEvent.path)
 
-			inode := cacheEvent.inode
-			flags := inode.fs.flags
-
-			knownHash, ok := inode.userMetadata[flags.HashAttr]
-			if !ok {
-				log.Errorf("No hash found for inode, not caching inode in external cache: %v", inode.FullName())
+			if cacheEvent.hash == "" {
+				log.Errorf("No hash found for inode, not caching inode in external cache: %v", cacheEvent.path)
 				continue
 			}
 
-			s3, ok := flags.Backend.(*cfg.S3Config)
-			if !ok {
-				log.Errorf("Backend is not S3, not caching inode in external cache: %v", inode.FullName())
-				continue
-			}
-
-			if inode.Attributes.Size > 0 {
-				hash, err := fs.flags.ExternalCacheClient.StoreContentFromS3(struct {
-					Path        string
-					BucketName  string
-					Region      string
-					EndpointURL string
-					AccessKey   string
-					SecretKey   string
-				}{
-					Path:        inode.FullName(),
-					BucketName:  fs.bucket,
-					Region:      s3.Region,
-					EndpointURL: flags.Endpoint,
-					AccessKey:   s3.AccessKey,
-					SecretKey:   s3.SecretKey,
-				}, struct {
-					RoutingKey string
-					Lock       bool
-				}{RoutingKey: string(knownHash), Lock: true})
+			if cacheEvent.size > 0 {
+				var (
+					hash string
+					err  error
+				)
+				if cacheEvent.localSourcePath != "" {
+					hash, err = fs.storeContentFromLocalFile(cacheEvent)
+				} else {
+					s3, ok := fs.flags.Backend.(*cfg.S3Config)
+					if !ok {
+						log.Errorf("Backend is not S3, not caching inode in external cache: %v", cacheEvent.path)
+						fs.clearCachingStatus(cacheEvent.hash)
+						continue
+					}
+					hash, err = fs.flags.ExternalCacheClient.StoreContentFromS3(struct {
+						Path        string
+						BucketName  string
+						Region      string
+						EndpointURL string
+						AccessKey   string
+						SecretKey   string
+					}{
+						Path:        cacheEvent.path,
+						BucketName:  fs.bucket,
+						Region:      s3.Region,
+						EndpointURL: fs.flags.Endpoint,
+						AccessKey:   s3.AccessKey,
+						SecretKey:   s3.SecretKey,
+					}, struct {
+						RoutingKey string
+						Lock       bool
+					}{RoutingKey: cacheEvent.hash, Lock: true})
+				}
 				if err != nil {
 					log.Debugf("Failed to store content from source: %v", err)
-				} else if hash != string(knownHash) {
-					log.Debugf("Hash mismatch for inode: %v", inode.FullName())
-					continue
-				} else if hash == string(knownHash) {
-					log.Debugf("Successfully cached inode: %v", inode.FullName())
+				} else if hash != cacheEvent.hash {
+					log.Debugf("Hash mismatch for inode: %v", cacheEvent.path)
+					fs.clearCachingStatus(cacheEvent.hash)
+				} else if hash == cacheEvent.hash {
+					log.Debugf("Successfully cached inode: %v", cacheEvent.path)
 				}
 
-				fs.clearCachingStatus(inode.FullName())
+				fs.clearCachingStatus(cacheEvent.hash)
+			} else {
+				fs.clearCachingStatus(cacheEvent.hash)
+			}
+
+			if cacheEvent.removeLocalAfter {
+				err := os.RemoveAll(cacheEvent.localSourcePath)
+				if err != nil {
+					log.Warnf("Failed to remove staged cache source %v: %v", cacheEvent.localSourcePath, err)
+				}
 			}
 		}
 	}
 }
 
 func (fs *Goofys) CacheFileInExternalCache(inode *Inode) {
+	fs.CacheFileInExternalCacheFromSource(inode, "", false)
+}
+
+func (fs *Goofys) CacheFileInExternalCacheFromSource(inode *Inode, localSourcePath string, removeLocalAfter bool) bool {
+	if inode.userMetadata == nil {
+		log.Errorf("No metadata found for inode, not caching inode in external cache: %v", inode.FullName())
+		return false
+	}
 	hash, ok := inode.userMetadata[fs.flags.HashAttr]
 	if !ok {
 		log.Errorf("No hash found for inode, not caching inode in external cache: %v", inode.FullName())
-		return
+		return false
 	}
+
+	hashString := string(hash)
 
 	// Check and update caching status
 	fs.cachingStatusMu.Lock()
-	if fs.cachingStatus[string(hash)] {
+	if fs.cachingStatus[hashString] {
 		fs.cachingStatusMu.Unlock()
-		return // File is already being cached or has been cached
+		return false // File is already being cached or has been cached
 	}
-	fs.cachingStatus[string(hash)] = true
+	fs.cachingStatus[hashString] = true
 	fs.cachingStatusMu.Unlock()
 
 	if fs.flags.EventCallback != nil {
 		fs.flags.EventCallback(cfg.EventCacheTriggered, map[string]interface{}{
 			"inode": inode.FullName(),
-			"hash":  string(hash),
+			"hash":  hashString,
 		})
+	}
+
+	event := cacheEvent{
+		path:             inode.FullName(),
+		size:             inode.Attributes.Size,
+		hash:             hashString,
+		localSourcePath:  localSourcePath,
+		removeLocalAfter: removeLocalAfter,
 	}
 
 	// Submit cache event
 	log.Debugf("Submitting cache event for file: %v", inode.FullName())
-	fs.cacheEventChan <- cacheEvent{inode: inode}
+	select {
+	case fs.cacheEventChan <- event:
+		return true
+	default:
+		log.Warnf("External cache event queue is full, skipping cache for %v", inode.FullName())
+		fs.clearCachingStatus(hashString)
+		return false
+	}
 }
 
-func (fs *Goofys) clearCachingStatus(path string) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	delete(fs.cachingStatus, path)
+func (fs *Goofys) storeContentFromLocalFile(event cacheEvent) (string, error) {
+	file, err := os.Open(event.localSourcePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	chunks := make(chan []byte, 2)
+	done := make(chan struct{})
+	readErr := make(chan error, 1)
+	go func() {
+		defer close(chunks)
+		defer close(readErr)
+
+		buf := make([]byte, 4*1024*1024)
+		for {
+			n, err := file.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				select {
+				case chunks <- chunk:
+				case <-done:
+					readErr <- nil
+					return
+				}
+			}
+			if err == io.EOF {
+				readErr <- nil
+				return
+			}
+			if err != nil {
+				readErr <- err
+				return
+			}
+		}
+	}()
+
+	hash, err := fs.flags.ExternalCacheClient.StoreContent(chunks, event.hash, struct{ RoutingKey string }{RoutingKey: event.hash})
+	close(done)
+	if readErrValue := <-readErr; err == nil && readErrValue != nil {
+		err = readErrValue
+	}
+	return hash, err
+}
+
+func (fs *Goofys) clearCachingStatus(hash string) {
+	fs.cachingStatusMu.Lock()
+	defer fs.cachingStatusMu.Unlock()
+	delete(fs.cachingStatus, hash)
 }
 
 func (fs *Goofys) Shutdown() {
@@ -878,42 +966,47 @@ func (fs *Goofys) StagedFileFlusher() {
 	}
 }
 
-func (fs *Goofys) flushStagedFile(inode *Inode) {
+func (fs *Goofys) flushStagedFile(inode *Inode) (err error) {
 	inode.mu.Lock()
 
 	stagedFile := inode.StagedFile
 	if stagedFile == nil {
 		inode.fs.stagedFiles.Delete(inode.Id)
 		inode.mu.Unlock()
-		return
+		return nil
 	}
 
 	stagedFile.mu.Lock()
 	if stagedFile.flushing {
 		stagedFile.mu.Unlock()
 		inode.mu.Unlock()
-		return
+		return nil
 	}
 
-	var shouldCleanup = true
-	defer func(stagedFile *StagedFile) {
-		if shouldCleanup {
-			inode.mu.Lock()
-			inode.StagedFile = nil
-			inode.fs.stagedFiles.Delete(inode.Id)
+	if inode.flushError != nil {
+		if time.Since(inode.flushErrorTime) < inode.fs.flags.RetryInterval {
+			err = inode.flushError
+			stagedFile.mu.Unlock()
 			inode.mu.Unlock()
-
-			stagedFile.Cleanup()
+			return err
 		}
-	}(stagedFile)
+		inode.flushError = nil
+	}
 
-	totalSize := int64(stagedFile.FH.inode.Attributes.Size)
+	totalSize := int64(inode.Attributes.Size)
 
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
 	stagedFile.mu.Unlock()
 
 	inode.mu.Unlock()
+
+	defer func() {
+		if err != nil {
+			stagedFile.ResetFlushForRetry()
+			fs.WakeupFlusher()
+		}
+	}()
 
 	fs.WakeupFlusher()
 	offset := int64(0)
@@ -930,26 +1023,38 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		inode.mu.Unlock()
 
 		var n int
-		var err error
+		var readErr error
 		{
 			stagedFile.mu.Lock()
-			buf := make([]byte, chunkSize)
-			n, err = stagedFile.FD.ReadAt(buf, offset)
-			stagedFile.mu.Unlock()
-
-			if err != nil && err != io.EOF {
-				log.Errorf("Error reading from staged file: %v", err)
+			if stagedFile.FD == nil {
+				stagedFile.mu.Unlock()
 				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
 				inode.mu.Unlock()
-				break
+				err = syscall.EAGAIN
+				return err
+			}
+			buf := make([]byte, chunkSize)
+			n, readErr = stagedFile.FD.ReadAt(buf, offset)
+			stagedFile.mu.Unlock()
+
+			if readErr != nil && readErr != io.EOF {
+				log.Errorf("Error reading from staged file: %v", readErr)
+				inode.mu.Lock()
+				inode.UnlockRange(uint64(offset), chunkSize, true)
+				inode.mu.Unlock()
+				err = readErr
+				return err
 			}
 
 			if n == 0 {
 				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
 				inode.mu.Unlock()
-				break
+				if offset < totalSize {
+					err = io.ErrUnexpectedEOF
+				}
+				return err
 			}
 
 			// Check if readers want to interrupt this flush
@@ -965,9 +1070,8 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 				stagedFile.flushing = false
 				stagedFile.mu.Unlock()
 
-				shouldCleanup = false // Don't clean up, let it be retried
 				inode.mu.Unlock()
-				return // Exit and let readers proceed, staged file will be retried later
+				return nil // Exit and let readers proceed, staged file will be retried later
 			}
 			inode.mu.Unlock()
 
@@ -978,7 +1082,7 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 				inode.mu.Lock()
 				inode.UnlockRange(uint64(offset), chunkSize, true)
 				inode.mu.Unlock()
-				break
+				return err
 			}
 		}
 
@@ -988,16 +1092,52 @@ func (fs *Goofys) flushStagedFile(inode *Inode) {
 		inode.mu.Unlock()
 
 		offset += int64(n)
-		if err == io.EOF {
+		if readErr == io.EOF {
 			break
 		}
 	}
 
-	err := inode.SyncFile()
+	err = inode.SyncFile()
 	if err != nil {
 		log.Errorf("Error syncing staged file: %v", err)
-		return
+		return err
 	}
+
+	localPath, hasLocalPath := stagedFile.Path()
+	preserveForCache := false
+	if fs.flags.CacheThroughModeEnabled && fs.flags.ExternalCacheClient != nil && hasLocalPath {
+		preserveForCache = fs.CacheFileInExternalCacheFromSource(inode, localPath, true)
+		if preserveForCache {
+			stagedFile.PreserveForCache(localPath)
+		}
+	}
+
+	var (
+		hash []byte
+		size uint64
+	)
+	inode.mu.Lock()
+	if inode.userMetadata != nil {
+		hash = inode.userMetadata[fs.flags.HashAttr]
+	}
+	size = inode.Attributes.Size
+	if inode.StagedFile == stagedFile {
+		inode.StagedFile = nil
+	}
+	inode.fs.stagedFiles.Delete(inode.Id)
+	inode.mu.Unlock()
+
+	stagedFile.Cleanup()
+
+	if fs.flags.EventCallback != nil {
+		fs.flags.EventCallback(cfg.EventStagedFileUploaded, map[string]interface{}{
+			"inode": stagedFile.FH.inode.FullName(),
+			"hash":  hash,
+			"size":  size,
+		})
+	}
+
+	return nil
 }
 
 func (fs *Goofys) WaitForFlush() {
@@ -1383,6 +1523,16 @@ func mapAwsError(err error) error {
 	} else {
 		return err
 	}
+}
+
+func isNoSuchUploadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if awsErr, ok := err.(awserr.Error); ok {
+		return awsErr.Code() == "NoSuchUpload"
+	}
+	return false
 }
 
 // note that this is NOT the same as url.PathEscape in golang 1.8,
