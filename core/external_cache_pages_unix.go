@@ -118,7 +118,7 @@ func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]
 }
 
 func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]byte, bytesRead int, callback func(), ok bool, err error) {
-	pageCache, ok := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheLocalPageRegions)
+	pageCache, ok := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
 	if !ok || pageCache == nil {
 		return nil, 0, nil, false, nil
 	}
@@ -166,10 +166,6 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 		return data, int(size), callback, true, nil
 	}
 
-	if data, bytesRead, callback, ok, err := fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started); ok || err != nil {
-		return data, bytesRead, callback, ok, err
-	}
-
 	windowSize := size
 	if sequential && windowSize < externalPageMmapWindowBytes {
 		windowSize = externalPageMmapWindowBytes
@@ -178,38 +174,42 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 		windowSize = fileSize - offset
 	}
 
-	regions, err := pageCache.LocalPageRegions(hash, int64(offset), int64(windowSize), struct{ RoutingKey string }{RoutingKey: hash})
+	views, err := pageCache.ClientLocalPageFileViews(hash, int64(offset), int64(windowSize), struct{ RoutingKey string }{RoutingKey: hash})
 	lookupElapsed := time.Since(started)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageLookupCount, 1)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageLookupNanos, lookupElapsed.Nanoseconds())
-	if err != nil || len(regions) == 0 {
-		fh.recordExternalPageMiss(path, hash, offset, size, "no_local_region", started, err)
-		return nil, 0, nil, false, nil
+	if err != nil || len(views) == 0 {
+		fh.recordExternalPageMiss(path, hash, offset, size, "no_client_local_page_file", started, err)
+		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
 	}
 
 	mmapStarted := time.Now()
-	err = mmapCache.insertWindow(hash, offset, regions)
+	err = mmapCache.insertWindow(hash, offset, views)
 	mmapElapsed := time.Since(mmapStarted)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageMmapCount, 1)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageMmapNanos, mmapElapsed.Nanoseconds())
 	if err != nil {
 		atomic.AddInt64(&fh.inode.fs.stats.externalPageMmapFailures, 1)
 		log.Warnf(
-			"geesefs external page mmap failed: path=%q hash=%q offset=%d size=%d regions=%d lookup_elapsed=%s mmap_elapsed=%s err=%v",
+			"geesefs external page mmap failed: path=%q hash=%q offset=%d size=%d views=%d lookup_elapsed=%s mmap_elapsed=%s err=%v",
 			path,
 			hash,
 			offset,
 			size,
-			len(regions),
+			len(views),
 			lookupElapsed.Truncate(time.Millisecond),
 			mmapElapsed.Truncate(time.Millisecond),
 			err,
 		)
-		return nil, 0, nil, false, nil
+		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
 	}
 	data, callback, ok = mmapCache.lookup(hash, offset, size)
 	if !ok {
 		atomic.AddInt64(&fh.inode.fs.stats.externalPageMmapFailures, 1)
+		data, bytesRead, callback, fallbackOK, fallbackErr := fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+		if fallbackOK || fallbackErr != nil {
+			return data, bytesRead, callback, fallbackOK, fallbackErr
+		}
 		return nil, 0, nil, false, syscall.EIO
 	}
 
@@ -219,12 +219,12 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	if sequential {
 		mmapCache.prefetchAhead(hash, nextExternalPageWindowStart(offset), fileSize, pageCache)
 	}
-	fh.logExternalPageHit(path, hash, offset, size, len(regions), "local_page_region", started, mmapStarted, hitCount)
+	fh.logExternalPageHit(path, hash, offset, size, len(views), "client_local_page_file", started, mmapStarted, hitCount)
 	return data, int(size), callback, true, nil
 }
 
 func (fh *FileHandle) prefetchExternalCachePagesOnOpen() {
-	pageCache, ok := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheLocalPageRegions)
+	pageCache, ok := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
 	if !ok || pageCache == nil {
 		return
 	}
@@ -280,8 +280,8 @@ func (fh *FileHandle) tryReadExternalCacheInto(path, hash string, offset, size, 
 
 	if sequential {
 		mmapCache := fh.inode.fs.externalPageCache()
-		mmapCache.prefetchWindow(hash, offset, externalPageMmapWindowBytes, fileSize, fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheLocalPageRegions))
-		mmapCache.prefetchAhead(hash, nextExternalPageWindowStart(offset), fileSize, fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheLocalPageRegions))
+		mmapCache.prefetchWindow(hash, offset, externalPageMmapWindowBytes, fileSize, fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews))
+		mmapCache.prefetchAhead(hash, nextExternalPageWindowStart(offset), fileSize, fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews))
 	}
 
 	released := int32(0)
@@ -294,7 +294,7 @@ func (fh *FileHandle) tryReadExternalCacheInto(path, hash string, offset, size, 
 	return [][]byte{buf[:n]}, int(n), callback, true, nil
 }
 
-func (fh *FileHandle) logExternalPageHit(path, hash string, offset, size uint64, regions int, source string, started, mmapStarted time.Time, globalHitCount int64) {
+func (fh *FileHandle) logExternalPageHit(path, hash string, offset, size uint64, views int, source string, started, mmapStarted time.Time, globalHitCount int64) {
 	handleHitCount := atomic.AddUint64(&fh.externalPageHitLogCount, 1)
 	if handleHitCount > 8 && globalHitCount > 16 && globalHitCount%1024 != 0 && time.Since(started) <= 100*time.Millisecond {
 		return
@@ -304,13 +304,13 @@ func (fh *FileHandle) logExternalPageHit(path, hash string, offset, size uint64,
 		mmapElapsed = time.Since(mmapStarted)
 	}
 	log.Debugf(
-		"geesefs external page hit: source=%s path=%q hash=%q offset=%d size=%d regions=%d lookup_elapsed=%s mmap_elapsed=%s total_elapsed=%s hit_count=%d handle_hit_count=%d",
+		"geesefs external page hit: source=%s path=%q hash=%q offset=%d size=%d views=%d lookup_elapsed=%s mmap_elapsed=%s total_elapsed=%s hit_count=%d handle_hit_count=%d",
 		source,
 		path,
 		hash,
 		offset,
 		size,
-		regions,
+		views,
 		time.Since(started).Truncate(time.Millisecond),
 		mmapElapsed.Truncate(time.Millisecond),
 		time.Since(started).Truncate(time.Millisecond),
@@ -415,7 +415,7 @@ func (c *externalPageMmapCache) lookup(cacheKey string, offset, size uint64) (da
 	return data, callback, true
 }
 
-func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fileSize uint64, pageCache cfg.ContentCacheLocalPageRegions) {
+func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews) {
 	if cacheKey == "" || pageCache == nil || size == 0 || offset >= fileSize {
 		return
 	}
@@ -444,11 +444,11 @@ func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fi
 			c.mu.Unlock()
 		}()
 
-		regions, err := pageCache.LocalPageRegions(cacheKey, int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: cacheKey})
-		if err != nil || len(regions) == 0 {
+		views, err := pageCache.ClientLocalPageFileViews(cacheKey, int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: cacheKey})
+		if err != nil || len(views) == 0 {
 			return
 		}
-		if err := c.insertWindow(cacheKey, offset, regions); err != nil {
+		if err := c.insertWindow(cacheKey, offset, views); err != nil {
 			return
 		}
 		if data, cleanup, ok := c.lookup(cacheKey, offset, size); ok {
@@ -462,7 +462,7 @@ func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fi
 	}()
 }
 
-func (c *externalPageMmapCache) prefetchAhead(cacheKey string, offset, fileSize uint64, pageCache cfg.ContentCacheLocalPageRegions) {
+func (c *externalPageMmapCache) prefetchAhead(cacheKey string, offset, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews) {
 	for i := 0; i < externalPagePrefetchWindows; i++ {
 		windowOffset := offset + uint64(i)*externalPageMmapWindowBytes
 		c.prefetchWindow(cacheKey, windowOffset, externalPageMmapWindowBytes, fileSize, pageCache)
@@ -493,30 +493,26 @@ func (c *externalPageMmapCache) hasRangeLocked(cacheKey string, start, end uint6
 	return true
 }
 
-func (c *externalPageMmapCache) insertWindow(cacheKey string, offset uint64, regions []struct {
-	Path   string
-	Offset int64
-	Length int
-}) error {
-	if len(regions) == 0 {
+func (c *externalPageMmapCache) insertWindow(cacheKey string, offset uint64, views []cfg.ClientLocalPageFileView) error {
+	if len(views) == 0 {
 		return syscall.ENOENT
 	}
 	if cacheKey == "" {
 		return syscall.EINVAL
 	}
 
-	mapped := make([]externalPageMappedRegion, 0, len(regions))
+	mapped := make([]externalPageMappedRegion, 0, len(views))
 	current := offset
-	for _, region := range regions {
-		warmContentCacheRegion(region.Path, region.Offset, region.Length)
-		entry, err := c.getOrMap(region.Path)
+	for _, view := range views {
+		warmContentCacheRegion(view.Path, view.Offset, view.Length)
+		entry, err := c.getOrMap(view.Path)
 		if err != nil {
 			for _, r := range mapped {
 				c.release([]*externalPageMmapEntry{r.entry})
 			}
 			return err
 		}
-		if region.Offset < 0 || region.Length <= 0 || int(region.Offset)+region.Length > len(entry.data) {
+		if view.Offset < 0 || view.Length <= 0 || int(view.Offset)+view.Length > len(entry.data) {
 			c.release([]*externalPageMmapEntry{entry})
 			for _, r := range mapped {
 				c.release([]*externalPageMmapEntry{r.entry})
@@ -526,11 +522,11 @@ func (c *externalPageMmapCache) insertWindow(cacheKey string, offset uint64, reg
 		mapped = append(mapped, externalPageMappedRegion{
 			cacheKey:  cacheKey,
 			fileStart: current,
-			fileEnd:   current + uint64(region.Length),
-			mapOffset: int(region.Offset),
+			fileEnd:   current + uint64(view.Length),
+			mapOffset: int(view.Offset),
 			entry:     entry,
 		})
-		current += uint64(region.Length)
+		current += uint64(view.Length)
 	}
 
 	c.mu.Lock()
@@ -730,7 +726,7 @@ func (c *externalPageMmapCache) close() {
 
 func (fh *FileHandle) recordExternalPageMiss(path, hash string, offset, size uint64, reason string, started time.Time, err error) {
 	missCount := atomic.AddInt64(&fh.inode.fs.stats.externalPageMisses, 1)
-	if missCount <= 16 || missCount%1024 == 0 || time.Since(started) > 100*time.Millisecond || (err != nil && reason != "no_local_region") {
+	if missCount <= 16 || missCount%1024 == 0 || time.Since(started) > 100*time.Millisecond || (err != nil && reason != "no_client_local_page_file") {
 		log.Debugf(
 			"geesefs external page miss: path=%q hash=%q offset=%d size=%d reason=%s elapsed=%s miss_count=%d err=%v",
 			path,
@@ -745,17 +741,13 @@ func (fh *FileHandle) recordExternalPageMiss(path, hash string, offset, size uin
 	}
 }
 
-func mmapContentCacheRegions(regions []struct {
-	Path   string
-	Offset int64
-	Length int
-}, wantLength int) (data [][]byte, cleanup func(), err error) {
+func mmapContentCacheViews(views []cfg.ClientLocalPageFileView, wantLength int) (data [][]byte, cleanup func(), err error) {
 	if wantLength < 0 {
 		return nil, nil, syscall.EINVAL
 	}
 
 	pageSize := int64(os.Getpagesize())
-	maps := make([][]byte, 0, len(regions))
+	maps := make([][]byte, 0, len(views))
 	total := 0
 	cleanup = func() {
 		for _, mapped := range maps {
@@ -763,17 +755,17 @@ func mmapContentCacheRegions(regions []struct {
 		}
 	}
 
-	for _, region := range regions {
-		if region.Path == "" || region.Offset < 0 || region.Length <= 0 {
+	for _, view := range views {
+		if view.Path == "" || view.Offset < 0 || view.Length <= 0 {
 			cleanup()
 			return nil, nil, syscall.EINVAL
 		}
 
-		mapOffset := region.Offset - region.Offset%pageSize
-		mapDelta := int(region.Offset - mapOffset)
-		mapLength := mapDelta + region.Length
+		mapOffset := view.Offset - view.Offset%pageSize
+		mapDelta := int(view.Offset - mapOffset)
+		mapLength := mapDelta + view.Length
 
-		file, openErr := os.Open(region.Path)
+		file, openErr := os.Open(view.Path)
 		if openErr != nil {
 			cleanup()
 			return nil, nil, openErr
@@ -787,7 +779,7 @@ func mmapContentCacheRegions(regions []struct {
 
 		maps = append(maps, mapped)
 		data = append(data, mapped[mapDelta:mapLength])
-		total += region.Length
+		total += view.Length
 	}
 
 	if total != wantLength {

@@ -41,11 +41,7 @@ type fakeContentCache struct {
 		RoutingKey string
 		Lock       bool
 	}) (string, error)
-	localPageRegions func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]struct {
-		Path   string
-		Offset int64
-		Length int
-	}, error)
+	clientLocalPageFileViews func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error)
 }
 
 func (c *fakeContentCache) GetContent(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]byte, error) {
@@ -105,13 +101,9 @@ func (c *fakeContentCache) StoreContentFromLocalPath(source struct {
 	return c.StoreContent(chunks, opts.RoutingKey, struct{ RoutingKey string }{RoutingKey: opts.RoutingKey})
 }
 
-func (c *fakeContentCache) LocalPageRegions(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]struct {
-	Path   string
-	Offset int64
-	Length int
-}, error) {
-	if c.localPageRegions != nil {
-		return c.localPageRegions(hash, offset, length, opts)
+func (c *fakeContentCache) ClientLocalPageFileViews(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+	if c.clientLocalPageFileViews != nil {
+		return c.clientLocalPageFileViews(hash, offset, length, opts)
 	}
 	return nil, errContentNotFound
 }

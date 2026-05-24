@@ -35,10 +35,12 @@ type ContentCacheStoreLocalPath interface {
 	}) (string, error)
 }
 
-type ContentCacheLocalPageRegions interface {
-	LocalPageRegions(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]struct {
-		Path   string
-		Offset int64
-		Length int
-	}, error)
+type ClientLocalPageFileView struct {
+	Path   string
+	Offset int64
+	Length int
+}
+
+type ContentCacheClientLocalPageFileViews interface {
+	ClientLocalPageFileViews(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]ClientLocalPageFileView, error)
 }

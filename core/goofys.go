@@ -848,7 +848,7 @@ func (fs *Goofys) StatPrinter() {
 			continue
 		}
 
-		log.Infof(
+		log.Debugf(
 			"I/O: %.2f read/s, %.2f MiB/s, %.2f %% hits, %.2f write/s; metadata: %.2f read/s, %.2f write/s, %.2f noop/s, %v alive, %.2f evict/s; %.2f flush/s",
 			float64(reads)/d,
 			float64(readBytes)/(1024*1024)/d,
@@ -862,7 +862,7 @@ func (fs *Goofys) StatPrinter() {
 			float64(flushes)/d,
 		)
 		if readSlow+readErrors+readBufferHits+readHandlerCount+readCallbackCount+externalPageAttempts+externalReadIntoAttempts+externalStreamAttempts+externalUnaryAttempts+cacheEventsQueued+cacheEventsStarted+cacheEventsSuccess+cacheEventsErrors+cacheEventsMismatch+cacheEventsDropped+cloudReadRequests > 0 {
-			log.Infof(
+			log.Debugf(
 				"geesefs read path summary: fuse_reads=%d fuse_read=%.2fMiB slow=%d errors=%d timing(handler_count=%d handler_avg=%s callback_count=%d callback=%.2fMiB callback_avg=%s) buffer_hit=%d buffer=%.2fMiB mmap_page(attempt=%d hit=%d miss=%d mmap_fail=%d %.2fMiB lookup_count=%d lookup_avg=%s mmap_count=%d mmap_avg=%s) read_into(attempt=%d hit=%d miss=%d %.2fMiB) stream(attempt=%d hit=%d miss=%d %.2fMiB) unary(attempt=%d hit=%d miss=%d %.2fMiB) cache_event(queued=%d started=%d ok=%d err=%d mismatch=%d dropped=%d %.2fMiB) cloud(req=%d %.2fMiB)",
 				reads,
 				float64(readBytes)/(1024*1024),

@@ -1115,6 +1115,7 @@ func DefaultFlags() *FlagStorage {
 		},
 		ExternalCacheClient:           nil,
 		ExternalCacheStreamingEnabled: false,
+		ExternalCacheDirectIO:         true,
 		StagedWriteModeEnabled:        false,
 		CacheThroughModeEnabled:       false,
 		StagedWritePath:               "",

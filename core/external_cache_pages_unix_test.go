@@ -26,7 +26,7 @@ import (
 	"github.com/yandex-cloud/geesefs/core/cfg"
 )
 
-func TestExternalCacheLocalPageRegionReadUsesMmap(t *testing.T) {
+func TestExternalCacheClientLocalPageFileViewReadUsesMmap(t *testing.T) {
 	pagePath := filepath.Join(t.TempDir(), "page")
 	if err := os.WriteFile(pagePath, []byte("abcdef"), 0644); err != nil {
 		t.Fatal(err)
@@ -34,19 +34,11 @@ func TestExternalCacheLocalPageRegionReadUsesMmap(t *testing.T) {
 
 	flags := cfg.DefaultFlags()
 	flags.ExternalCacheClient = &fakeContentCache{
-		localPageRegions: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]struct {
-			Path   string
-			Offset int64
-			Length int
-		}, error) {
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
 			if hash != "hash" || opts.RoutingKey != "hash" || offset != 0 || length != 3 {
-				t.Fatalf("unexpected local page request: hash=%q routing=%q offset=%d length=%d", hash, opts.RoutingKey, offset, length)
+				t.Fatalf("unexpected client-local page-file request: hash=%q routing=%q offset=%d length=%d", hash, opts.RoutingKey, offset, length)
 			}
-			return []struct {
-				Path   string
-				Offset int64
-				Length int
-			}{{Path: pagePath, Offset: 1, Length: 3}}, nil
+			return []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: 1, Length: 3}}, nil
 		},
 	}
 	fs := newUnitFS(flags)
@@ -71,7 +63,7 @@ func TestExternalCacheLocalPageRegionReadUsesMmap(t *testing.T) {
 	}
 }
 
-func TestExternalCacheLocalPageRegionReadUsesOpenHandleWindow(t *testing.T) {
+func TestExternalCacheClientLocalPageFileViewReadUsesOpenHandleWindow(t *testing.T) {
 	pagePath := filepath.Join(t.TempDir(), "page")
 	if err := os.WriteFile(pagePath, []byte("abcdef"), 0644); err != nil {
 		t.Fatal(err)
@@ -80,20 +72,12 @@ func TestExternalCacheLocalPageRegionReadUsesOpenHandleWindow(t *testing.T) {
 	calls := 0
 	flags := cfg.DefaultFlags()
 	flags.ExternalCacheClient = &fakeContentCache{
-		localPageRegions: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]struct {
-			Path   string
-			Offset int64
-			Length int
-		}, error) {
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
 			calls++
 			if hash != "hash" || opts.RoutingKey != "hash" || offset != 0 || length != 6 {
-				t.Fatalf("unexpected local page request: hash=%q routing=%q offset=%d length=%d", hash, opts.RoutingKey, offset, length)
+				t.Fatalf("unexpected client-local page-file request: hash=%q routing=%q offset=%d length=%d", hash, opts.RoutingKey, offset, length)
 			}
-			return []struct {
-				Path   string
-				Offset int64
-				Length int
-			}{{Path: pagePath, Offset: 0, Length: 6}}, nil
+			return []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: 0, Length: 6}}, nil
 		},
 	}
 	fs := newUnitFS(flags)
@@ -131,11 +115,11 @@ func TestExternalCacheLocalPageRegionReadUsesOpenHandleWindow(t *testing.T) {
 		cleanup()
 	}
 	if calls != 1 {
-		t.Fatalf("expected one local page lookup, got %d", calls)
+		t.Fatalf("expected one client-local page-file lookup, got %d", calls)
 	}
 }
 
-func TestExternalCacheLocalPageRegionWindowSeparatesHashes(t *testing.T) {
+func TestExternalCacheClientLocalPageFileViewWindowSeparatesHashes(t *testing.T) {
 	dir := t.TempDir()
 	pageA := filepath.Join(dir, "page-a")
 	pageB := filepath.Join(dir, "page-b")
@@ -148,20 +132,12 @@ func TestExternalCacheLocalPageRegionWindowSeparatesHashes(t *testing.T) {
 
 	flags := cfg.DefaultFlags()
 	flags.ExternalCacheClient = &fakeContentCache{
-		localPageRegions: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]struct {
-			Path   string
-			Offset int64
-			Length int
-		}, error) {
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
 			path := pageA
 			if hash == "hash-b" {
 				path = pageB
 			}
-			return []struct {
-				Path   string
-				Offset int64
-				Length int
-			}{{Path: path, Offset: 0, Length: int(length)}}, nil
+			return []cfg.ClientLocalPageFileView{{Path: path, Offset: 0, Length: int(length)}}, nil
 		},
 	}
 	fs := newUnitFS(flags)
@@ -214,12 +190,8 @@ func TestExternalPageMmapCacheEvictsUnreferencedEntries(t *testing.T) {
 	cache := newExternalPageMmapCache(4)
 	defer cache.close()
 
-	regionsA := []struct {
-		Path   string
-		Offset int64
-		Length int
-	}{{Path: pageA, Offset: 0, Length: 4}}
-	if err := cache.insertWindow("hash-a", 0, regionsA); err != nil {
+	viewsA := []cfg.ClientLocalPageFileView{{Path: pageA, Offset: 0, Length: 4}}
+	if err := cache.insertWindow("hash-a", 0, viewsA); err != nil {
 		t.Fatal(err)
 	}
 	data, cleanup, ok := cache.lookup("hash-a", 0, 4)
@@ -231,12 +203,8 @@ func TestExternalPageMmapCacheEvictsUnreferencedEntries(t *testing.T) {
 	}
 	cleanup()
 
-	regionsB := []struct {
-		Path   string
-		Offset int64
-		Length int
-	}{{Path: pageB, Offset: 0, Length: 4}}
-	if err := cache.insertWindow("hash-b", 0, regionsB); err != nil {
+	viewsB := []cfg.ClientLocalPageFileView{{Path: pageB, Offset: 0, Length: 4}}
+	if err := cache.insertWindow("hash-b", 0, viewsB); err != nil {
 		t.Fatal(err)
 	}
 

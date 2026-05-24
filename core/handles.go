@@ -426,7 +426,7 @@ func (inode *Inode) cacheHashForLog() string {
 	return string(inode.userMetadata[inode.fs.flags.HashAttr])
 }
 
-func (fs *Goofys) shouldKeepPageCacheForExternalCacheRead(inode *Inode) bool {
+func (fs *Goofys) shouldUseExternalCacheFUSEFastPath(inode *Inode) bool {
 	if fs == nil || fs.flags == nil || fs.flags.ExternalCacheClient == nil || fs.flags.HashAttr == "" || inode == nil {
 		return false
 	}
@@ -440,30 +440,6 @@ func (fs *Goofys) shouldKeepPageCacheForExternalCacheRead(inode *Inode) bool {
 
 	hash := inode.userMetadata[fs.flags.HashAttr]
 	return len(hash) > 0
-}
-
-func (fs *Goofys) shouldUseDirectIOForExternalCacheRead(inode *Inode) bool {
-	if fs == nil || fs.flags == nil || fs.flags.ExternalCacheClient == nil || fs.flags.HashAttr == "" || inode == nil {
-		return false
-	}
-	pageCache, ok := fs.flags.ExternalCacheClient.(cfg.ContentCacheLocalPageRegions)
-	if !ok || pageCache == nil {
-		return false
-	}
-
-	inode.mu.Lock()
-	if inode.StagedFile != nil || inode.buffers.AnyUnclean() || inode.userMetadata == nil || inode.Attributes.Size == 0 {
-		inode.mu.Unlock()
-		return false
-	}
-	hash := string(inode.userMetadata[fs.flags.HashAttr])
-	inode.mu.Unlock()
-	if hash == "" {
-		return false
-	}
-
-	regions, err := pageCache.LocalPageRegions(hash, 0, 1, struct{ RoutingKey string }{RoutingKey: hash})
-	return err == nil && len(regions) > 0
 }
 
 func (inode *Inode) touch() {

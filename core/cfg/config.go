@@ -73,6 +73,7 @@ type FlagStorage struct {
 	// External Caching
 	ExternalCacheClient           ContentCache
 	ExternalCacheStreamingEnabled bool
+	ExternalCacheDirectIO         bool
 	HashAttr                      string
 	HashTimeout                   time.Duration
 	MinFileSizeForHashKB          uint64

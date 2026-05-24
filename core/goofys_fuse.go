@@ -462,8 +462,8 @@ func (fs *GoofysFuse) OpenFile(
 	op.Handle = fs.AddFileHandle(fh)
 
 	op.KeepPageCache = false
-	if op.OpenFlags.IsReadOnly() && fs.shouldKeepPageCacheForExternalCacheRead(in) {
-		if fs.shouldUseDirectIOForExternalCacheRead(in) {
+	if op.OpenFlags.IsReadOnly() && fs.shouldUseExternalCacheFUSEFastPath(in) {
+		if fs.flags.ExternalCacheDirectIO {
 			op.UseDirectIO = true
 		} else {
 			op.KeepPageCache = true
