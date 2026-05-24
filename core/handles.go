@@ -414,6 +414,58 @@ func (inode *Inode) FullName() string {
 	}
 }
 
+func (inode *Inode) cacheHashForLog() string {
+	if inode == nil || inode.fs == nil || inode.fs.flags == nil {
+		return ""
+	}
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
+	if inode.userMetadata == nil {
+		return ""
+	}
+	return string(inode.userMetadata[inode.fs.flags.HashAttr])
+}
+
+func (fs *Goofys) shouldKeepPageCacheForExternalCacheRead(inode *Inode) bool {
+	if fs == nil || fs.flags == nil || fs.flags.ExternalCacheClient == nil || fs.flags.HashAttr == "" || inode == nil {
+		return false
+	}
+
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
+
+	if inode.StagedFile != nil || inode.buffers.AnyUnclean() || inode.userMetadata == nil {
+		return false
+	}
+
+	hash := inode.userMetadata[fs.flags.HashAttr]
+	return len(hash) > 0
+}
+
+func (fs *Goofys) shouldUseDirectIOForExternalCacheRead(inode *Inode) bool {
+	if fs == nil || fs.flags == nil || fs.flags.ExternalCacheClient == nil || fs.flags.HashAttr == "" || inode == nil {
+		return false
+	}
+	pageCache, ok := fs.flags.ExternalCacheClient.(cfg.ContentCacheLocalPageRegions)
+	if !ok || pageCache == nil {
+		return false
+	}
+
+	inode.mu.Lock()
+	if inode.StagedFile != nil || inode.buffers.AnyUnclean() || inode.userMetadata == nil || inode.Attributes.Size == 0 {
+		inode.mu.Unlock()
+		return false
+	}
+	hash := string(inode.userMetadata[fs.flags.HashAttr])
+	inode.mu.Unlock()
+	if hash == "" {
+		return false
+	}
+
+	regions, err := pageCache.LocalPageRegions(hash, 0, 1, struct{ RoutingKey string }{RoutingKey: hash})
+	return err == nil && len(regions) > 0
+}
+
 func (inode *Inode) touch() {
 	inode.Attributes.Mtime = time.Now()
 	inode.Attributes.Ctime = time.Now()

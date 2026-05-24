@@ -34,6 +34,18 @@ type fakeContentCache struct {
 		RoutingKey string
 		Lock       bool
 	}) (string, error)
+	storeLocalPath func(source struct {
+		Path      string
+		CachePath string
+	}, opts struct {
+		RoutingKey string
+		Lock       bool
+	}) (string, error)
+	localPageRegions func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]struct {
+		Path   string
+		Offset int64
+		Length int
+	}, error)
 }
 
 func (c *fakeContentCache) GetContent(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]byte, error) {
@@ -78,6 +90,32 @@ func (c *fakeContentCache) StoreContentFromS3(source struct {
 	return opts.RoutingKey, nil
 }
 
+func (c *fakeContentCache) StoreContentFromLocalPath(source struct {
+	Path      string
+	CachePath string
+}, opts struct {
+	RoutingKey string
+	Lock       bool
+}) (string, error) {
+	if c.storeLocalPath != nil {
+		return c.storeLocalPath(source, opts)
+	}
+	chunks := make(chan []byte)
+	close(chunks)
+	return c.StoreContent(chunks, opts.RoutingKey, struct{ RoutingKey string }{RoutingKey: opts.RoutingKey})
+}
+
+func (c *fakeContentCache) LocalPageRegions(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]struct {
+	Path   string
+	Offset int64
+	Length int
+}, error) {
+	if c.localPageRegions != nil {
+		return c.localPageRegions(hash, offset, length, opts)
+	}
+	return nil, errContentNotFound
+}
+
 func newUnitFS(flags *cfg.FlagStorage) *Goofys {
 	fs := &Goofys{
 		bucket:           "bucket",
@@ -110,6 +148,72 @@ func newNoSuchUploadError() error {
 		404,
 		"request-id",
 	)
+}
+
+func TestProcessCacheEventsDrainsQueuedEventsOnShutdown(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	var mu sync.Mutex
+	stored := make([]string, 0, 2)
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeLocalPath: func(source struct {
+			Path      string
+			CachePath string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			mu.Lock()
+			stored = append(stored, opts.RoutingKey)
+			mu.Unlock()
+			return opts.RoutingKey, nil
+		},
+	}
+	fs := newUnitFS(flags)
+	fs.cacheEventChan <- cacheEvent{path: "one", hash: "h1", size: 1, localSourcePath: "/tmp/one"}
+	fs.cacheEventChan <- cacheEvent{path: "two", hash: "h2", size: 1, localSourcePath: "/tmp/two"}
+	close(fs.shutdownCh)
+
+	fs.processCacheEvents()
+
+	if len(stored) != 2 {
+		t.Fatalf("expected queued cache events to drain on shutdown, got %v", stored)
+	}
+}
+
+func TestProcessCacheEventRetriesTransientExternalCacheStoreError(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	var attempts int32
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeLocalPath: func(source struct {
+			Path      string
+			CachePath string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			attempt := atomic.AddInt32(&attempts, 1)
+			if attempt < 3 {
+				return "", errors.New("transient cache dial error")
+			}
+			return opts.RoutingKey, nil
+		},
+	}
+	fs := newUnitFS(flags)
+	originalDelay := externalCacheStoreRetryDelay
+	externalCacheStoreRetryDelay = func(int) time.Duration { return 0 }
+	defer func() { externalCacheStoreRetryDelay = originalDelay }()
+
+	fs.processCacheEvent(cacheEvent{path: "file", hash: "h1", size: 1, localSourcePath: "/tmp/file"})
+
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("expected store to be retried until success, got %d attempts", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsSuccess); got != 1 {
+		t.Fatalf("expected one successful cache event, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsErrors); got != 0 {
+		t.Fatalf("expected no final cache event errors, got %d", got)
+	}
 }
 
 func TestStagedFileCleanupIsIdempotent(t *testing.T) {
@@ -355,7 +459,7 @@ func TestCacheStatusClearedByHash(t *testing.T) {
 				t.Fatal("expected cache event to be queued")
 			}
 
-			deadline := time.Now().Add(time.Second)
+			deadline := time.Now().Add(8 * time.Second)
 			for time.Now().Before(deadline) {
 				fs.cachingStatusMu.Lock()
 				_, ok := fs.cachingStatus["hash"]
@@ -434,6 +538,72 @@ func TestCacheThroughUsesLocalStagedSource(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("expected staged source to be removed after cache processing")
+}
+
+func TestCacheFileInExternalCacheFromSourceUsesLocalPathStore(t *testing.T) {
+	dir := t.TempDir()
+	stagedPath := filepath.Join(dir, "staged.bin")
+	if err := os.WriteFile(stagedPath, []byte("abcdef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	flags := cfg.DefaultFlags()
+	flags.CacheThroughModeEnabled = true
+	flags.HashAttr = "sha256"
+	flags.Backend = &cfg.S3Config{}
+	var storeContentCalls int32
+	var storeLocalPathCalls int32
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeContent: func(chunks chan []byte, hash string, opts struct{ RoutingKey string }) (string, error) {
+			atomic.AddInt32(&storeContentCalls, 1)
+			for range chunks {
+			}
+			return hash, nil
+		},
+		storeLocalPath: func(source struct {
+			Path      string
+			CachePath string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			atomic.AddInt32(&storeLocalPathCalls, 1)
+			if source.Path != stagedPath {
+				t.Fatalf("unexpected local path: %q", source.Path)
+			}
+			if source.CachePath != "file" {
+				t.Fatalf("unexpected cache path: %q", source.CachePath)
+			}
+			if !opts.Lock {
+				t.Fatal("expected local path store to request lock")
+			}
+			return opts.RoutingKey, nil
+		},
+	}
+	fs := newUnitFS(flags)
+	defer close(fs.shutdownCh)
+	go fs.processCacheEvents()
+
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = 6
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	if !fs.CacheFileInExternalCacheFromSource(inode, stagedPath, true) {
+		t.Fatal("expected cache event to be queued")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&storeLocalPathCalls) == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&storeLocalPathCalls); got != 1 {
+		t.Fatalf("expected local path StoreContent call, got %d", got)
+	}
+	if got := atomic.LoadInt32(&storeContentCalls); got != 0 {
+		t.Fatalf("expected no chunk StoreContent fallback, got %d", got)
+	}
 }
 
 func BenchmarkExternalCacheLargeOutput(b *testing.B) {

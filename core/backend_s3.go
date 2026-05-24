@@ -60,6 +60,12 @@ type S3Backend struct {
 	iamRefreshTimer    *time.Timer
 }
 
+const maxSingleCopyObjectSize = uint64(5 * 1024 * 1024 * 1024)
+
+func shouldUseMultipartCopy(gcs bool, size uint64, threshold uint64, sameObject bool) bool {
+	return !gcs && size > threshold && (!sameObject || size > maxSingleCopyObjectSize)
+}
+
 func NewS3(bucket string, flags *cfg.FlagStorage, config *cfg.S3Config) (*S3Backend, error) {
 	if config.MultipartCopyThreshold == 0 {
 		config.MultipartCopyThreshold = 128 * 1024 * 1024
@@ -826,10 +832,13 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 	}
 
 	from := s.bucket + "/" + param.Source
+	sameObject := param.Source == param.Destination
 
 	// Copy into the same object is used to just update metadata
-	// and should be very quick regardless of parameters
-	if param.Source != param.Destination || *param.Size > s.config.MultipartCopyThreshold {
+	// and should be very quick regardless of parameters. Keep metadata-only
+	// self-copy on CopyObject up to S3's 5 GiB single-copy limit; multipart
+	// self-copy is slower and breaks some S3-compatible backends.
+	if !sameObject || param.Size == nil || *param.Size > maxSingleCopyObjectSize {
 		// FIXME Remove additional HEAD query
 		if param.Size == nil || param.ETag == nil || (*param.Size > s.config.MultipartCopyThreshold &&
 			(param.Metadata == nil || param.StorageClass == nil)) {
@@ -852,7 +861,7 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 			param.StorageClass = s.selectStorageClass(param.Size)
 		}
 
-		if !s.gcs && *param.Size > s.config.MultipartCopyThreshold {
+		if shouldUseMultipartCopy(s.gcs, *param.Size, s.config.MultipartCopyThreshold, sameObject) {
 			reqId, err := s.copyObjectMultipart(int64(*param.Size), from, param.Destination, "", param.ETag, param.Metadata, param.StorageClass)
 			if err != nil {
 				return nil, err

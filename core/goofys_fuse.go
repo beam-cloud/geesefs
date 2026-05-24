@@ -461,14 +461,15 @@ func (fs *GoofysFuse) OpenFile(
 
 	op.Handle = fs.AddFileHandle(fh)
 
-	// this flag appears to tell the kernel if this open should
-	// use the page cache or not. "use" here means:
-	//
-	// read will read from cache
-	// write will populate cache
-
-	// We have our own in-memory cache, kernel page cache is redundant
 	op.KeepPageCache = false
+	if op.OpenFlags.IsReadOnly() && fs.shouldKeepPageCacheForExternalCacheRead(in) {
+		if fs.shouldUseDirectIOForExternalCacheRead(in) {
+			op.UseDirectIO = true
+		} else {
+			op.KeepPageCache = true
+		}
+		fh.prefetchExternalCachePagesOnOpen()
+	}
 
 	return
 }
@@ -482,9 +483,136 @@ func (fs *GoofysFuse) ReadFile(
 	fs.mu.RLock()
 	fh := fs.fileHandles[op.Handle]
 	fs.mu.RUnlock()
+	if fh == nil {
+		atomic.AddInt64(&fs.stats.readErrors, 1)
+		log.Warnf("geesefs fuse read missing handle: inode=%d handle=%d offset=%d size=%d", op.Inode, op.Handle, op.Offset, op.Size)
+		return syscall.EBADF
+	}
 
-	op.Data, op.BytesRead, err = fh.ReadFile(op.Offset, op.Size)
+	readPath := fh.inode.FullName()
+	readHash := fh.inode.cacheHashForLog()
+	readStarted := time.Now()
+	slowReadThreshold := 30 * time.Second
+	slowReadRepeat := 30 * time.Second
+	if fs.flags.DebugMain || fs.flags.DebugFuse {
+		slowReadThreshold = time.Second
+		slowReadRepeat = 10 * time.Second
+	}
+	var readFinished int32
+	readDone := make(chan struct{})
+	var slowLogged int32
+	slowTimer := time.AfterFunc(slowReadThreshold, func() {
+		if atomic.LoadInt32(&readFinished) != 0 {
+			return
+		}
+		atomic.StoreInt32(&slowLogged, 1)
+		atomic.AddInt64(&fs.stats.readSlow, 1)
+		log.Warnf(
+			"geesefs fuse read slow: inode=%d handle=%d path=%q hash=%q offset=%d size=%d elapsed=%s",
+			op.Inode,
+			op.Handle,
+			readPath,
+			readHash,
+			op.Offset,
+			op.Size,
+			time.Since(readStarted).Truncate(time.Millisecond),
+		)
+		ticker := time.NewTicker(slowReadRepeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-readDone:
+				return
+			case <-ticker.C:
+				if atomic.LoadInt32(&readFinished) != 0 {
+					return
+				}
+				log.Warnf(
+					"geesefs fuse read still running: inode=%d handle=%d path=%q hash=%q offset=%d size=%d elapsed=%s",
+					op.Inode,
+					op.Handle,
+					readPath,
+					readHash,
+					op.Offset,
+					op.Size,
+					time.Since(readStarted).Truncate(time.Millisecond),
+				)
+			}
+		}
+	})
+	defer func() {
+		atomic.StoreInt32(&readFinished, 1)
+		slowTimer.Stop()
+		close(readDone)
+		if err != nil {
+			atomic.AddInt64(&fs.stats.readErrors, 1)
+		}
+		if atomic.LoadInt32(&slowLogged) != 0 {
+			log.Warnf(
+				"geesefs fuse read completed after slow path: inode=%d handle=%d path=%q hash=%q offset=%d size=%d bytes=%d err=%v elapsed=%s",
+				op.Inode,
+				op.Handle,
+				readPath,
+				readHash,
+				op.Offset,
+				op.Size,
+				op.BytesRead,
+				err,
+				time.Since(readStarted).Truncate(time.Millisecond),
+			)
+		}
+	}()
+
+	op.Data, op.BytesRead, op.Callback, err = fh.ReadFileWithCallback(op.Offset, op.Size)
+	handlerElapsed := time.Since(readStarted)
+	atomic.AddInt64(&fs.stats.readHandlerCount, 1)
+	atomic.AddInt64(&fs.stats.readHandlerNanos, handlerElapsed.Nanoseconds())
 	err = mapAwsError(err)
+	if err == nil && op.BytesRead > 0 {
+		atomic.AddInt64(&fs.stats.readBytes, int64(op.BytesRead))
+	}
+	if err == nil && op.Callback != nil {
+		callback := op.Callback
+		bytesRead := op.BytesRead
+		responseStarted := time.Now()
+		op.Callback = func() {
+			responseElapsed := time.Since(responseStarted)
+			callbackCount := atomic.AddInt64(&fs.stats.readCallbackCount, 1)
+			atomic.AddInt64(&fs.stats.readCallbackBytes, int64(bytesRead))
+			atomic.AddInt64(&fs.stats.readCallbackNanos, responseElapsed.Nanoseconds())
+			if callbackCount <= 16 || callbackCount%1024 == 0 || responseElapsed > 100*time.Millisecond {
+				log.Debugf(
+					"geesefs fuse read response complete: path=%q hash=%q offset=%d size=%d bytes=%d handler_elapsed=%s response_elapsed=%s handler_ms=%.3f response_ms=%.3f callback_count=%d",
+					readPath,
+					readHash,
+					op.Offset,
+					op.Size,
+					bytesRead,
+					handlerElapsed.Truncate(time.Microsecond),
+					responseElapsed.Truncate(time.Microsecond),
+					float64(handlerElapsed.Nanoseconds())/1_000_000,
+					float64(responseElapsed.Nanoseconds())/1_000_000,
+					callbackCount,
+				)
+			}
+			callback()
+		}
+	} else if err == nil && op.BytesRead > 0 {
+		handlerCount := atomic.LoadInt64(&fs.stats.readHandlerCount)
+		if handlerCount <= 16 || handlerCount%1024 == 0 || handlerElapsed > 100*time.Millisecond {
+			log.Debugf(
+				"geesefs fuse read response complete: path=%q hash=%q offset=%d size=%d bytes=%d handler_elapsed=%s response_elapsed=0s handler_ms=%.3f response_ms=0.000 callback_count=%d",
+				readPath,
+				readHash,
+				op.Offset,
+				op.Size,
+				op.BytesRead,
+				handlerElapsed.Truncate(time.Microsecond),
+				float64(handlerElapsed.Nanoseconds())/1_000_000,
+				atomic.LoadInt64(&fs.stats.readCallbackCount),
+			)
+		}
+	}
 
 	return
 }
@@ -502,6 +630,8 @@ func (fs *GoofysFuse) SyncFile(
 			err = fs.SyncTree(nil)
 		} else if in.isDir() {
 			err = fs.SyncTree(in)
+		} else if in.StagedFile != nil {
+			err = in.fs.flushStagedFile(in)
 		} else {
 			err = in.SyncFile()
 		}
@@ -555,8 +685,7 @@ func (fs *GoofysFuse) ReleaseFileHandle(
 	fs.mu.Unlock()
 
 	if fh.inode.fs.flags.FsyncOnClose {
-		// FIXME: This is a hack to ensure that we flush the staged file for outputs immediately
-		if fh.inode.StagedFile != nil && strings.HasPrefix(fh.inode.FullName(), "outputs/") {
+		if fh.inode.StagedFile != nil {
 			err = fh.inode.fs.flushStagedFile(fh.inode)
 			if err != nil {
 				return err
@@ -964,6 +1093,10 @@ func MountFuse(
 
 func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 	// Mount the file system.
+	const (
+		fuseMaxBackground       = 128
+		fuseCongestionThreshold = 96
+	)
 	mountCfg := &fuse.MountConfig{
 		FSName:                  fs.bucket,
 		Subtype:                 "geesefs",
@@ -974,7 +1107,10 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 		UseReadDirPlus:          true,
 		FuseImpl:                fuse.FUSEImplMacFUSE,
 		EnableAsyncReads:        true,
+		MaxBackground:           fuseMaxBackground,
+		CongestionThreshold:     fuseCongestionThreshold,
 	}
+	log.Debugf("geesefs fuse mount config: async_reads=%t vectored_read=%t max_background=%d congestion_threshold=%d keep_page_cache=external-cache-readonly-clean", mountCfg.EnableAsyncReads, mountCfg.UseVectoredRead, mountCfg.MaxBackground, mountCfg.CongestionThreshold)
 
 	if fs.flags.DebugFuse {
 		fuseLog := cfg.GetLogger("fuse")
@@ -993,7 +1129,7 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 	// Update read_ahead_kb on the mount point if set
 	if fs.flags.FuseReadAheadKB > 0 {
 		if err := updateFuseReadAheadKB(fs.flags.MountPoint, int(fs.flags.FuseReadAheadKB)); err != nil {
-			log.Warnf("Failed to update read_ahead_kb: %v", err)
+			log.Debugf("Failed to update read_ahead_kb: %v", err)
 		}
 	}
 

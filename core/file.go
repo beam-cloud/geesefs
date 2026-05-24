@@ -17,6 +17,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -30,16 +31,19 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/yandex-cloud/geesefs/core/cfg"
 )
 
 type FileHandle struct {
-	inode         *Inode
-	lastReadEnd   uint64
-	seqReadSize   uint64
-	lastReadCount uint64
-	lastReadTotal uint64
-	lastReadSizes []uint64
-	lastReadIdx   int
+	inode                   *Inode
+	lastReadEnd             uint64
+	seqReadSize             uint64
+	lastReadCount           uint64
+	lastReadTotal           uint64
+	lastReadSizes           []uint64
+	lastReadIdx             int
+	externalPageHitLogCount uint64
 }
 
 // On Linux and MacOS, IOV_MAX = 1024
@@ -406,9 +410,31 @@ func (inode *Inode) loadFromStagedFile(diskRanges []Range) (buffers []struct {
 }
 
 func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash string) (allocated int64, totalDone uint64, err error) {
+	if readIntoCache, ok := inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheReadInto); ok {
+		atomic.AddInt64(&inode.fs.stats.externalReadIntoAttempts, 1)
+		if size > uint64(int(^uint(0)>>1)) {
+			atomic.AddInt64(&inode.fs.stats.externalReadIntoMisses, 1)
+			return 0, 0, errContentNotFound
+		}
+		buf := make([]byte, int(size))
+		n, err := readIntoCache.ReadContentInto(context.Background(), string(hash), int64(offset), buf, struct{ RoutingKey string }{RoutingKey: hash})
+		if err == nil && n == int64(size) {
+			atomic.AddInt64(&inode.fs.stats.externalReadIntoHits, 1)
+			atomic.AddInt64(&inode.fs.stats.externalReadIntoBytes, n)
+			inode.mu.Lock()
+			allocated += inode.buffers.Add(offset, buf, BUF_CLEAN, false)
+			inode.mu.Unlock()
+			inode.readCond.Broadcast()
+			return allocated, size, nil
+		}
+		atomic.AddInt64(&inode.fs.stats.externalReadIntoMisses, 1)
+	}
+
 	if inode.fs.flags.ExternalCacheStreamingEnabled {
+		atomic.AddInt64(&inode.fs.stats.externalStreamAttempts, 1)
 		contentChan, err := inode.fs.flags.ExternalCacheClient.GetContentStream(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 		if err != nil || contentChan == nil {
+			atomic.AddInt64(&inode.fs.stats.externalStreamMisses, 1)
 			inode.fs.CacheFileInExternalCache(inode)
 			return 0, 0, errContentNotFound
 		}
@@ -418,6 +444,7 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 				continue
 			}
 			if uint64(len(chunk)) > size-totalDone {
+				atomic.AddInt64(&inode.fs.stats.externalStreamMisses, 1)
 				inode.fs.CacheFileInExternalCache(inode)
 				return allocated, 0, errContentNotFound
 			}
@@ -430,20 +457,27 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 		}
 
 		if totalDone != size {
+			atomic.AddInt64(&inode.fs.stats.externalStreamMisses, 1)
 			inode.fs.CacheFileInExternalCache(inode)
 			return allocated, 0, errContentNotFound
 		}
 
+		atomic.AddInt64(&inode.fs.stats.externalStreamHits, 1)
+		atomic.AddInt64(&inode.fs.stats.externalStreamBytes, int64(totalDone))
 		return allocated, totalDone, nil
 	}
 
+	atomic.AddInt64(&inode.fs.stats.externalUnaryAttempts, 1)
 	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 	if err != nil || buf == nil || uint64(len(buf)) != size {
+		atomic.AddInt64(&inode.fs.stats.externalUnaryMisses, 1)
 		inode.fs.CacheFileInExternalCache(inode)
 		return 0, 0, errContentNotFound
 	}
 
 	totalDone = uint64(len(buf))
+	atomic.AddInt64(&inode.fs.stats.externalUnaryHits, 1)
+	atomic.AddInt64(&inode.fs.stats.externalUnaryBytes, int64(totalDone))
 
 	// Cache the result
 	inode.mu.Lock()
@@ -636,6 +670,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 }
 
 func (inode *Inode) sendRead(cloud StorageBackend, key string, offset, size uint64) (allocated int64, totalDone uint64, err error) {
+	atomic.AddInt64(&inode.fs.stats.cloudReadRequests, 1)
 	resp, err := cloud.GetBlob(&GetBlobInput{
 		Key:   key,
 		Start: offset,
@@ -672,6 +707,7 @@ func (inode *Inode) sendRead(cloud StorageBackend, key string, offset, size uint
 		size -= done
 		offset += done
 		totalDone += done
+		atomic.AddInt64(&inode.fs.stats.cloudReadBytes, int64(done))
 		// Notify waiting readers
 		inode.readCond.Broadcast()
 	}
@@ -808,7 +844,28 @@ func (fh *FileHandle) shouldRetrieveHash() bool {
 	return true
 }
 
+func (fh *FileHandle) retrieveHashMetadata() {
+	fh.inode.mu.Lock()
+	cloud, path := fh.inode.cloud()
+	fh.inode.mu.Unlock()
+	head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
+	if err == nil {
+		fh.inode.mu.Lock()
+		fh.inode.setMetadata(head.Metadata)
+		fh.inode.mu.Unlock()
+	} else {
+		log.Errorf("Error getting head blob: %v", err)
+	}
+}
+
 func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesRead int, err error) {
+	if fh.shouldRetrieveHash() {
+		fh.retrieveHashMetadata()
+	}
+	return fh.readFileAfterHash(sOffset, sLen)
+}
+
+func (fh *FileHandle) readFileAfterHash(sOffset int64, sLen int64) (data [][]byte, bytesRead int, err error) {
 	offset := uint64(sOffset)
 	size := uint64(sLen)
 
@@ -822,24 +879,12 @@ func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesR
 		}
 	}()
 
-	if fh.shouldRetrieveHash() {
-		fh.inode.mu.Lock()
-		cloud, path := fh.inode.cloud()
-		fh.inode.mu.Unlock()
-		head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
-		if err == nil {
-			fh.inode.mu.Lock()
-			fh.inode.setMetadata(head.Metadata)
-			fh.inode.mu.Unlock()
-		} else {
-			log.Errorf("Error getting head blob: %v", err)
-		}
-	}
-
 	// return cached buffers directly without locking
 	// this only works well if readahead is large
 	data, _, err = fh.inode.buffers.GetData(offset, size, false)
 	if err == nil {
+		atomic.AddInt64(&fh.inode.fs.stats.readBufferHits, 1)
+		atomic.AddInt64(&fh.inode.fs.stats.readBufferBytes, int64(size))
 		return data, int(size), nil
 	}
 
@@ -934,11 +979,12 @@ func (inode *Inode) recordFlushError(err error) {
 
 func (inode *Inode) TryFlush(priority int) bool {
 	inode.mu.Lock()
-	if sf := inode.StagedFile; sf != nil {
-		if !sf.shouldFlush {
-			inode.mu.Unlock()
-			return false
-		}
+	if inode.StagedFile != nil {
+		// Staged-write files are persisted by Goofys.flushStagedFileDirect.
+		// Letting the generic dirty-part flusher run here can try to copy
+		// ranges from a cloud object that has not been created yet.
+		inode.mu.Unlock()
+		return false
 	}
 	inode.mu.Unlock()
 
@@ -1846,13 +1892,31 @@ func (inode *Inode) flushSmallObject() {
 		inode.mu.Unlock()
 		return
 	}
+
+	hashedBeforeUpload := false
+	if inode.shouldHashFlushedFile(sz) {
+		hasher := sha256.New()
+		if _, err := io.Copy(hasher, bufReader); err != nil {
+			log.Warnf("Failed to hash small file %v before upload: %v", key, err)
+		} else if _, err := bufReader.Seek(0, io.SeekStart); err != nil {
+			log.Warnf("Failed to rewind small file %v after hashing: %v", key, err)
+		} else {
+			hash := hex.EncodeToString(hasher.Sum(nil))
+			if inode.userMetadata == nil {
+				inode.userMetadata = make(map[string][]byte)
+			}
+			inode.userMetadata[inode.fs.flags.HashAttr] = []byte(hash)
+			hashedBeforeUpload = true
+		}
+	}
+
 	params := &PutBlobInput{
 		Key:         key,
 		Body:        bufReader,
 		Size:        PUInt64(uint64(bufReader.Len())),
 		ContentType: inode.fs.flags.GetMimeType(inode.FullName()),
 	}
-	if inode.userMetadataDirty != 0 {
+	if inode.userMetadataDirty != 0 || hashedBeforeUpload {
 		params.Metadata = escapeMetadata(inode.userMetadata)
 		inode.userMetadataDirty = 0
 	}
@@ -1888,12 +1952,17 @@ func (inode *Inode) flushSmallObject() {
 			}
 		}
 
-		// Compute hash of file and store it in user metadata
-		err = inode.finalizeAndHash()
-		if err != nil {
-			log.Warnf("Failed to finalize and hash object %v: %v", key, err)
+		if !hashedBeforeUpload {
+			// Compute hash of file and store it in user metadata.
+			// If the hash was added to the initial PutObject metadata above,
+			// avoid an extra metadata self-copy.
+			err = inode.finalizeAndHash()
+			if err != nil {
+				log.Warnf("Failed to finalize and hash object %v: %v", key, err)
+			}
 		}
 
+		inode.queueCacheThroughAfterFlushLocked()
 	}
 
 	inode.UnlockRange(0, sz, true)
@@ -2211,9 +2280,7 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 		// If cache through mode is enabled, immediately cache the file in the external cache.
 		// Staged writes enqueue after SyncFile succeeds so the cache worker can read
 		// the local staged source instead of fetching the object back from S3.
-		if inode.fs.flags.CacheThroughModeEnabled && inode.StagedFile == nil {
-			inode.fs.CacheFileInExternalCache(inode)
-		}
+		inode.queueCacheThroughAfterFlushLocked()
 
 		inode.mpu = nil
 		inode.buffers.SetFlushedClean()
@@ -2231,15 +2298,7 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 func (inode *Inode) finalizeAndHash() error {
 	log.Debugf("Called finalizeAndHash: %s", inode.FullName())
 
-	if inode.isDir() {
-		return nil
-	}
-
-	if inode.Attributes.Size < inode.fs.flags.MinFileSizeForHashKB*1024 {
-		return nil
-	}
-
-	if inode.fs.flags.HashAttr == "" {
+	if !inode.shouldHashFlushedFile(inode.Attributes.Size) {
 		return nil
 	}
 
@@ -2285,6 +2344,48 @@ func (inode *Inode) finalizeAndHash() error {
 	inode.sendUpdateMeta()
 
 	return nil
+}
+
+func (inode *Inode) shouldHashFlushedFile(size uint64) bool {
+	if inode.isDir() {
+		return false
+	}
+	if inode.fs.flags.HashAttr == "" {
+		return false
+	}
+	return size >= inode.fs.flags.MinFileSizeForHashKB*1024
+}
+
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) queueCacheThroughAfterFlushLocked() {
+	if !inode.fs.flags.CacheThroughModeEnabled || inode.fs.flags.ExternalCacheClient == nil || inode.StagedFile != nil {
+		return
+	}
+	if inode.fs.flags.HashAttr == "" || inode.userMetadata == nil {
+		return
+	}
+	if len(inode.userMetadata[inode.fs.flags.HashAttr]) == 0 {
+		return
+	}
+	inode.fs.CacheFileInExternalCache(inode)
+}
+
+func (inode *Inode) dropCleanBuffersAfterExternalCacheStore(hash string) {
+	inode.mu.Lock()
+	if inode.userMetadata == nil || string(inode.userMetadata[inode.fs.flags.HashAttr]) != hash || inode.StagedFile != nil || inode.buffers.AnyUnclean() {
+		inode.mu.Unlock()
+		return
+	}
+	size := inode.Attributes.Size
+	allocated := inode.buffers.RemoveRange(0, size, func(b *FileBuffer) bool {
+		return b.state == BUF_CLEAN && !b.loading.Load() && !inode.IsRangeLocked(b.offset, b.length, false)
+	})
+	inode.mu.Unlock()
+
+	if allocated != 0 {
+		inode.fs.bufferPool.Use(allocated, true)
+		log.Debugf("geesefs external cache store dropped clean buffers: path=%q hash=%q size=%d freed=%d", inode.FullName(), hash, size, -allocated)
+	}
 }
 
 func (inode *Inode) updateFromFlush(size uint64, etag *string, lastModified *time.Time, storageClass *string) {

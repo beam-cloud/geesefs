@@ -910,6 +910,8 @@ func MountCluster(
 		DisableWritebackCaching: true,
 		UseVectoredRead:         true,
 		FuseImpl:                fuse.FUSEImplMacFUSE,
+		MaxBackground:           128,
+		CongestionThreshold:     96,
 	}
 
 	if flags.DebugFuse {
