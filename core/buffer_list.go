@@ -369,6 +369,18 @@ func (l *BufferList) SetFlushedClean() {
 	})
 }
 
+func (l *BufferList) RevertFlushedToDirty() {
+	ascendChange(&l.at, 0, func(end uint64, b *FileBuffer) (cont bool, chg bool) {
+		if b.state == BUF_FLUSHED_FULL || b.state == BUF_FLUSHED_CUT || b.state == BUF_FL_CLEARED {
+			l.unqueue(b)
+			b.dirtyID = l.nextID()
+			b.state = BUF_DIRTY
+			l.queue(b)
+		}
+		return true, false
+	})
+}
+
 func (l *BufferList) delete(b *FileBuffer) (allocated int64) {
 	if b.data != nil {
 		b.ptr.refs--

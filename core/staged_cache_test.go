@@ -2,6 +2,8 @@ package core
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -271,6 +273,168 @@ func TestNoSuchUploadPreservesStagedData(t *testing.T) {
 	}
 	if inode.flushError == nil {
 		t.Fatal("expected flush error to be recorded for retry backoff")
+	}
+}
+
+func TestResetMultipartStateForRetryKeepsFlushedBuffersDirty(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.CacheState = ST_MODIFIED
+	inode.mpu = &MultipartBlobCommitInput{
+		Key:      PString("file"),
+		UploadId: PString("upload"),
+		Parts:    make([]*string, 10000),
+	}
+
+	data := []byte("multipart-data")
+	inode.buffers.Add(0, data, BUF_DIRTY, true)
+	_, ids, err := inode.buffers.GetData(0, uint64(len(data)), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inode.buffers.SetState(0, uint64(len(data)), ids, BUF_FLUSHED_FULL)
+
+	inode.resetMultipartStateForRetry()
+
+	if inode.mpu != nil {
+		t.Fatal("expected MPU state to be cleared")
+	}
+	if !inode.isStillDirty() {
+		t.Fatal("expected flushed buffers to become dirty again")
+	}
+	got, ids, err := inode.buffers.GetData(0, uint64(len(data)), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) == 0 {
+		t.Fatal("expected reverted buffers to have dirty ids")
+	}
+	if !bytes.Equal(bytes.Join(got, nil), data) {
+		t.Fatalf("expected data %q, got %q", data, bytes.Join(got, nil))
+	}
+}
+
+func TestNonStagedFlushPartUsesRetryableBufferReader(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	fs := newUnitFS(flags)
+	payload := bytes.Repeat([]byte("retryable-buffer-reader-"), 8192)
+	partID := "part-1"
+	var sawMultiReader bool
+
+	backend := &TestBackend{}
+	backend.MultipartBlobAddFunc = func(param *MultipartBlobAddInput) (*MultipartBlobAddOutput, error) {
+		if _, ok := param.Body.(*MultiReader); !ok {
+			t.Fatalf("expected non-hashed part body to use MultiReader directly, got %T", param.Body)
+		}
+		sawMultiReader = true
+		first, err := io.ReadAll(param.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := param.Body.Seek(0, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		second, err := io.ReadAll(param.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(first, payload) || !bytes.Equal(second, payload) {
+			t.Fatalf("upload body changed across retry seek: first=%d second=%d want=%d", len(first), len(second), len(payload))
+		}
+		return &MultipartBlobAddOutput{PartId: &partID}, nil
+	}
+
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "file")
+	inode.Id = 2
+	inode.SetCacheState(ST_CREATED)
+	inode.Attributes.Size = uint64(len(payload))
+	inode.mpu = &MultipartBlobCommitInput{
+		Key:      PString("file"),
+		UploadId: PString("upload-id"),
+		Parts:    make([]*string, 10000),
+	}
+	inode.buffers.Add(0, payload, BUF_DIRTY, false)
+
+	inode.mu.Lock()
+	inode.flushPart(0)
+	inode.mu.Unlock()
+
+	if !sawMultiReader {
+		t.Fatal("expected MultipartBlobAdd to be called")
+	}
+	if inode.mpu == nil || inode.mpu.Parts[0] == nil || *inode.mpu.Parts[0] != partID {
+		t.Fatalf("expected uploaded part id to be recorded, got %#v", inode.mpu)
+	}
+	if inode.flushError != nil {
+		t.Fatalf("expected successful part flush, got flush error %v", inode.flushError)
+	}
+}
+
+func TestNonStagedFlushPartSpoolsHashSourceToTempFile(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.CachePath = t.TempDir()
+	flags.HashAttr = "sha256"
+	flags.MinFileSizeForHashKB = 0
+	fs := newUnitFS(flags)
+	payload := bytes.Repeat([]byte("hash-spooled-part-"), 8192)
+	expectedHash := sha256.Sum256(payload)
+	partID := "part-1"
+	var spooledPath string
+
+	backend := &TestBackend{}
+	backend.MultipartBlobAddFunc = func(param *MultipartBlobAddInput) (*MultipartBlobAddOutput, error) {
+		f, ok := param.Body.(*os.File)
+		if !ok {
+			t.Fatalf("expected hashed part body to use a temp file, got %T", param.Body)
+		}
+		spooledPath = f.Name()
+		got, err := io.ReadAll(param.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("uploaded payload mismatch: got %d bytes want %d", len(got), len(payload))
+		}
+		if _, err := param.Body.Seek(0, io.SeekStart); err != nil {
+			t.Fatal(err)
+		}
+		return &MultipartBlobAddOutput{PartId: &partID}, nil
+	}
+
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "file")
+	inode.Id = 2
+	inode.SetCacheState(ST_CREATED)
+	inode.Attributes.Size = uint64(len(payload))
+	inode.mpu = &MultipartBlobCommitInput{
+		Key:      PString("file"),
+		UploadId: PString("upload-id"),
+		Parts:    make([]*string, 10000),
+	}
+	inode.buffers.Add(0, payload, BUF_DIRTY, false)
+
+	inode.mu.Lock()
+	inode.flushPart(0)
+	gotHash := ""
+	if inode.hashInProgress != nil {
+		gotHash = hex.EncodeToString(inode.hashInProgress.Sum(nil))
+	}
+	inode.mu.Unlock()
+
+	if spooledPath == "" {
+		t.Fatal("expected a temp file upload source")
+	}
+	if _, err := os.Stat(spooledPath); !os.IsNotExist(err) {
+		t.Fatalf("expected temp upload source to be removed after hashing, stat err=%v", err)
+	}
+	if gotHash != hex.EncodeToString(expectedHash[:]) {
+		t.Fatalf("hash mismatch: got %s want %s", gotHash, hex.EncodeToString(expectedHash[:]))
+	}
+	if inode.mpu == nil || inode.mpu.Parts[0] == nil || *inode.mpu.Parts[0] != partID {
+		t.Fatalf("expected uploaded part id to be recorded, got %#v", inode.mpu)
 	}
 }
 
@@ -595,6 +759,189 @@ func TestCacheFileInExternalCacheFromSourceUsesLocalPathStore(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&storeContentCalls); got != 0 {
 		t.Fatalf("expected no chunk StoreContent fallback, got %d", got)
+	}
+}
+
+func TestCacheThroughFromFlushedBuffersUsesLocalBytes(t *testing.T) {
+	payload := bytes.Repeat([]byte("cache-through-data-"), 512*1024)
+	sum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(sum[:])
+
+	flags := cfg.DefaultFlags()
+	flags.CacheThroughModeEnabled = true
+	flags.HashAttr = "sha256"
+	flags.ExternalCacheClient = &fakeContentCache{}
+
+	var storeContentCalls int32
+	var storeFromS3Calls int32
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeContent: func(chunks chan []byte, hash string, opts struct{ RoutingKey string }) (string, error) {
+			atomic.AddInt32(&storeContentCalls, 1)
+			hasher := sha256.New()
+			for chunk := range chunks {
+				if _, err := hasher.Write(chunk); err != nil {
+					return "", err
+				}
+			}
+			return hex.EncodeToString(hasher.Sum(nil)), nil
+		},
+		storeFromS3: func(source struct {
+			Path        string
+			BucketName  string
+			Region      string
+			EndpointURL string
+			AccessKey   string
+			SecretKey   string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			atomic.AddInt32(&storeFromS3Calls, 1)
+			return opts.RoutingKey, nil
+		},
+	}
+
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = uint64(len(payload))
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte(expectedHash)}
+	inode.buffers.at.Set(uint64(len(payload)), &FileBuffer{
+		offset: 0,
+		length: uint64(len(payload)),
+		data:   payload,
+		ptr:    &BufferPointer{mem: payload, refs: 1},
+		state:  BUF_FLUSHED_FULL,
+	})
+
+	inode.mu.Lock()
+	ok := fs.CacheFileInExternalCacheFromBuffersLocked(inode)
+	inode.mu.Unlock()
+
+	if !ok {
+		t.Fatal("expected flushed buffer cache-through to succeed")
+	}
+	if got := atomic.LoadInt32(&storeContentCalls); got != 1 {
+		t.Fatalf("expected one StoreContent call, got %d", got)
+	}
+	if got := atomic.LoadInt32(&storeFromS3Calls); got != 0 {
+		t.Fatalf("expected no StoreContentFromS3 calls, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsSuccess); got != 1 {
+		t.Fatalf("expected one successful cache event, got %d", got)
+	}
+}
+
+func TestDeferredHashMetadataPublishFailureDoesNotPoisonFlush(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = "sha256"
+	fs := newUnitFS(flags)
+	done := make(chan struct{})
+	backend := &TestBackend{
+		CopyBlobFunc: func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+			close(done)
+			return nil, syscall.EIO
+		},
+	}
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "file")
+	inode.Id = 2
+	inode.SetCacheState(ST_CACHED)
+	inode.Attributes.Size = 5
+	inode.knownSize = 5
+	inode.knownETag = "etag"
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	inode.hashMetadataDirty = true
+
+	inode.mu.Lock()
+	inode.sendHashUpdateMeta()
+	inode.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for hash metadata publish")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		inode.mu.Lock()
+		syncing := inode.hashMetadataSync
+		inode.mu.Unlock()
+		if !syncing {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
+	if inode.flushError != nil {
+		t.Fatalf("deferred hash metadata error must not set flushError, got %v", inode.flushError)
+	}
+	if !inode.hashMetadataDirty {
+		t.Fatal("expected transient hash metadata failure to remain dirty for background retry")
+	}
+	if inode.CacheState != ST_CACHED {
+		t.Fatalf("expected file to remain cached after deferred metadata failure, got %v", inode.CacheState)
+	}
+}
+
+func TestDeferredHashMetadataPublishCASFailureInvalidatesLocalView(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = "sha256"
+	fs := newUnitFS(flags)
+	done := make(chan struct{})
+	backend := &TestBackend{
+		CopyBlobFunc: func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+			if param.ETag == nil || *param.ETag != "etag" {
+				t.Fatalf("expected hash metadata copy to be guarded by current ETag, got %v", param.ETag)
+			}
+			close(done)
+			return nil, syscall.EBUSY
+		},
+	}
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "file")
+	inode.Id = 2
+	inode.SetCacheState(ST_CACHED)
+	inode.Attributes.Size = 5
+	inode.knownSize = 5
+	inode.knownETag = "etag"
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	inode.hashMetadataDirty = true
+	inode.buffers.Add(0, []byte("hello"), BUF_CLEAN, true)
+
+	inode.mu.Lock()
+	inode.sendHashUpdateMeta()
+	inode.mu.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for hash metadata publish")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		inode.mu.Lock()
+		syncing := inode.hashMetadataSync
+		inode.mu.Unlock()
+		if !syncing {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
+	if inode.flushError != nil {
+		t.Fatalf("CAS hash metadata failure must not set flushError, got %v", inode.flushError)
+	}
+	if inode.hashMetadataDirty {
+		t.Fatal("expected CAS failure to stop retrying stale hash metadata")
+	}
+	if inode.buffers.AnyUnclean() {
+		t.Fatal("expected resetCache to drop local buffer state")
 	}
 }
 

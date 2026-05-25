@@ -196,3 +196,45 @@ func TestHashFlushedPart_KnownHash(t *testing.T) {
 		t.Errorf("sha256 out-of-order: hash mismatch: got %x, want %x", gotSHA256, expectedSHA256)
 	}
 }
+
+func TestGetMultiReader_DirtyDiskBackedBuffer(t *testing.T) {
+	const partSize = 64
+	expected := bytes.Repeat([]byte{0x5A}, partSize)
+
+	buffers := BufferList{
+		at: btree.Map[uint64, *FileBuffer]{},
+	}
+	buffers.at.Set(partSize, &FileBuffer{
+		offset:  0,
+		length:  partSize,
+		state:   BUF_DIRTY,
+		onDisk:  true,
+		dirtyID: 1,
+	})
+
+	ranges := buffers.AddLoadingFromDisk(0, partSize)
+	if len(ranges) != 1 || ranges[0].Start != 0 || ranges[0].End != partSize {
+		t.Fatalf("unexpected disk ranges: %#v", ranges)
+	}
+	buffers.ReviveFromDisk(0, expected)
+
+	inode := &Inode{
+		Attributes: InodeAttributes{Size: partSize},
+		buffers:    buffers,
+	}
+	reader, _, err := inode.getMultiReader(0, partSize)
+	if err != nil {
+		t.Fatalf("getMultiReader failed: %v", err)
+	}
+	got := make([]byte, partSize)
+	n, err := reader.Read(got)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if n != partSize {
+		t.Fatalf("read %d bytes, want %d", n, partSize)
+	}
+	if !bytes.Equal(got, expected) {
+		t.Fatalf("disk-backed buffer mismatch")
+	}
+}

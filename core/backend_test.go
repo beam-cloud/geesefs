@@ -22,6 +22,7 @@ type TestBackend struct {
 	HeadBlobFunc            func(param *HeadBlobInput) (*HeadBlobOutput, error)
 	GetBlobFunc             func(param *GetBlobInput) (*GetBlobOutput, error)
 	PutBlobFunc             func(param *PutBlobInput) (*PutBlobOutput, error)
+	CopyBlobFunc            func(param *CopyBlobInput) (*CopyBlobOutput, error)
 	MultipartBlobAddFunc    func(param *MultipartBlobAddInput) (*MultipartBlobAddOutput, error)
 	MultipartBlobCopyFunc   func(param *MultipartBlobCopyInput) (*MultipartBlobCopyOutput, error)
 	MultipartBlobCommitFunc func(param *MultipartBlobCommitInput) (*MultipartBlobCommitOutput, error)
@@ -95,6 +96,9 @@ func (s *TestBackend) RenameBlob(param *RenameBlobInput) (*RenameBlobOutput, err
 }
 
 func (s *TestBackend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
+	if s.CopyBlobFunc != nil {
+		return s.CopyBlobFunc(param)
+	}
 	if s.err != nil {
 		return nil, s.err
 	}

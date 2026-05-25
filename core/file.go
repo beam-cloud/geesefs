@@ -16,7 +16,6 @@
 package core
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -52,6 +51,32 @@ const READ_BUF_SIZE = 128 * 1024
 const MAX_FLUSH_PRIORITY = 3
 
 var errContentNotFound = errors.New("content not found")
+
+type multipartPartSource struct {
+	body       io.ReadSeeker
+	file       *os.File
+	path       string
+	removePath bool
+}
+
+func (s *multipartPartSource) Close() error {
+	var err error
+	if s.file != nil {
+		err = s.file.Close()
+		s.file = nil
+	}
+	if s.path != "" && s.removePath {
+		if removeErr := os.Remove(s.path); removeErr != nil && err == nil && !os.IsNotExist(removeErr) {
+			err = removeErr
+		}
+	}
+	return err
+}
+
+func (s *multipartPartSource) KeepPathForHash() string {
+	s.removePath = false
+	return s.path
+}
 
 // NewFileHandle returns a new file handle for the given `inode`
 func NewFileHandle(inode *Inode) *FileHandle {
@@ -369,9 +394,27 @@ func (inode *Inode) loadFromDisk(diskRanges []Range) (allocated int64, err error
 		_, err = inode.DiskCacheFD.ReadAt(data, int64(rr.Start))
 		if err == nil {
 			inode.buffers.ReviveFromDisk(rr.Start, data)
+			allocated += int64(readSize)
 		}
 	}
 	return
+}
+
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) loadDiskBackedBuffers(offset, size uint64) error {
+	diskRanges := inode.buffers.AddLoadingFromDisk(offset, size)
+	if len(diskRanges) == 0 {
+		return nil
+	}
+
+	allocated, err := inode.loadFromDisk(diskRanges)
+
+	// Match LoadRange: memory accounting can block, so don't hold inode.mu.
+	inode.mu.Unlock()
+	inode.fs.bufferPool.Use(allocated, true)
+	inode.mu.Lock()
+
+	return err
 }
 
 func (inode *Inode) loadFromStagedFile(diskRanges []Range) (buffers []struct {
@@ -969,6 +1012,54 @@ func (inode *Inode) getMultiReader(offset, size uint64) (reader *MultiReader, id
 	return reader, ids, err
 }
 
+func (inode *Inode) multipartPartSource(reader *MultiReader, key string, part uint64) (*multipartPartSource, error) {
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	if !inode.shouldHashFlushedFile(inode.Attributes.Size) {
+		return &multipartPartSource{body: reader}, nil
+	}
+
+	dir := inode.fs.flags.CachePath
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			log.Debugf("Failed to create cache temp dir %q for multipart upload source: %v", dir, err)
+			dir = ""
+		}
+	}
+	tmp, err := os.CreateTemp(dir, ".geesefs-mpu-part-*")
+	if err != nil && dir != "" {
+		tmp, err = os.CreateTemp("", ".geesefs-mpu-part-*")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	source := &multipartPartSource{
+		body:       tmp,
+		file:       tmp,
+		path:       tmp.Name(),
+		removePath: true,
+	}
+	defer func() {
+		if err != nil {
+			_ = source.Close()
+		}
+	}()
+
+	written, err := io.CopyBuffer(tmp, reader, make([]byte, READ_BUF_SIZE))
+	if err != nil {
+		return nil, err
+	}
+	if uint64(written) != reader.Len() {
+		return nil, fmt.Errorf("short multipart source spool for %v part %d: wrote %d of %d bytes", key, part, written, reader.Len())
+	}
+	if _, err = tmp.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return source, nil
+}
+
 func (inode *Inode) recordFlushError(err error) {
 	inode.flushError = err
 	inode.flushErrorTime = time.Now()
@@ -1023,6 +1114,10 @@ func (inode *Inode) TryFlush(priority int) bool {
 		}
 
 		return inode.sendUpload(priority)
+	} else if inode.CacheState == ST_CACHED && inode.hashMetadataDirty && !inode.hashMetadataSync &&
+		inode.oldParent == nil && inode.userMetadataDirty == 0 {
+		inode.sendHashUpdateMeta()
+		return true
 	}
 
 	return false
@@ -1321,6 +1416,8 @@ func (inode *Inode) sendUpdateMeta() {
 			}
 			log.Warnf("Error flushing metadata using COPY for %v: %v", key, err)
 		} else if inode.CacheState == ST_MODIFIED && !inode.isStillDirty() {
+			inode.hashMetadataDirty = false
+			inode.hashMetadataSync = false
 			inode.SetCacheState(ST_CACHED)
 			inode.SetAttrTime(time.Now())
 		}
@@ -1329,6 +1426,58 @@ func (inode *Inode) sendUpdateMeta() {
 		atomic.AddInt64(&inode.fs.activeFlushers, -1)
 		inode.fs.WakeupFlusher()
 		inode.mu.Unlock()
+	}()
+}
+
+func (inode *Inode) sendHashUpdateMeta() {
+	if inode.hashMetadataSync || !inode.hashMetadataDirty || inode.userMetadataDirty != 0 || inode.fs.flags.HashAttr == "" {
+		return
+	}
+
+	cloud, key := inode.cloud()
+	if inode.isDir() {
+		key += "/"
+	}
+	if inode.userMetadata == nil || len(inode.userMetadata[inode.fs.flags.HashAttr]) == 0 {
+		inode.hashMetadataDirty = false
+		return
+	}
+
+	inode.hashMetadataDirty = false
+	inode.hashMetadataSync = true
+	copyIn := &CopyBlobInput{
+		Source:      key,
+		Destination: key,
+		Size:        PUInt64(inode.knownSize),
+		ETag:        PString(inode.knownETag),
+		Metadata:    escapeMetadata(inode.userMetadata),
+	}
+
+	go func() {
+		inode.fs.addInflightChange(key)
+		_, err := cloud.CopyBlob(copyIn)
+		inode.fs.completeInflightChange(key)
+		inode.mu.Lock()
+		defer inode.mu.Unlock()
+
+		inode.hashMetadataSync = false
+		if err != nil {
+			mappedErr := mapAwsError(err)
+			if mappedErr == syscall.EBUSY || mappedErr == syscall.ENOENT || mappedErr == syscall.ERANGE {
+				s3Log.Warnf("Deferred hash metadata publish lost compare-and-swap for %v, invalidating local cached metadata: %v", key, err)
+				inode.hashMetadataDirty = false
+				inode.resetCache()
+				inode.fs.WakeupFlusher()
+				return
+			}
+			inode.hashMetadataDirty = true
+			log.Warnf("Deferred hash metadata publish failed for %v: %v", key, err)
+			inode.fs.ScheduleRetryFlush()
+			return
+		}
+
+		log.Debugf("Deferred hash metadata publish complete for %v", key)
+		inode.fs.WakeupFlusher()
 	}()
 }
 
@@ -1779,6 +1928,9 @@ func (inode *Inode) resetStagedMultipartState() {
 	inode.fs.bufferPool.Use(allocated, true)
 	inode.hashLock.Lock()
 	inode.hashInProgress = nil
+	for _, part := range inode.pendingHashParts {
+		part.cleanup()
+	}
 	inode.hashOffset = 0
 	inode.pendingHashParts = nil
 	inode.hashLock.Unlock()
@@ -1786,6 +1938,24 @@ func (inode *Inode) resetStagedMultipartState() {
 		inode.SetCacheState(ST_MODIFIED)
 	}
 	inode.forceFlush = true
+}
+
+func (inode *Inode) resetMultipartStateForRetry() {
+	inode.mpu = nil
+	inode.buffers.RevertFlushedToDirty()
+	inode.hashLock.Lock()
+	inode.hashInProgress = nil
+	for _, part := range inode.pendingHashParts {
+		part.cleanup()
+	}
+	inode.hashOffset = 0
+	inode.pendingHashParts = nil
+	inode.hashLock.Unlock()
+	if inode.CacheState == ST_CACHED {
+		inode.SetCacheState(ST_MODIFIED)
+	}
+	inode.forceFlush = true
+	inode.recordFlushError(nil)
 }
 
 func (inode *Inode) isStillDirty() bool {
@@ -1829,6 +1999,8 @@ func (inode *Inode) resetCache() {
 		inode.abortMultipart()
 	}
 	inode.userMetadataDirty = 0
+	inode.hashMetadataDirty = false
+	inode.hashMetadataSync = false
 	inode.SetCacheState(ST_CACHED)
 	// Invalidate metadata entry
 	inode.SetAttrTime(time.Time{})
@@ -1944,6 +2116,11 @@ func (inode *Inode) flushSmallObject() {
 
 		inode.buffers.SetState(0, sz, bufIds, BUF_CLEAN)
 		inode.updateFromFlush(sz, resp.ETag, resp.LastModified, resp.StorageClass)
+		if params.Metadata != nil && inode.fs.flags.HashAttr != "" && inode.userMetadata != nil &&
+			len(inode.userMetadata[inode.fs.flags.HashAttr]) > 0 {
+			inode.hashMetadataDirty = false
+			inode.hashMetadataSync = false
+		}
 		if inode.CacheState == ST_CREATED || inode.CacheState == ST_MODIFIED {
 			if !inode.isStillDirty() {
 				inode.SetCacheState(ST_CACHED)
@@ -2128,6 +2305,11 @@ func (inode *Inode) flushPart(part uint64) {
 		return
 	}
 
+	if err := inode.loadDiskBackedBuffers(partOffset, partSize); err != nil {
+		log.Warnf("Failed to load disk-backed buffers for part %v (%v-%v) of object %v: %v", part, partOffset, partOffset+partSize, key, err)
+		return
+	}
+
 	// Finally upload it
 	bufReader, bufIds, err := inode.getMultiReader(partOffset, partSize)
 	if err != nil {
@@ -2135,35 +2317,54 @@ func (inode *Inode) flushPart(part uint64) {
 		return
 	}
 
-	bufData, err := io.ReadAll(bufReader)
+	bufLen := bufReader.Len()
+	source, err := inode.multipartPartSource(bufReader, key, part)
 	if err != nil {
-		log.Errorf("BUG: Failed to read buffer data for part %v (%v-%v) of object %v: %v", part, partOffset, partSize, key, err)
+		log.Errorf("BUG: Failed to prepare upload source for part %v (%v-%v) of object %v: %v", part, partOffset, partSize, key, err)
 		return
 	}
 
-	bufLen := bufReader.Len()
 	partInput := MultipartBlobAddInput{
 		Commit:     inode.mpu,
 		PartNumber: uint32(part + 1),
-		Body:       bytes.NewReader(bufData),
+		Body:       source.body,
 		Size:       bufLen,
 		Offset:     partOffset,
 	}
 	inode.mu.Unlock()
 	resp, err := cloud.MultipartBlobAdd(&partInput)
 	inode.mu.Lock()
+	hashPath := ""
+	if err == nil && source.path != "" {
+		hashPath = source.KeepPathForHash()
+	}
+	if closeErr := source.Close(); closeErr != nil && err == nil {
+		err = closeErr
+		if hashPath != "" {
+			_ = os.Remove(hashPath)
+			hashPath = ""
+		}
+	}
 
 	if inode.CacheState == ST_DELETED {
 		// File was deleted while we were flushing it
+		if hashPath != "" {
+			_ = os.Remove(hashPath)
+		}
 		return
 	}
 	inode.recordFlushError(err)
 	if err != nil {
 		log.Warnf("Failed to flush part %v of object %v: %v", part, key, err)
 
-		if isNoSuchUploadError(err) && inode.StagedFile != nil {
-			s3Log.Warnf("Conflict detected (inode %v): Multipart upload of staged file %v is aborted remotely, preserving staged data for retry", inode.Id, inode.FullName())
-			inode.resetStagedMultipartState()
+		if isNoSuchUploadError(err) {
+			if inode.StagedFile != nil {
+				s3Log.Warnf("Conflict detected (inode %v): Multipart upload of staged file %v is aborted remotely, preserving staged data for retry", inode.Id, inode.FullName())
+				inode.resetStagedMultipartState()
+			} else {
+				s3Log.Warnf("Multipart upload for file %v disappeared while flushing part %v; preserving local data and restarting upload", inode.FullName(), part)
+				inode.resetMultipartStateForRetry()
+			}
 		} else if mappedErr := mapAwsError(err); mappedErr == syscall.ENOENT {
 			// Multipart upload is deleted
 			s3Log.Warnf("Conflict detected (inode %v): Multipart upload of file %v is aborted remotely, discarding local changes", inode.Id, inode.FullName())
@@ -2181,11 +2382,18 @@ func (inode *Inode) flushPart(part uint64) {
 		}
 		log.Debugf("Flushed part %v of object %v", part, key)
 
-		// Only hash in chunks if it's a multipart upload
-		if inode.mpu != nil {
-			if err := inode.hashFlushedPart(partOffset, partSize, bufData); err != nil {
+		// Only hash in chunks if this multipart upload needs content-hash metadata.
+		if inode.mpu != nil && inode.shouldHashFlushedFile(inode.Attributes.Size) {
+			if hashPath != "" {
+				err = inode.hashFlushedPartFile(partOffset, partSize, hashPath)
+			} else {
+				err = inode.hashFlushedPartReader(partOffset, partSize, bufReader)
+			}
+			if err != nil {
 				log.Warnf("Failed to hash flushed part %v of object %v: %v", part, key, err)
 			}
+		} else if hashPath != "" {
+			_ = os.Remove(hashPath)
 		}
 
 		inode.buffers.SetState(partOffset, partSize, bufIds, doneState)
@@ -2216,6 +2424,11 @@ func (inode *Inode) completeMultipart() {
 		inode.resetStagedMultipartState()
 		return
 	}
+	if isNoSuchUploadError(err) {
+		s3Log.Warnf("Multipart upload for file %v disappeared before completion; preserving local data and restarting upload", inode.FullName())
+		inode.resetMultipartStateForRetry()
+		return
+	}
 	mappedErr := mapAwsError(err)
 	if mappedErr == syscall.ENOENT || mappedErr == syscall.ERANGE {
 		// Object is deleted or resized remotely (416). Discard local version
@@ -2242,6 +2455,7 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 	// Finalize the upload
 	mpu := inode.mpu
 	mpu.NumParts = uint32(numParts)
+	mpu.Size = &finalSize
 	inode.mu.Unlock()
 	inode.fs.addInflightChange(key)
 	resp, err := cloud.MultipartBlobCommit(mpu)
@@ -2254,9 +2468,14 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 	inode.recordFlushError(err)
 	if err != nil {
 		log.Warnf("Failed to finalize multi-part upload of object %v: %v", key, err)
-		if isNoSuchUploadError(err) && inode.StagedFile != nil {
-			s3Log.Warnf("Conflict detected (inode %v): Multipart upload of staged file %v is aborted remotely, preserving staged data for retry", inode.Id, inode.FullName())
-			inode.resetStagedMultipartState()
+		if isNoSuchUploadError(err) {
+			if inode.StagedFile != nil {
+				s3Log.Warnf("Conflict detected (inode %v): Multipart upload of staged file %v is aborted remotely, preserving staged data for retry", inode.Id, inode.FullName())
+				inode.resetStagedMultipartState()
+			} else {
+				s3Log.Warnf("Multipart upload for file %v disappeared during completion; preserving local data and restarting upload", inode.FullName())
+				inode.resetMultipartStateForRetry()
+			}
 			return
 		}
 		if inode.mpu != nil && inode.mpu.Metadata != nil {
@@ -2270,6 +2489,11 @@ func (inode *Inode) commitMultipartUpload(numParts, finalSize uint64) {
 		}
 
 		inode.updateFromFlush(finalSize, resp.ETag, resp.LastModified, resp.StorageClass)
+		if inode.mpu != nil && inode.mpu.Metadata != nil && inode.fs.flags.HashAttr != "" &&
+			inode.userMetadata != nil && len(inode.userMetadata[inode.fs.flags.HashAttr]) > 0 {
+			inode.hashMetadataDirty = false
+			inode.hashMetadataSync = false
+		}
 
 		// Compute hash of file and store it in user metadata
 		err := inode.finalizeAndHash()
@@ -2318,7 +2542,8 @@ func (inode *Inode) finalizeAndHash() error {
 		}
 
 		inode.userMetadata[inode.fs.flags.HashAttr] = []byte(hash)
-		inode.sendUpdateMeta()
+		inode.hashMetadataDirty = true
+		inode.sendHashUpdateMeta()
 
 		return nil
 	}
@@ -2341,7 +2566,8 @@ func (inode *Inode) finalizeAndHash() error {
 	}
 
 	inode.userMetadata[inode.fs.flags.HashAttr] = []byte(hash)
-	inode.sendUpdateMeta()
+	inode.hashMetadataDirty = true
+	inode.sendHashUpdateMeta()
 
 	return nil
 }
@@ -2367,7 +2593,7 @@ func (inode *Inode) queueCacheThroughAfterFlushLocked() {
 	if len(inode.userMetadata[inode.fs.flags.HashAttr]) == 0 {
 		return
 	}
-	inode.fs.CacheFileInExternalCache(inode)
+	inode.fs.CacheFileInExternalCacheFromBuffersLocked(inode)
 }
 
 func (inode *Inode) dropCleanBuffersAfterExternalCacheStore(hash string) {

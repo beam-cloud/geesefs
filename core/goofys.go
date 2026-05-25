@@ -61,6 +61,7 @@ type cacheEvent struct {
 }
 
 const externalCacheStoreAttempts = 5
+const externalCacheStoreChunkSize = 4 * 1024 * 1024
 
 var externalCacheStoreRetryDelay = func(attempt int) time.Duration {
 	delay := time.Duration(250*(1<<(attempt-1))) * time.Millisecond
@@ -505,14 +506,18 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 		)
 		for attempt := 1; attempt <= externalCacheStoreAttempts; attempt++ {
 			hash, err = fs.storeCacheEventContent(cacheEvent)
-			if err == nil {
+			if err == nil && hash == cacheEvent.hash {
 				break
 			}
 			if attempt == externalCacheStoreAttempts {
 				break
 			}
 			delay := externalCacheStoreRetryDelay(attempt)
-			log.Debugf("geesefs external cache store retry: path=%q hash=%q source=%s size=%d attempt=%d/%d delay=%s err=%v", cacheEvent.path, cacheEvent.hash, source, cacheEvent.size, attempt, externalCacheStoreAttempts, delay, err)
+			if err != nil {
+				log.Debugf("geesefs external cache store retry: path=%q hash=%q source=%s size=%d attempt=%d/%d delay=%s err=%v", cacheEvent.path, cacheEvent.hash, source, cacheEvent.size, attempt, externalCacheStoreAttempts, delay, err)
+			} else {
+				log.Debugf("geesefs external cache store retry: path=%q hash=%q actual=%q source=%s size=%d attempt=%d/%d delay=%s err=hash_mismatch", cacheEvent.path, cacheEvent.hash, hash, source, cacheEvent.size, attempt, externalCacheStoreAttempts, delay)
+			}
 			time.Sleep(delay)
 		}
 		if err != nil {
@@ -577,6 +582,25 @@ func (fs *Goofys) CacheFileInExternalCache(inode *Inode) {
 	fs.CacheFileInExternalCacheFromSource(inode, "", false)
 }
 
+func (fs *Goofys) reserveExternalCacheStore(inode *Inode, hashString string) bool {
+	fs.cachingStatusMu.Lock()
+	if fs.cachingStatus[hashString] {
+		fs.cachingStatusMu.Unlock()
+		return false
+	}
+	fs.cachingStatus[hashString] = true
+	fs.cachingStatusMu.Unlock()
+
+	if fs.flags.EventCallback != nil {
+		fs.flags.EventCallback(cfg.EventCacheTriggered, map[string]interface{}{
+			"inode": inode.FullName(),
+			"hash":  hashString,
+		})
+	}
+
+	return true
+}
+
 func (fs *Goofys) CacheFileInExternalCacheFromSource(inode *Inode, localSourcePath string, removeLocalAfter bool) bool {
 	if inode.userMetadata == nil {
 		log.Errorf("No metadata found for inode, not caching inode in external cache: %v", inode.FullName())
@@ -590,20 +614,8 @@ func (fs *Goofys) CacheFileInExternalCacheFromSource(inode *Inode, localSourcePa
 
 	hashString := string(hash)
 
-	// Check and update caching status
-	fs.cachingStatusMu.Lock()
-	if fs.cachingStatus[hashString] {
-		fs.cachingStatusMu.Unlock()
-		return false // File is already being cached or has been cached
-	}
-	fs.cachingStatus[hashString] = true
-	fs.cachingStatusMu.Unlock()
-
-	if fs.flags.EventCallback != nil {
-		fs.flags.EventCallback(cfg.EventCacheTriggered, map[string]interface{}{
-			"inode": inode.FullName(),
-			"hash":  hashString,
-		})
+	if !fs.reserveExternalCacheStore(inode, hashString) {
+		return false
 	}
 
 	event := cacheEvent{
@@ -627,6 +639,160 @@ func (fs *Goofys) CacheFileInExternalCacheFromSource(inode *Inode, localSourcePa
 		fs.clearCachingStatus(hashString)
 		return false
 	}
+}
+
+// LOCKS_REQUIRED(inode.mu)
+func (fs *Goofys) CacheFileInExternalCacheFromBuffersLocked(inode *Inode) bool {
+	if !fs.flags.CacheThroughModeEnabled || fs.flags.ExternalCacheClient == nil || inode.StagedFile != nil {
+		return false
+	}
+	if inode.userMetadata == nil {
+		log.Errorf("No metadata found for inode, not caching inode in external cache: %v", inode.FullName())
+		return false
+	}
+	hash, ok := inode.userMetadata[fs.flags.HashAttr]
+	if !ok || len(hash) == 0 {
+		log.Errorf("No hash found for inode, not caching inode in external cache: %v", inode.FullName())
+		return false
+	}
+
+	hashString := string(hash)
+	if !fs.reserveExternalCacheStore(inode, hashString) {
+		return false
+	}
+
+	path := inode.FullName()
+	size := inode.Attributes.Size
+	atomic.AddInt64(&fs.stats.cacheEventsQueued, 1)
+	atomic.AddInt64(&fs.stats.cacheEventsStarted, 1)
+	atomic.AddInt64(&fs.stats.cacheEventsBytes, int64(size))
+	log.Debugf("geesefs external cache store start: path=%q hash=%q size=%d source=flushed_buffers queue_depth=%d", path, hashString, size, len(fs.cacheEventChan))
+
+	var actualHash string
+	var err error
+	for attempt := 1; attempt <= externalCacheStoreAttempts; attempt++ {
+		inode.mu.Unlock()
+		actualHash, err = fs.storeContentFromInodeBuffers(inode, path, hashString, size)
+		inode.mu.Lock()
+		if err == nil && actualHash == hashString {
+			atomic.AddInt64(&fs.stats.cacheEventsSuccess, 1)
+			log.Debugf("geesefs external cache store result: status=ok path=%q hash=%q source=flushed_buffers size=%d", path, hashString, size)
+			return true
+		}
+
+		if attempt == externalCacheStoreAttempts {
+			break
+		}
+
+		delay := externalCacheStoreRetryDelay(attempt)
+		if err != nil {
+			log.Debugf("geesefs external cache store retry: path=%q hash=%q source=flushed_buffers size=%d attempt=%d/%d delay=%s err=%v", path, hashString, size, attempt, externalCacheStoreAttempts, delay, err)
+		} else {
+			log.Debugf("geesefs external cache store retry: path=%q hash=%q actual=%q source=flushed_buffers size=%d attempt=%d/%d delay=%s err=hash_mismatch", path, hashString, actualHash, size, attempt, externalCacheStoreAttempts, delay)
+		}
+		inode.mu.Unlock()
+		time.Sleep(delay)
+		inode.mu.Lock()
+	}
+
+	if err != nil {
+		atomic.AddInt64(&fs.stats.cacheEventsErrors, 1)
+		log.Warnf("geesefs external cache store result: status=error path=%q hash=%q source=flushed_buffers size=%d err=%v", path, hashString, size, err)
+	} else {
+		atomic.AddInt64(&fs.stats.cacheEventsMismatch, 1)
+		log.Warnf("geesefs external cache store result: status=hash_mismatch path=%q expected=%q actual=%q source=flushed_buffers size=%d", path, hashString, actualHash, size)
+	}
+	fs.clearCachingStatus(hashString)
+	return false
+}
+
+func (fs *Goofys) storeContentFromInodeBuffers(inode *Inode, path, hash string, size uint64) (string, error) {
+	chunks := make(chan []byte, 2)
+	done := make(chan struct{})
+	readErr := make(chan error, 1)
+
+	go func() {
+		defer close(chunks)
+		readErr <- fs.streamInodeBufferChunks(inode, path, hash, size, chunks, done)
+	}()
+
+	actualHash, err := fs.flags.ExternalCacheClient.StoreContent(chunks, hash, struct{ RoutingKey string }{RoutingKey: hash})
+	close(done)
+	if readErrValue := <-readErr; err == nil && readErrValue != nil {
+		err = readErrValue
+	}
+	return actualHash, err
+}
+
+func (fs *Goofys) streamInodeBufferChunks(inode *Inode, path, hash string, size uint64, chunks chan<- []byte, done <-chan struct{}) error {
+	for offset := uint64(0); offset < size; {
+		chunkSize := uint64(externalCacheStoreChunkSize)
+		if remaining := size - offset; chunkSize > remaining {
+			chunkSize = remaining
+		}
+
+		chunk, err := inode.copyCacheThroughChunk(path, hash, size, offset, chunkSize)
+		if err != nil {
+			return err
+		}
+
+		select {
+		case chunks <- chunk:
+		case <-done:
+			return nil
+		}
+
+		offset += chunkSize
+	}
+	return nil
+}
+
+func (inode *Inode) validateCacheThroughSourceLocked(path, hash string, size uint64) error {
+	if inode.FullName() != path {
+		return fmt.Errorf("inode path changed during cache-through: expected %q got %q", path, inode.FullName())
+	}
+	if inode.Attributes.Size != size {
+		return fmt.Errorf("inode size changed during cache-through: expected %d got %d", size, inode.Attributes.Size)
+	}
+	if inode.StagedFile != nil {
+		return fmt.Errorf("inode has staged file during cache-through: %s", path)
+	}
+	if inode.userMetadata == nil || string(inode.userMetadata[inode.fs.flags.HashAttr]) != hash {
+		return fmt.Errorf("inode hash changed during cache-through: %s", path)
+	}
+	return nil
+}
+
+func (inode *Inode) copyCacheThroughChunk(path, hash string, totalSize, offset, size uint64) ([]byte, error) {
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
+
+	if err := inode.validateCacheThroughSourceLocked(path, hash, totalSize); err != nil {
+		return nil, err
+	}
+	inode.LockRange(offset, size, false)
+	defer inode.UnlockRange(offset, size, false)
+
+	if err := inode.loadDiskBackedBuffers(offset, size); err != nil {
+		return nil, err
+	}
+	if err := inode.validateCacheThroughSourceLocked(path, hash, totalSize); err != nil {
+		return nil, err
+	}
+
+	reader, _, err := inode.getMultiReader(offset, size)
+	if err != nil {
+		return nil, err
+	}
+	chunk := make([]byte, int(size))
+	n, err := io.ReadFull(reader, chunk)
+	if err != nil {
+		return nil, err
+	}
+	if n != len(chunk) {
+		return nil, fmt.Errorf("short cache-through buffer read: path=%q offset=%d size=%d read=%d", path, offset, size, n)
+	}
+	return chunk, nil
 }
 
 func (fs *Goofys) storeContentFromLocalFile(event cacheEvent) (string, error) {
@@ -939,6 +1105,10 @@ func (fs *Goofys) FreeSomeCleanBuffers(origSize int64) (int64, bool) {
 		if buf != nil && (buf.state == BUF_CLEAN || buf.state == BUF_FLUSHED_FULL) &&
 			buf.ptr != nil && !inode.IsRangeLocked(buf.offset, buf.length, false) {
 			fs.tryEvictToDisk(inode, buf, &toFs)
+			if buf.state == BUF_FLUSHED_FULL && !buf.onDisk {
+				inode.mu.Unlock()
+				continue
+			}
 			allocated, _ := inode.buffers.EvictFromMemory(buf)
 			if allocated != 0 {
 				fs.bufferPool.UseUnlocked(allocated, false)
@@ -1436,6 +1606,8 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	inode.recordFlushError(nil)
 	inode.updateFromFlush(totalSize, resp.ETag, resp.LastModified, resp.StorageClass)
 	inode.userMetadataDirty = 0
+	inode.hashMetadataDirty = false
+	inode.hashMetadataSync = false
 	inode.buffers.SetFlushedClean()
 	if inode.CacheState == ST_CREATED || inode.CacheState == ST_MODIFIED {
 		if !inode.isStillDirty() {
@@ -1639,6 +1811,7 @@ func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key, localPath st
 	}
 
 	mpu.NumParts = uint32(len(parts))
+	mpu.Size = &size
 	resp, err := cloud.MultipartBlobCommit(mpu)
 	if err != nil {
 		_, _ = cloud.MultipartBlobAbort(mpu)
@@ -1990,6 +2163,8 @@ func mapHttpError(status int) error {
 		return syscall.EINTR
 	case http.StatusRequestedRangeNotSatisfiable:
 		return syscall.ERANGE
+	case http.StatusPreconditionFailed:
+		return syscall.EBUSY
 	case 429:
 		return syscall.EAGAIN
 	case 503:

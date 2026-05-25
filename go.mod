@@ -80,4 +80,4 @@ replace github.com/aws/aws-sdk-go => ./s3ext
 
 replace github.com/winfsp/cgofuse => github.com/vitalif/cgofuse v0.0.0-20230609211427-22e8fa44f6b8
 
-replace github.com/jacobsa/fuse => ./internal/fusego
+replace github.com/jacobsa/fuse => ../gofuse

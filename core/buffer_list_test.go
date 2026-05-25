@@ -124,6 +124,35 @@ func (s *BufferListTest) TestGetHolesEvicted(t *C) {
 	t.Assert(flcl, Equals, false)
 }
 
+func (s *BufferListTest) TestRevertFlushedToDirty(t *C) {
+	l := BufferList{
+		helpers: &TestBLHelpers{},
+	}
+	t.Assert(l.Add(0, filledBuf(5*1024, 1), BUF_DIRTY, true), Equals, int64(5*1024))
+	_, ids, err := l.GetData(0, 5*1024, true)
+	t.Assert(err, IsNil)
+	l.SetState(0, 5*1024, ids, BUF_FLUSHED_FULL)
+
+	numDirty := 0
+	l.IterateDirtyParts(func(partNum uint64) bool { numDirty++; return true })
+	t.Assert(numDirty, Equals, 0)
+
+	l.RevertFlushedToDirty()
+
+	data, ids, err := l.GetData(0, 5*1024, true)
+	t.Assert(err, IsNil)
+	t.Assert(data, DeepEquals, [][]byte{filledBuf(5*1024, 1)})
+	t.Assert(len(ids), Equals, 1)
+
+	numDirty = 0
+	l.IterateDirtyParts(func(partNum uint64) bool {
+		numDirty++
+		t.Assert(partNum, Equals, uint64(0))
+		return true
+	})
+	t.Assert(numDirty, Equals, 1)
+}
+
 // Test targets the requeueSplit() function
 func (s *BufferListTest) TestSplitDirtyQueue(t *C) {
 	l := BufferList{
