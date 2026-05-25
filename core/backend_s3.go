@@ -16,13 +16,14 @@
 package core
 
 import (
-	"github.com/yandex-cloud/geesefs/core/cfg"
-	"golang.org/x/sync/errgroup"
-
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,6 +40,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/yandex-cloud/geesefs/core/cfg"
+	"golang.org/x/sync/errgroup"
 )
 
 type S3Backend struct {
@@ -58,6 +61,81 @@ type S3Backend struct {
 	iamToken           atomic.Value
 	iamTokenExpiration time.Time
 	iamRefreshTimer    *time.Timer
+}
+
+const maxSingleCopyObjectSize = uint64(5 * 1024 * 1024 * 1024)
+const s3WriteRetryAttempts = 5
+
+func shouldUseMultipartCopy(gcs bool, size uint64, threshold uint64, sameObject bool) bool {
+	return !gcs && size > threshold && (!sameObject || size > maxSingleCopyObjectSize)
+}
+
+func s3WriteRetryDelay(attempt int) time.Duration {
+	delay := time.Duration(250*(1<<(attempt-1))) * time.Millisecond
+	if delay > 2*time.Second {
+		return 2 * time.Second
+	}
+	return delay
+}
+
+func normalizeETag(etag *string) string {
+	if etag == nil {
+		return ""
+	}
+	return strings.Trim(*etag, "\"")
+}
+
+func expectedMultipartETag(parts []*string, numParts uint32) *string {
+	if numParts == 0 {
+		return nil
+	}
+	if int(numParts) > len(parts) {
+		return nil
+	}
+
+	raw := make([]byte, 0, int(numParts)*md5.Size)
+	for i := uint32(0); i < numParts; i++ {
+		if parts[i] == nil {
+			return nil
+		}
+		partETag := normalizeETag(parts[i])
+		if len(partETag) != md5.Size*2 {
+			return nil
+		}
+		sum, err := hex.DecodeString(partETag)
+		if err != nil || len(sum) != md5.Size {
+			return nil
+		}
+		raw = append(raw, sum...)
+	}
+
+	sum := md5.Sum(raw)
+	etag := fmt.Sprintf("%x-%d", sum, numParts)
+	return &etag
+}
+
+func expectedMultipartETagFromCompleted(parts []*s3.CompletedPart) *string {
+	partETags := make([]*string, len(parts))
+	for i, part := range parts {
+		if part == nil {
+			return nil
+		}
+		partETags[i] = part.ETag
+	}
+	return expectedMultipartETag(partETags, uint32(len(parts)))
+}
+
+func isRetryableTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ETIMEDOUT) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
 }
 
 func NewS3(bucket string, flags *cfg.FlagStorage, config *cfg.S3Config) (*S3Backend, error) {
@@ -808,11 +886,28 @@ func (s *S3Backend) copyObjectMultipart(size int64, from string, to string, mpuI
 
 	s3Log.Debug(params)
 
-	req, _ := s.CompleteMultipartUploadRequest(params)
-	err = req.Send()
+	startedAt := time.Now()
+	expectedETag := expectedMultipartETagFromCompleted(parts)
+	expectedSize := uint64(size)
+	var req *request.Request
+	for attempt := 1; attempt <= s3WriteRetryAttempts; attempt++ {
+		req, _ = s.CompleteMultipartUploadRequest(params)
+		err = req.Send()
+		if err == nil {
+			break
+		}
+		if !shouldRetry(err) || attempt == s3WriteRetryAttempts {
+			break
+		}
+		s3Log.Warnf("Complete MPU retrying key=%v attempt=%d/%d err=%v", to, attempt, s3WriteRetryAttempts, err)
+		time.Sleep(s3WriteRetryDelay(attempt))
+	}
 	if err != nil {
+		if head, ok := s.recoverCompletedMultipart(to, &expectedSize, expectedETag, startedAt, err); ok {
+			return head.RequestId, nil
+		}
 		s3Log.Errorf("Complete MPU %v = %v", params, err)
-	} else {
+	} else if req != nil {
 		requestId = s.getRequestId(req)
 	}
 
@@ -826,10 +921,13 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 	}
 
 	from := s.bucket + "/" + param.Source
+	sameObject := param.Source == param.Destination
 
 	// Copy into the same object is used to just update metadata
-	// and should be very quick regardless of parameters
-	if param.Source != param.Destination || *param.Size > s.config.MultipartCopyThreshold {
+	// and should be very quick regardless of parameters. Keep metadata-only
+	// self-copy on CopyObject up to S3's 5 GiB single-copy limit; multipart
+	// self-copy is slower and breaks some S3-compatible backends.
+	if !sameObject || param.Size == nil || *param.Size > maxSingleCopyObjectSize {
 		// FIXME Remove additional HEAD query
 		if param.Size == nil || param.ETag == nil || (*param.Size > s.config.MultipartCopyThreshold &&
 			(param.Metadata == nil || param.StorageClass == nil)) {
@@ -852,7 +950,7 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 			param.StorageClass = s.selectStorageClass(param.Size)
 		}
 
-		if !s.gcs && *param.Size > s.config.MultipartCopyThreshold {
+		if shouldUseMultipartCopy(s.gcs, *param.Size, s.config.MultipartCopyThreshold, sameObject) {
 			reqId, err := s.copyObjectMultipart(int64(*param.Size), from, param.Destination, "", param.ETag, param.Metadata, param.StorageClass)
 			if err != nil {
 				return nil, err
@@ -864,6 +962,7 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 	params := &s3.CopyObjectInput{
 		Bucket:            &s.bucket,
 		CopySource:        aws.String(pathEscape(from)),
+		CopySourceIfMatch: param.ETag,
 		Key:               &param.Destination,
 		StorageClass:      param.StorageClass,
 		ContentType:       s.flags.GetMimeType(param.Destination),
@@ -891,14 +990,26 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 		params.ACL = &s.config.ACL
 	}
 
-	req, _ := s.CopyObjectRequest(params)
-	// make a shallow copy of the client so we can change the
-	// timeout only for this request but still re-use the
-	// connection pool
-	c := *(req.Config.HTTPClient)
-	req.Config.HTTPClient = &c
-	req.Config.HTTPClient.Timeout = 15 * time.Minute
-	err := req.Send()
+	var req *request.Request
+	var err error
+	for attempt := 1; attempt <= s3WriteRetryAttempts; attempt++ {
+		req, _ = s.CopyObjectRequest(params)
+		// make a shallow copy of the client so we can change the
+		// timeout only for this request but still re-use the
+		// connection pool
+		c := *(req.Config.HTTPClient)
+		req.Config.HTTPClient = &c
+		req.Config.HTTPClient.Timeout = 15 * time.Minute
+		err = req.Send()
+		if err == nil {
+			break
+		}
+		if !shouldRetry(err) || attempt == s3WriteRetryAttempts {
+			break
+		}
+		s3Log.Warnf("CopyObject retrying source=%s destination=%s attempt=%d/%d err=%v", param.Source, param.Destination, attempt, s3WriteRetryAttempts, err)
+		time.Sleep(s3WriteRetryDelay(attempt))
+	}
 	if err != nil {
 		s3Log.Warnf("CopyObject %v = %v", params, err)
 		return nil, err
@@ -908,9 +1019,52 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 }
 
 func shouldRetry(err error) bool {
+	if isRetryableTransportError(err) {
+		return true
+	}
+	if awsErr, ok := err.(awserr.Error); ok {
+		switch awsErr.Code() {
+		case "InternalError", "RequestError", "RequestTimeout", "RequestTimeoutException",
+			"ServiceUnavailable", "SlowDown", "Throttling", "ThrottlingException",
+			"TooManyRequestsException":
+			return true
+		}
+		if isRetryableTransportError(awsErr.OrigErr()) {
+			return true
+		}
+	}
 	err = mapAwsError(err)
 	return err != syscall.ENOENT && err != syscall.EINVAL &&
-		err != syscall.EACCES && err != syscall.ENOTSUP && err != syscall.ERANGE
+		err != syscall.EACCES && err != syscall.ENOTSUP && err != syscall.ERANGE &&
+		err != syscall.EBUSY
+}
+
+func (s *S3Backend) recoverCompletedMultipart(key string, expectedSize *uint64, expectedETag *string, startedAt time.Time, cause error) (*HeadBlobOutput, bool) {
+	if expectedSize == nil && expectedETag == nil {
+		return nil, false
+	}
+
+	resp, err := s.HeadBlob(&HeadBlobInput{Key: key})
+	if err != nil {
+		s3Log.Warnf("CompleteMultipartUpload recovery HEAD failed key=%s cause=%v head_err=%v", key, cause, err)
+		return nil, false
+	}
+
+	if expectedSize != nil && resp.Size != *expectedSize {
+		s3Log.Warnf("CompleteMultipartUpload recovery rejected key=%s cause=%v expected_size=%d actual_size=%d", key, cause, *expectedSize, resp.Size)
+		return nil, false
+	}
+	if expectedETag != nil && normalizeETag(resp.ETag) != normalizeETag(expectedETag) {
+		s3Log.Warnf("CompleteMultipartUpload recovery rejected key=%s cause=%v expected_etag=%s actual_etag=%s", key, cause, normalizeETag(expectedETag), normalizeETag(resp.ETag))
+		return nil, false
+	}
+	if expectedETag == nil && resp.LastModified != nil && resp.LastModified.Before(startedAt.Add(-2*time.Minute)) {
+		s3Log.Warnf("CompleteMultipartUpload recovery rejected key=%s cause=%v last_modified=%s started_at=%s", key, cause, resp.LastModified.Format(time.RFC3339Nano), startedAt.Format(time.RFC3339Nano))
+		return nil, false
+	}
+
+	s3Log.Warnf("CompleteMultipartUpload returned error but committed object is visible; treating as success key=%s size=%d etag=%s cause=%v", key, resp.Size, NilStr(resp.ETag), cause)
+	return resp, true
 }
 
 func (s *S3Backend) GetBlob(param *GetBlobInput) (*GetBlobOutput, error) {
@@ -999,9 +1153,28 @@ func (s *S3Backend) PutBlob(param *PutBlobInput) (*PutBlobOutput, error) {
 		put.ACL = &s.config.ACL
 	}
 
-	req, resp := s.PutObjectRequest(put)
-	err := req.Send()
+	var req *request.Request
+	var resp *s3.PutObjectOutput
+	var err error
+	for attempt := 1; attempt <= s3WriteRetryAttempts; attempt++ {
+		if param.Body != nil {
+			if _, seekErr := param.Body.Seek(0, io.SeekStart); seekErr != nil {
+				return nil, seekErr
+			}
+		}
+		req, resp = s.PutObjectRequest(put)
+		err = req.Send()
+		if err == nil {
+			break
+		}
+		if !shouldRetry(err) || attempt == s3WriteRetryAttempts {
+			break
+		}
+		s3Log.Warnf("PutObject retrying key=%s attempt=%d/%d err=%v", param.Key, attempt, s3WriteRetryAttempts, err)
+		time.Sleep(s3WriteRetryDelay(attempt))
+	}
 	if err != nil {
+		s3Log.Warnf("PutObject failed key=%s err=%v", param.Key, err)
 		return nil, err
 	}
 
@@ -1104,9 +1277,26 @@ func (s *S3Backend) MultipartBlobAdd(param *MultipartBlobAddInput) (*MultipartBl
 	}
 	s3Log.Debug(params)
 
-	req, resp := s.UploadPartRequest(&params)
-	err := req.Send()
+	var req *request.Request
+	var resp *s3.UploadPartOutput
+	var err error
+	for attempt := 1; attempt <= s3WriteRetryAttempts; attempt++ {
+		if _, seekErr := param.Body.Seek(0, io.SeekStart); seekErr != nil {
+			return nil, seekErr
+		}
+		req, resp = s.UploadPartRequest(&params)
+		err = req.Send()
+		if err == nil {
+			break
+		}
+		if !shouldRetry(err) || attempt == s3WriteRetryAttempts {
+			break
+		}
+		s3Log.Warnf("UploadPart retrying key=%v part=%d attempt=%d/%d err=%v", NilStr(param.Commit.Key), param.PartNumber, attempt, s3WriteRetryAttempts, err)
+		time.Sleep(s3WriteRetryDelay(attempt))
+	}
 	if err != nil {
+		s3Log.Warnf("UploadPart failed key=%v part=%d err=%v", NilStr(param.Commit.Key), param.PartNumber, err)
 		return nil, err
 	}
 
@@ -1135,9 +1325,23 @@ func (s *S3Backend) MultipartBlobCopy(param *MultipartBlobCopyInput) (*Multipart
 	}
 	s3Log.Debug(params)
 
-	req, resp := s.UploadPartCopyRequest(&params)
-	err := req.Send()
+	var req *request.Request
+	var resp *s3.UploadPartCopyOutput
+	var err error
+	for attempt := 1; attempt <= s3WriteRetryAttempts; attempt++ {
+		req, resp = s.UploadPartCopyRequest(&params)
+		err = req.Send()
+		if err == nil {
+			break
+		}
+		if !shouldRetry(err) || attempt == s3WriteRetryAttempts {
+			break
+		}
+		s3Log.Warnf("UploadPartCopy retrying key=%v part=%d attempt=%d/%d err=%v", NilStr(param.Commit.Key), param.PartNumber, attempt, s3WriteRetryAttempts, err)
+		time.Sleep(s3WriteRetryDelay(attempt))
+	}
 	if err != nil {
+		s3Log.Warnf("UploadPartCopy failed key=%v part=%d err=%v", NilStr(param.Commit.Key), param.PartNumber, err)
 		return nil, err
 	}
 
@@ -1170,9 +1374,33 @@ func (s *S3Backend) MultipartBlobCommit(param *MultipartBlobCommitInput) (*Multi
 
 	s3Log.Debug(mpu)
 
-	req, resp := s.CompleteMultipartUploadRequest(&mpu)
-	err := req.Send()
+	startedAt := time.Now()
+	expectedETag := expectedMultipartETag(param.Parts, param.NumParts)
+	var req *request.Request
+	var resp *s3.CompleteMultipartUploadOutput
+	var err error
+	for attempt := 1; attempt <= s3WriteRetryAttempts; attempt++ {
+		req, resp = s.CompleteMultipartUploadRequest(&mpu)
+		err = req.Send()
+		if err == nil {
+			break
+		}
+		if !shouldRetry(err) || attempt == s3WriteRetryAttempts {
+			break
+		}
+		s3Log.Warnf("CompleteMultipartUpload retrying key=%v attempt=%d/%d err=%v", NilStr(param.Key), attempt, s3WriteRetryAttempts, err)
+		time.Sleep(s3WriteRetryDelay(attempt))
+	}
 	if err != nil {
+		if head, ok := s.recoverCompletedMultipart(NilStr(param.Key), param.Size, expectedETag, startedAt, err); ok {
+			return &MultipartBlobCommitOutput{
+				ETag:         head.ETag,
+				LastModified: head.LastModified,
+				StorageClass: head.StorageClass,
+				RequestId:    head.RequestId,
+			}, nil
+		}
+		s3Log.Warnf("CompleteMultipartUpload failed key=%v err=%v", NilStr(param.Key), err)
 		return nil, err
 	}
 

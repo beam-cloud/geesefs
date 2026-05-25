@@ -177,6 +177,7 @@ type MultipartBlobCommitInput struct {
 	UploadId *string
 	Parts    []*string
 	NumParts uint32
+	Size     *uint64
 
 	// for GCS
 	backendData interface{}

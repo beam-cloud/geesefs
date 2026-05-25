@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -93,6 +94,7 @@ type StagedFile struct {
 	shouldFlush bool
 	flushing    bool
 	debounce    time.Duration
+	cachePath   string
 }
 
 func (stagedFile *StagedFile) ReadyToFlush() bool {
@@ -123,31 +125,60 @@ func (stagedFile *StagedFile) ReadyToFlush() bool {
 }
 
 func (stagedFile *StagedFile) Cleanup() {
-	log.Debugf("Cleaning up staged file: %s", stagedFile.FH.inode.FullName())
-
 	stagedFile.mu.Lock()
+	if stagedFile.FD == nil {
+		stagedFile.flushing = false
+		stagedFile.shouldFlush = false
+		stagedFile.mu.Unlock()
+		return
+	}
+
 	fh := stagedFile.FH
 	fullPath := stagedFile.FD.Name()
+	removePath := stagedFile.cachePath == ""
+	log.Debugf("Cleaning up staged file: %s", fh.inode.FullName())
 	stagedFile.FD.Close()
 	stagedFile.FD = nil
 	stagedFile.flushing = false
 	stagedFile.shouldFlush = false
 	stagedFile.mu.Unlock()
 
-	err := os.RemoveAll(fullPath)
-	if err != nil {
-		log.Warnf("Failed to remove staged file: %v", err)
-	}
-
-	if fh.inode.fs.flags.EventCallback != nil {
-		fh.inode.fs.flags.EventCallback(cfg.EventStagedFileUploaded, map[string]interface{}{
-			"inode": fh.inode.FullName(),
-			"hash":  fh.inode.userMetadata["hash"],
-			"size":  fh.inode.Attributes.Size,
-		})
+	if removePath {
+		err := os.RemoveAll(fullPath)
+		if err != nil {
+			log.Warnf("Failed to remove staged file: %v", err)
+		}
 	}
 
 	log.Debugf("Removed staged file: %s", fh.inode.FullName())
+}
+
+func (stagedFile *StagedFile) Path() (string, bool) {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
+	if stagedFile.FD == nil {
+		return "", false
+	}
+
+	return stagedFile.FD.Name(), true
+}
+
+func (stagedFile *StagedFile) PreserveForCache(path string) {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
+	stagedFile.cachePath = path
+}
+
+func (stagedFile *StagedFile) ResetFlushForRetry() {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
+	if stagedFile.FD != nil {
+		stagedFile.flushing = false
+		stagedFile.shouldFlush = true
+	}
 }
 
 type Inode struct {
@@ -206,6 +237,8 @@ type Inode struct {
 	userMetadataDirty int
 	userMetadata      map[string][]byte
 	s3Metadata        map[string][]byte
+	hashMetadataDirty bool
+	hashMetadataSync  bool
 
 	// last known size and etag from the cloud
 	knownSize uint64
@@ -225,7 +258,42 @@ type Inode struct {
 	hashLock         sync.Mutex
 	hashInProgress   hash.Hash
 	hashOffset       uint64
-	pendingHashParts map[uint64][]byte // key: offset, value: data
+	pendingHashParts map[uint64]*pendingHashPart // key: offset
+}
+
+type pendingHashPart struct {
+	data []byte
+	path string
+	size uint64
+}
+
+func (p *pendingHashPart) writeTo(dst hash.Hash) error {
+	if p == nil {
+		return nil
+	}
+	if p.data != nil {
+		_, err := dst.Write(p.data)
+		return err
+	}
+	f, err := os.Open(p.path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	n, err := io.CopyBuffer(dst, f, make([]byte, READ_BUF_SIZE))
+	if err != nil {
+		return err
+	}
+	if uint64(n) != p.size {
+		return fmt.Errorf("hash part length mismatch for %s: got %d, want %d", p.path, n, p.size)
+	}
+	return nil
+}
+
+func (p *pendingHashPart) cleanup() {
+	if p != nil && p.path != "" {
+		_ = os.Remove(p.path)
+	}
 }
 
 func NewInode(fs *Goofys, parent *Inode, name string) (inode *Inode) {
@@ -382,6 +450,34 @@ func (inode *Inode) FullName() string {
 	} else {
 		return inode.Parent.getChildName(inode.Name)
 	}
+}
+
+func (inode *Inode) cacheHashForLog() string {
+	if inode == nil || inode.fs == nil || inode.fs.flags == nil {
+		return ""
+	}
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
+	if inode.userMetadata == nil {
+		return ""
+	}
+	return string(inode.userMetadata[inode.fs.flags.HashAttr])
+}
+
+func (fs *Goofys) shouldUseExternalCacheFUSEFastPath(inode *Inode) bool {
+	if fs == nil || fs.flags == nil || fs.flags.ExternalCacheClient == nil || fs.flags.HashAttr == "" || inode == nil {
+		return false
+	}
+
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
+
+	if inode.StagedFile != nil || inode.buffers.AnyUnclean() || inode.userMetadata == nil {
+		return false
+	}
+
+	hash := inode.userMetadata[fs.flags.HashAttr]
+	return len(hash) > 0
 }
 
 func (inode *Inode) touch() {
@@ -1114,6 +1210,9 @@ func (inode *Inode) waitForHashToComplete(size uint64) (string, error) {
 	// Clean up
 	defer func() {
 		inode.hashInProgress = nil
+		for _, part := range inode.pendingHashParts {
+			part.cleanup()
+		}
 		inode.pendingHashParts = nil
 	}()
 
@@ -1131,30 +1230,66 @@ func (inode *Inode) waitForHashToComplete(size uint64) (string, error) {
 }
 
 func (inode *Inode) hashFlushedPart(partOffset, partSize uint64, data []byte) error {
+	if uint64(len(data)) != partSize {
+		return fmt.Errorf("hash part length mismatch at offset %d: got %d, want %d", partOffset, len(data), partSize)
+	}
+	return inode.hashFlushedPartSource(partOffset, &pendingHashPart{data: data, size: partSize})
+}
+
+func (inode *Inode) hashFlushedPartFile(partOffset, partSize uint64, path string) error {
+	return inode.hashFlushedPartSource(partOffset, &pendingHashPart{path: path, size: partSize})
+}
+
+func (inode *Inode) hashFlushedPartReader(partOffset, partSize uint64, reader io.ReadSeeker) error {
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return inode.hashFlushedPart(partOffset, partSize, data)
+}
+
+func (inode *Inode) hashFlushedPartSource(partOffset uint64, part *pendingHashPart) error {
 	inode.hashLock.Lock()
 	defer inode.hashLock.Unlock()
 
 	if inode.hashInProgress == nil {
 		inode.hashInProgress = sha256.New()
 		inode.hashOffset = 0
-		inode.pendingHashParts = make(map[uint64][]byte)
+		inode.pendingHashParts = make(map[uint64]*pendingHashPart)
 	}
 
 	if partOffset == inode.hashOffset {
-		inode.hashInProgress.Write(data)
-		inode.hashOffset += uint64(len(data))
+		if err := part.writeTo(inode.hashInProgress); err != nil {
+			part.cleanup()
+			return err
+		}
+		part.cleanup()
+		inode.hashOffset += part.size
 		for {
 			next, ok := inode.pendingHashParts[inode.hashOffset]
 			if !ok {
 				break
 			}
-			inode.hashInProgress.Write(next)
-			inode.hashOffset += uint64(len(next))
-			delete(inode.pendingHashParts, inode.hashOffset-uint64(len(next)))
+			offset := inode.hashOffset
+			if err := next.writeTo(inode.hashInProgress); err != nil {
+				return err
+			}
+			next.cleanup()
+			inode.hashOffset += next.size
+			delete(inode.pendingHashParts, offset)
 		}
 	} else {
 		// out of order, buffer part until the next caller aligns with this offset
-		inode.pendingHashParts[partOffset] = data
+		if old := inode.pendingHashParts[partOffset]; old != nil {
+			old.cleanup()
+		}
+		inode.pendingHashParts[partOffset] = part
 	}
 
 	return nil
