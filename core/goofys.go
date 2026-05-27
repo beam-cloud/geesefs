@@ -144,9 +144,10 @@ type Goofys struct {
 
 	NotifyCallback func(notifications []interface{})
 
-	cacheEventChan  chan cacheEvent
-	cachingStatus   map[string]bool
-	cachingStatusMu sync.Mutex
+	cacheEventChan    chan cacheEvent
+	cachingStatus     map[string]bool
+	cachingStatusMu   sync.Mutex
+	activeCacheEvents int64
 
 	externalPageMmapCache   *externalPageMmapCache
 	externalPageMmapCacheMu sync.Mutex
@@ -486,6 +487,8 @@ func (fs *Goofys) processCacheEvents() {
 
 func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 	started := time.Now()
+	atomic.AddInt64(&fs.activeCacheEvents, 1)
+	defer atomic.AddInt64(&fs.activeCacheEvents, -1)
 	atomic.AddInt64(&fs.stats.cacheEventsStarted, 1)
 	atomic.AddInt64(&fs.stats.cacheEventsBytes, int64(cacheEvent.size))
 	source := "s3"
@@ -1907,6 +1910,15 @@ func (fs *Goofys) WaitForFlush() {
 		select {
 		case <-timeoutTimer.C:
 			log.Warnf("Flush did not complete within timeout of %v", timeout)
+			return
+		case <-time.After(1 * time.Second):
+		}
+	}
+
+	for len(fs.cacheEventChan) > 0 || atomic.LoadInt64(&fs.activeCacheEvents) > 0 {
+		select {
+		case <-timeoutTimer.C:
+			log.Warnf("External cache publish did not complete within timeout of %v", timeout)
 			return
 		case <-time.After(1 * time.Second):
 		}

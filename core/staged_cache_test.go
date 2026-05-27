@@ -1015,6 +1015,58 @@ func TestDeferredHashMetadataPublishParticipatesInFlushAccounting(t *testing.T) 
 	}
 }
 
+func TestWaitForFlushWaitsForExternalCachePublish(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.StagedWriteFlushTimeout = time.Second
+	started := make(chan struct{})
+	release := make(chan struct{})
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeLocalPath: func(source struct {
+			Path      string
+			CachePath string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			close(started)
+			<-release
+			return opts.RoutingKey, nil
+		},
+	}
+
+	fs := newUnitFS(flags)
+	go fs.processCacheEvents()
+	defer close(fs.shutdownCh)
+
+	fs.cacheEventChan <- cacheEvent{path: "file", hash: "hash", size: 1, localSourcePath: "/tmp/file"}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for cache publish to start")
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		fs.WaitForFlush()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		t.Fatal("WaitForFlush returned before external cache publish completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for WaitForFlush")
+	}
+}
+
 func BenchmarkExternalCacheLargeOutput(b *testing.B) {
 	for _, size := range []int64{10 << 20, 100 << 20, 1 << 30} {
 		size := size
