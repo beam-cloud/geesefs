@@ -1445,6 +1445,9 @@ func (inode *Inode) sendHashUpdateMeta() {
 
 	inode.hashMetadataDirty = false
 	inode.hashMetadataSync = true
+	inode.IsFlushing += inode.fs.flags.MaxParallelParts
+	atomic.AddInt64(&inode.fs.stats.flushes, 1)
+	atomic.AddInt64(&inode.fs.activeFlushers, 1)
 	copyIn := &CopyBlobInput{
 		Source:      key,
 		Destination: key,
@@ -1458,7 +1461,12 @@ func (inode *Inode) sendHashUpdateMeta() {
 		_, err := cloud.CopyBlob(copyIn)
 		inode.fs.completeInflightChange(key)
 		inode.mu.Lock()
-		defer inode.mu.Unlock()
+		defer func() {
+			inode.IsFlushing -= inode.fs.flags.MaxParallelParts
+			atomic.AddInt64(&inode.fs.activeFlushers, -1)
+			inode.fs.WakeupFlusher()
+			inode.mu.Unlock()
+		}()
 
 		inode.hashMetadataSync = false
 		if err != nil {
@@ -1467,7 +1475,6 @@ func (inode *Inode) sendHashUpdateMeta() {
 				s3Log.Warnf("Deferred hash metadata publish lost compare-and-swap for %v, invalidating local cached metadata: %v", key, err)
 				inode.hashMetadataDirty = false
 				inode.resetCache()
-				inode.fs.WakeupFlusher()
 				return
 			}
 			inode.hashMetadataDirty = true
@@ -1477,7 +1484,6 @@ func (inode *Inode) sendHashUpdateMeta() {
 		}
 
 		log.Debugf("Deferred hash metadata publish complete for %v", key)
-		inode.fs.WakeupFlusher()
 	}()
 }
 

@@ -1822,11 +1822,10 @@ func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key, localPath st
 
 func (fs *Goofys) WaitForFlush() {
 	timeout := fs.flags.StagedWriteFlushTimeout
+	timeoutTimer := time.NewTimer(timeout)
+	defer timeoutTimer.Stop()
 
 	if fs.flags.StagedWriteModeEnabled {
-		timeoutTimer := time.NewTimer(timeout)
-		defer timeoutTimer.Stop()
-
 		for {
 			hasStaged := false
 			startedFlush := false
@@ -1875,6 +1874,15 @@ func (fs *Goofys) WaitForFlush() {
 			case <-time.After(1 * time.Second):
 				// Continue waiting
 			}
+		}
+	}
+
+	for atomic.LoadInt64(&fs.activeFlushers) > 0 {
+		select {
+		case <-timeoutTimer.C:
+			log.Warnf("Flush did not complete within timeout of %v", timeout)
+			return
+		case <-time.After(1 * time.Second):
 		}
 	}
 }

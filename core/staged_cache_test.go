@@ -945,6 +945,70 @@ func TestDeferredHashMetadataPublishCASFailureInvalidatesLocalView(t *testing.T)
 	}
 }
 
+func TestDeferredHashMetadataPublishParticipatesInFlushAccounting(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = "sha256"
+	flags.StagedWriteFlushTimeout = time.Second
+
+	fs := newUnitFS(flags)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	backend := &TestBackend{
+		CopyBlobFunc: func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+			close(started)
+			<-release
+			return &CopyBlobOutput{}, nil
+		},
+	}
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "file")
+	inode.Id = 2
+	inode.SetCacheState(ST_CACHED)
+	inode.Attributes.Size = 5
+	inode.knownSize = 5
+	inode.knownETag = "etag"
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	inode.hashMetadataDirty = true
+
+	inode.mu.Lock()
+	inode.sendHashUpdateMeta()
+	inode.mu.Unlock()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for hash metadata publish")
+	}
+
+	if got := atomic.LoadInt64(&fs.activeFlushers); got != 1 {
+		t.Fatalf("expected deferred hash metadata publish to count as active flusher, got %d", got)
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		fs.WaitForFlush()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		t.Fatal("WaitForFlush returned before deferred hash metadata publish completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for WaitForFlush")
+	}
+
+	if got := atomic.LoadInt64(&fs.activeFlushers); got != 0 {
+		t.Fatalf("expected active flusher count to drain, got %d", got)
+	}
+}
+
 func BenchmarkExternalCacheLargeOutput(b *testing.B) {
 	for _, size := range []int64{10 << 20, 100 << 20, 1 << 30} {
 		size := size
