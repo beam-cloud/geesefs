@@ -27,9 +27,15 @@ const CGROUP_PATH = "/proc/self/cgroup"
 const CGROUP_FOLDER_PREFIX = "/sys/fs/cgroup/memory"
 const MEM_LIMIT_FILE_SUFFIX = "/memory.limit_in_bytes"
 const MEM_USAGE_FILE_SUFFIX = "/memory.usage_in_bytes"
+const CGROUP_V2_PATH = "/sys/fs/cgroup"
+const CGROUP_V2_MEM_LIMIT_FILE = "memory.max"
+const CGROUP_V2_MEM_USAGE_FILE = "memory.current"
 
 func getCgroupAvailableMem() (retVal uint64, err error) {
 	// get the memory cgroup for self and send limit - usage for the cgroup
+	if available, err := getCgroupV2AvailableMem(); err == nil && available > 0 {
+		return available, nil
+	}
 
 	data, err := ioutil.ReadFile(CGROUP_PATH)
 	if err != nil {
@@ -44,7 +50,7 @@ func getCgroupAvailableMem() (retVal uint64, err error) {
 
 	// newer version of docker mounts the cgroup memory limit/usage files directly under
 	// /sys/fs/cgroup/memory/ rather than /sys/fs/cgroup/memory/docker/$container_id/
-	if _, err := os.Stat(filepath.Join(CGROUP_FOLDER_PREFIX, path)); os.IsExist(err) {
+	if _, err := os.Stat(filepath.Join(CGROUP_FOLDER_PREFIX, path)); err == nil {
 		path = filepath.Join(CGROUP_FOLDER_PREFIX, path)
 	} else {
 		path = filepath.Join(CGROUP_FOLDER_PREFIX)
@@ -63,6 +69,37 @@ func getCgroupAvailableMem() (retVal uint64, err error) {
 	}
 
 	return (mem_limit - mem_usage), nil
+}
+
+func getCgroupV2AvailableMem() (uint64, error) {
+	limit, err := readCgroupV2Limit(filepath.Join(CGROUP_V2_PATH, CGROUP_V2_MEM_LIMIT_FILE))
+	if err != nil || limit == 0 {
+		return 0, err
+	}
+
+	usage, err := readFileAndGetValue(filepath.Join(CGROUP_V2_PATH, CGROUP_V2_MEM_USAGE_FILE))
+	if err != nil {
+		log.Debugf("Unable to get memory usage from cgroup v2 file %v error: %v", CGROUP_V2_PATH, err)
+		return 0, err
+	}
+	if usage >= limit {
+		return 0, nil
+	}
+	return limit - usage, nil
+}
+
+func readCgroupV2Limit(path string) (uint64, error) {
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		log.Debugf("Unable to read file %v error: %v", path, err)
+		return 0, err
+	}
+
+	text := strings.TrimSpace(string(data))
+	if text == "" || text == "max" {
+		return 0, nil
+	}
+	return strconv.ParseUint(text, 10, 64)
 }
 
 func getMemoryCgroupPath(data string) (string, error) {

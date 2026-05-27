@@ -829,6 +829,12 @@ func TestCacheThroughFromFlushedBuffersUsesLocalBytes(t *testing.T) {
 	if got := atomic.LoadInt64(&fs.stats.cacheEventsSuccess); got != 1 {
 		t.Fatalf("expected one successful cache event, got %d", got)
 	}
+	if fs.cachingStatus[expectedHash] {
+		t.Fatal("expected cache-through reservation to be cleared after success")
+	}
+	if _, _, err := inode.buffers.GetData(0, uint64(len(payload)), true); !errors.Is(err, ErrBufferIsMissing) {
+		t.Fatalf("expected flushed cache-through buffers to be released, got err=%v", err)
+	}
 }
 
 func TestDeferredHashMetadataPublishFailureDoesNotPoisonFlush(t *testing.T) {

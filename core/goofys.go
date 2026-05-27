@@ -660,6 +660,7 @@ func (fs *Goofys) CacheFileInExternalCacheFromBuffersLocked(inode *Inode) bool {
 	if !fs.reserveExternalCacheStore(inode, hashString) {
 		return false
 	}
+	defer fs.clearCachingStatus(hashString)
 
 	path := inode.FullName()
 	size := inode.Attributes.Size
@@ -765,34 +766,59 @@ func (inode *Inode) validateCacheThroughSourceLocked(path, hash string, size uin
 
 func (inode *Inode) copyCacheThroughChunk(path, hash string, totalSize, offset, size uint64) ([]byte, error) {
 	inode.mu.Lock()
-	defer inode.mu.Unlock()
 
 	if err := inode.validateCacheThroughSourceLocked(path, hash, totalSize); err != nil {
+		inode.mu.Unlock()
 		return nil, err
 	}
 	inode.LockRange(offset, size, false)
-	defer inode.UnlockRange(offset, size, false)
 
 	if err := inode.loadDiskBackedBuffers(offset, size); err != nil {
+		inode.UnlockRange(offset, size, false)
+		inode.mu.Unlock()
 		return nil, err
 	}
 	if err := inode.validateCacheThroughSourceLocked(path, hash, totalSize); err != nil {
+		inode.UnlockRange(offset, size, false)
+		inode.mu.Unlock()
 		return nil, err
 	}
 
 	reader, _, err := inode.getMultiReader(offset, size)
 	if err != nil {
+		inode.UnlockRange(offset, size, false)
+		inode.mu.Unlock()
 		return nil, err
 	}
 	chunk := make([]byte, int(size))
 	n, err := io.ReadFull(reader, chunk)
 	if err != nil {
+		inode.UnlockRange(offset, size, false)
+		inode.mu.Unlock()
 		return nil, err
 	}
 	if n != len(chunk) {
+		inode.UnlockRange(offset, size, false)
+		inode.mu.Unlock()
 		return nil, fmt.Errorf("short cache-through buffer read: path=%q offset=%d size=%d read=%d", path, offset, size, n)
 	}
+	inode.UnlockRange(offset, size, false)
+	freed := inode.dropCacheThroughChunkBuffersLocked(offset, size)
+	inode.mu.Unlock()
+	if freed != 0 {
+		inode.fs.bufferPool.Use(freed, true)
+	}
 	return chunk, nil
+}
+
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) dropCacheThroughChunkBuffersLocked(offset, size uint64) int64 {
+	return inode.buffers.RemoveRange(offset, size, func(b *FileBuffer) bool {
+		if b.loading.Load() || inode.IsRangeLocked(b.offset, b.length, false) {
+			return false
+		}
+		return b.state == BUF_CLEAN || b.state == BUF_FLUSHED_FULL || b.state == BUF_FLUSHED_CUT
+	})
 }
 
 func (fs *Goofys) storeContentFromLocalFile(event cacheEvent) (string, error) {
