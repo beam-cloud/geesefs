@@ -34,9 +34,10 @@ import (
 )
 
 const (
-	externalPageMmapWindowBytes = 64 * 1024 * 1024
-	externalPageMmapMaxBytes    = 2 * 1024 * 1024 * 1024
-	externalPagePrefetchWindows = 16
+	externalPageMmapWindowBytes       = 64 * 1024 * 1024
+	externalPageMmapMaxBytes          = 2 * 1024 * 1024 * 1024
+	externalPagePrefetchWindows       = 4
+	externalPagePrefetchMaxConcurrent = 4
 )
 
 type externalPageMmapEntry struct {
@@ -68,6 +69,7 @@ type externalPageMmapCache struct {
 	regions     []externalPageCachedRegion
 	lru         *list.List
 	prefetching map[string]struct{}
+	prefetchSem chan struct{}
 	mappedBytes int64
 	maxBytes    int64
 	closed      bool
@@ -167,9 +169,6 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	}
 
 	windowSize := size
-	if sequential && windowSize < externalPageMmapWindowBytes {
-		windowSize = externalPageMmapWindowBytes
-	}
 	if offset+windowSize > fileSize {
 		windowSize = fileSize - offset
 	}
@@ -347,6 +346,7 @@ func newExternalPageMmapCache(maxBytes int64) *externalPageMmapCache {
 		regions:     make([]externalPageCachedRegion, 0, 128),
 		lru:         list.New(),
 		prefetching: make(map[string]struct{}),
+		prefetchSem: make(chan struct{}, externalPagePrefetchMaxConcurrent),
 		maxBytes:    maxBytes,
 	}
 }
@@ -437,8 +437,18 @@ func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fi
 	c.prefetching[prefetchKey] = struct{}{}
 	c.mu.Unlock()
 
+	select {
+	case c.prefetchSem <- struct{}{}:
+	default:
+		c.mu.Lock()
+		delete(c.prefetching, prefetchKey)
+		c.mu.Unlock()
+		return
+	}
+
 	go func() {
 		defer func() {
+			<-c.prefetchSem
 			c.mu.Lock()
 			delete(c.prefetching, prefetchKey)
 			c.mu.Unlock()

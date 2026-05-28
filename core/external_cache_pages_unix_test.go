@@ -63,21 +63,27 @@ func TestExternalCacheClientLocalPageFileViewReadUsesMmap(t *testing.T) {
 	}
 }
 
-func TestExternalCacheClientLocalPageFileViewReadUsesOpenHandleWindow(t *testing.T) {
+func TestExternalCacheClientLocalPageFileViewReadUsesForegroundRange(t *testing.T) {
 	pagePath := filepath.Join(t.TempDir(), "page")
 	if err := os.WriteFile(pagePath, []byte("abcdef"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	calls := 0
+	var calls []struct {
+		offset int64
+		length int64
+	}
 	flags := cfg.DefaultFlags()
 	flags.ExternalCacheClient = &fakeContentCache{
 		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
-			calls++
-			if hash != "hash" || opts.RoutingKey != "hash" || offset != 0 || length != 6 {
+			calls = append(calls, struct {
+				offset int64
+				length int64
+			}{offset: offset, length: length})
+			if hash != "hash" || opts.RoutingKey != "hash" || length != 3 {
 				t.Fatalf("unexpected client-local page-file request: hash=%q routing=%q offset=%d length=%d", hash, opts.RoutingKey, offset, length)
 			}
-			return []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: 0, Length: 6}}, nil
+			return []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: offset, Length: int(length)}}, nil
 		},
 	}
 	fs := newUnitFS(flags)
@@ -114,8 +120,11 @@ func TestExternalCacheClientLocalPageFileViewReadUsesOpenHandleWindow(t *testing
 	if cleanup != nil {
 		cleanup()
 	}
-	if calls != 1 {
-		t.Fatalf("expected one client-local page-file lookup, got %d", calls)
+	if len(calls) != 2 {
+		t.Fatalf("expected two foreground client-local page-file lookups, got %d", len(calls))
+	}
+	if calls[0].offset != 0 || calls[0].length != 3 || calls[1].offset != 3 || calls[1].length != 3 {
+		t.Fatalf("unexpected foreground page-file lookups: %+v", calls)
 	}
 }
 
