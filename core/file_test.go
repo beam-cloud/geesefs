@@ -7,6 +7,7 @@ import (
 )
 
 func TestShouldRetrieveHash(t *testing.T) {
+	hashAttr := cfg.DefaultFlags().HashAttr
 	tests := []struct {
 		name     string
 		fileSize int64
@@ -29,11 +30,18 @@ func TestShouldRetrieveHash(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "Has metadata",
+			name:     "Has hash metadata",
 			fileSize: 10 * 1024 * 1024, // 10 MB
 			isDir:    false,
-			metadata: map[string]string{"content-sha256": "abc123"},
+			metadata: map[string]string{hashAttr: "abc123"},
 			expected: false,
+		},
+		{
+			name:     "Has metadata but missing hash",
+			fileSize: 10 * 1024 * 1024, // 10 MB
+			isDir:    false,
+			metadata: map[string]string{"content-type": "application/zip"},
+			expected: true,
 		},
 		{
 			name:     "Is directory",
@@ -75,5 +83,22 @@ func TestShouldRetrieveHash(t *testing.T) {
 				t.Errorf("shouldRetrieveHash() = %v, want %v", got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestShouldRetrieveHashDoesNotRepeatSuccessfulHeadWithoutHash(t *testing.T) {
+	fh := &FileHandle{
+		inode: &Inode{
+			Attributes:          InodeAttributes{Size: 10 * 1024 * 1024},
+			userMetadata:        map[string][]byte{"content-type": []byte("application/zip")},
+			hashMetadataChecked: true,
+			fs: &Goofys{
+				flags: cfg.DefaultFlags(),
+			},
+		},
+	}
+
+	if got := fh.shouldRetrieveHash(); got {
+		t.Errorf("shouldRetrieveHash() = %v, want false after successful metadata check", got)
 	}
 }

@@ -868,11 +868,10 @@ func (fh *FileHandle) getReadAhead() uint64 {
 // from the server -- this costs an extra HEAD request, so we only do it for
 // large files where the hash is not already present in user metadata.
 func (fh *FileHandle) shouldRetrieveHash() bool {
-	if fh.inode.userMetadata != nil {
-		return false
-	}
+	fh.inode.mu.Lock()
+	defer fh.inode.mu.Unlock()
 
-	if fh.inode.StagedFile != nil {
+	if fh.inode.fs.flags.HashAttr == "" || fh.inode.StagedFile != nil {
 		return false
 	}
 
@@ -884,7 +883,11 @@ func (fh *FileHandle) shouldRetrieveHash() bool {
 		return false
 	}
 
-	return true
+	if fh.inode.userMetadata != nil && len(fh.inode.userMetadata[fh.inode.fs.flags.HashAttr]) > 0 {
+		return false
+	}
+
+	return !fh.inode.hashMetadataChecked
 }
 
 func (fh *FileHandle) retrieveHashMetadata() {
@@ -895,6 +898,7 @@ func (fh *FileHandle) retrieveHashMetadata() {
 	if err == nil {
 		fh.inode.mu.Lock()
 		fh.inode.setMetadata(head.Metadata)
+		fh.inode.hashMetadataChecked = true
 		fh.inode.mu.Unlock()
 	} else {
 		log.Errorf("Error getting head blob: %v", err)

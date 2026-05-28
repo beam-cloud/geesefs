@@ -474,6 +474,23 @@ func (fs *GoofysFuse) OpenFile(
 	return
 }
 
+func (fs *GoofysFuse) Poll(
+	ctx context.Context,
+	op *fuseops.PollOp) (err error) {
+
+	fs.mu.RLock()
+	fh := fs.fileHandles[op.Handle]
+	fs.mu.RUnlock()
+	if fh == nil {
+		return syscall.EBADF
+	}
+
+	// Regular object-backed files are always ready for non-blocking reads and
+	// writes. geesefs does not generate deferred poll wakeups.
+	op.Revents = op.Events
+	return nil
+}
+
 func (fs *GoofysFuse) ReadFile(
 	ctx context.Context,
 	op *fuseops.ReadFileOp) (err error) {

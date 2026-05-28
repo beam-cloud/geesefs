@@ -234,11 +234,12 @@ type Inode struct {
 	// multipart upload state
 	mpu *MultipartBlobCommitInput
 
-	userMetadataDirty int
-	userMetadata      map[string][]byte
-	s3Metadata        map[string][]byte
-	hashMetadataDirty bool
-	hashMetadataSync  bool
+	userMetadataDirty   int
+	userMetadata        map[string][]byte
+	s3Metadata          map[string][]byte
+	hashMetadataChecked bool
+	hashMetadataDirty   bool
+	hashMetadataSync    bool
 
 	// last known size and etag from the cloud
 	knownSize uint64
