@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -44,6 +45,7 @@ type fakeContentCache struct {
 		Lock       bool
 	}) (string, error)
 	clientLocalPageFileViews func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error)
+	readContentInto          func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error)
 }
 
 func (c *fakeContentCache) GetContent(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]byte, error) {
@@ -108,6 +110,13 @@ func (c *fakeContentCache) ClientLocalPageFileViews(hash string, offset int64, l
 		return c.clientLocalPageFileViews(hash, offset, length, opts)
 	}
 	return nil, errContentNotFound
+}
+
+func (c *fakeContentCache) ReadContentInto(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+	if c.readContentInto != nil {
+		return c.readContentInto(ctx, hash, offset, dst, opts)
+	}
+	return 0, errContentNotFound
 }
 
 func newUnitFS(flags *cfg.FlagStorage) *Goofys {

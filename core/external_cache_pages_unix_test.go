@@ -19,9 +19,11 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/yandex-cloud/geesefs/core/cfg"
 )
@@ -125,6 +127,74 @@ func TestExternalCacheClientLocalPageFileViewReadUsesForegroundRange(t *testing.
 	}
 	if calls[0].offset != 0 || calls[0].length != 6 {
 		t.Fatalf("unexpected foreground page-file lookups: %+v", calls)
+	}
+}
+
+func TestExternalCachePageFileMissQueuesReadThrough(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			if hash != "hash" || opts.RoutingKey != "hash" {
+				t.Fatalf("unexpected client-local page-file request: hash=%q routing=%q", hash, opts.RoutingKey)
+			}
+			return nil, errContentNotFound
+		},
+	}
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = 4
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	fh := NewFileHandle(inode)
+
+	_, _, _, ok, err := fh.tryReadExternalCachePages(0, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected page-file miss")
+	}
+
+	select {
+	case event := <-fs.cacheEventChan:
+		if event.hash != "hash" || event.path != "file" {
+			t.Fatalf("unexpected cache event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected read-through cache event")
+	}
+}
+
+func TestExternalCacheReadIntoMissQueuesReadThrough(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = &fakeContentCache{
+		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			if hash != "hash" || opts.RoutingKey != "hash" || offset != 0 || len(dst) != 4 {
+				t.Fatalf("unexpected read-into request: hash=%q routing=%q offset=%d len=%d", hash, opts.RoutingKey, offset, len(dst))
+			}
+			return 0, errContentNotFound
+		},
+	}
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = 4
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	fh := NewFileHandle(inode)
+
+	_, _, _, ok, err := fh.tryReadExternalCacheInto("file", "hash", 0, 4, 4, false, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected read-into miss")
+	}
+
+	select {
+	case event := <-fs.cacheEventChan:
+		if event.hash != "hash" || event.path != "file" {
+			t.Fatalf("unexpected cache event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected read-through cache event")
 	}
 }
 
