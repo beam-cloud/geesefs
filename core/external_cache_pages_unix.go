@@ -124,7 +124,6 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	if !ok || pageCache == nil {
 		return nil, 0, nil, false, nil
 	}
-	atomic.AddInt64(&fh.inode.fs.stats.externalPageAttempts, 1)
 	started := time.Now()
 	path := fh.inode.FullName()
 
@@ -136,13 +135,17 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	}
 	if offset >= fileSize {
 		fh.inode.mu.Unlock()
-		fh.recordExternalPageMiss(path, hash, offset, size, "offset_past_eof", started, nil)
-		return nil, 0, nil, false, nil
+		return nil, 0, nil, true, nil
 	}
 	if offset+size > fileSize {
 		size = fileSize - offset
 	}
-	if size == 0 || fh.inode.StagedFile != nil || fh.inode.buffers.AnyUnclean() {
+	if size == 0 {
+		fh.inode.mu.Unlock()
+		return nil, 0, nil, true, nil
+	}
+	atomic.AddInt64(&fh.inode.fs.stats.externalPageAttempts, 1)
+	if fh.inode.StagedFile != nil || fh.inode.buffers.AnyUnclean() {
 		fh.inode.mu.Unlock()
 		fh.recordExternalPageMiss(path, "", offset, size, "not_cacheable_state", started, nil)
 		return nil, 0, nil, false, nil

@@ -22,6 +22,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -189,6 +190,42 @@ func TestExternalCacheReadIntoMissDoesNotQueueWholeObjectS3ReadThrough(t *testin
 	case event := <-fs.cacheEventChan:
 		t.Fatalf("unexpected cache event before foreground EOF: %+v", event)
 	default:
+	}
+}
+
+func TestExternalCacheClientLocalPageFileViewEOFDoesNotCountAsMiss(t *testing.T) {
+	var calls int64
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			atomic.AddInt64(&calls, 1)
+			return nil, errContentNotFound
+		},
+	}
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = 4
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	fh := NewFileHandle(inode)
+
+	data, bytesRead, cleanup, ok, err := fh.tryReadExternalCachePages(4, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected EOF to be handled without falling back to cloud")
+	}
+	if data != nil || bytesRead != 0 || cleanup != nil {
+		t.Fatalf("unexpected EOF read result: data=%v bytes=%d cleanup_present=%t", data, bytesRead, cleanup != nil)
+	}
+	if got := atomic.LoadInt64(&calls); got != 0 {
+		t.Fatalf("expected no cache client lookup beyond EOF, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalPageAttempts); got != 0 {
+		t.Fatalf("expected EOF not to count as page attempt, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalPageMisses); got != 0 {
+		t.Fatalf("expected EOF not to count as page miss, got %d", got)
 	}
 }
 
