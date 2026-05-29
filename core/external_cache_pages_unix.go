@@ -44,6 +44,7 @@ type externalPageMmapEntry struct {
 	key  string
 	data []byte
 	refs int
+	mmap bool
 	elem *list.Element
 }
 
@@ -121,7 +122,11 @@ func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]
 
 func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]byte, bytesRead int, callback func(), ok bool, err error) {
 	pageCache, ok := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
-	if !ok || pageCache == nil {
+	if !ok {
+		pageCache = nil
+	}
+	readIntoCache, _ := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheReadInto)
+	if pageCache == nil && readIntoCache == nil {
 		return nil, 0, nil, false, nil
 	}
 	started := time.Now()
@@ -165,7 +170,7 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 		hitCount := atomic.AddInt64(&fh.inode.fs.stats.externalPageHits, 1)
 		atomic.AddInt64(&fh.inode.fs.stats.externalPageBytes, int64(size))
 		if sequential {
-			fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache)
+			fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
 		}
 		fh.logExternalPageHit(path, hash, offset, size, 0, "mmap_cache", started, time.Time{}, hitCount)
 		return data, int(size), callback, true, nil
@@ -181,6 +186,10 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
 	}
 	windowSize := windowEnd - windowOffset
+
+	if pageCache == nil {
+		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+	}
 
 	views, err := pageCache.ClientLocalPageFileViews(hash, int64(windowOffset), int64(windowSize), struct{ RoutingKey string }{RoutingKey: hash})
 	lookupElapsed := time.Since(started)
@@ -225,7 +234,7 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	hitCount := atomic.AddInt64(&fh.inode.fs.stats.externalPageHits, 1)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageBytes, int64(size))
 	if sequential {
-		fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache)
+		fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
 	}
 	fh.logExternalPageHit(path, hash, offset, size, len(views), "client_local_page_file", started, mmapStarted, hitCount)
 	return data, int(size), callback, true, nil
@@ -233,7 +242,11 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 
 func (fh *FileHandle) prefetchExternalCachePagesOnOpen() {
 	pageCache, ok := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
-	if !ok || pageCache == nil {
+	if !ok {
+		pageCache = nil
+	}
+	readIntoCache, _ := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheReadInto)
+	if pageCache == nil && readIntoCache == nil {
 		return
 	}
 
@@ -249,11 +262,11 @@ func (fh *FileHandle) prefetchExternalCachePagesOnOpen() {
 		return
 	}
 
-	fh.scheduleExternalPagePrefetch(hash, 0, fileSize, pageCache)
+	fh.scheduleExternalPagePrefetch(hash, 0, fileSize, pageCache, readIntoCache)
 }
 
-func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews) {
-	if hash == "" || pageCache == nil || start >= fileSize {
+func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto) {
+	if hash == "" || (pageCache == nil && readIntoCache == nil) || start >= fileSize {
 		return
 	}
 
@@ -277,7 +290,7 @@ func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize 
 		if next+windowSize > fileSize {
 			windowSize = fileSize - next
 		}
-		if !cache.prefetchWindow(hash, next, windowSize, fileSize, pageCache) {
+		if !cache.prefetchWindow(hash, next, windowSize, fileSize, pageCache, readIntoCache) {
 			return
 		}
 		next += windowSize
@@ -326,10 +339,12 @@ func (fh *FileHandle) tryReadExternalCacheInto(path, hash string, offset, size, 
 
 	if sequential {
 		pageCache, ok := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
-		if ok {
-			fh.scheduleExternalPagePrefetch(hash, offset, fileSize, pageCache)
-			fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache)
+		if !ok {
+			pageCache = nil
 		}
+		readIntoCache, _ := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheReadInto)
+		fh.scheduleExternalPagePrefetch(hash, offset, fileSize, pageCache, readIntoCache)
+		fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
 	}
 
 	released := int32(0)
@@ -471,8 +486,8 @@ func (c *externalPageMmapCache) lookup(cacheKey string, offset, size uint64) (da
 	return data, callback, true
 }
 
-func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews) bool {
-	if cacheKey == "" || pageCache == nil || size == 0 || offset >= fileSize {
+func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto) bool {
+	if cacheKey == "" || (pageCache == nil && readIntoCache == nil) || size == 0 || offset >= fileSize {
 		return true
 	}
 	if offset+size > fileSize {
@@ -510,11 +525,32 @@ func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fi
 			c.mu.Unlock()
 		}()
 
-		views, err := pageCache.ClientLocalPageFileViews(cacheKey, int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: cacheKey})
-		if err != nil || len(views) == 0 {
+		if pageCache != nil {
+			views, err := pageCache.ClientLocalPageFileViews(cacheKey, int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: cacheKey})
+			if err == nil && len(views) > 0 {
+				if err := c.insertWindow(cacheKey, offset, views); err != nil {
+					return
+				}
+				if data, cleanup, ok := c.lookup(cacheKey, offset, size); ok {
+					for _, segment := range data {
+						prefaultMappedContentCache(segment)
+					}
+					if cleanup != nil {
+						cleanup()
+					}
+				}
+				return
+			}
+		}
+		if readIntoCache == nil || size > uint64(int(^uint(0)>>1)) {
 			return
 		}
-		if err := c.insertWindow(cacheKey, offset, views); err != nil {
+		buf := make([]byte, int(size))
+		n, err := readIntoCache.ReadContentInto(context.Background(), cacheKey, int64(offset), buf, struct{ RoutingKey string }{RoutingKey: cacheKey})
+		if err != nil || n != int64(size) {
+			return
+		}
+		if err := c.insertBytesWindow(cacheKey, offset, buf[:n]); err != nil {
 			return
 		}
 		if data, cleanup, ok := c.lookup(cacheKey, offset, size); ok {
@@ -610,6 +646,45 @@ func (c *externalPageMmapCache) insertWindow(cacheKey string, offset uint64, vie
 	return nil
 }
 
+func (c *externalPageMmapCache) insertBytesWindow(cacheKey string, offset uint64, data []byte) error {
+	if cacheKey == "" || len(data) == 0 {
+		return syscall.EINVAL
+	}
+	end := offset + uint64(len(data))
+	entryKey := fmt.Sprintf("readinto:%s:%d:%d", cacheKey, offset, end)
+
+	entry := &externalPageMmapEntry{key: entryKey, data: data, refs: 1}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return syscall.EBADF
+	}
+	if old := c.entries[entryKey]; old != nil {
+		c.removeEntryLocked(old)
+	}
+	entry.elem = c.lru.PushBack(entry)
+	c.entries[entryKey] = entry
+	c.mappedBytes += int64(len(data))
+	c.removeRegionsLocked(cacheKey, offset, end)
+	c.regions = append(c.regions, externalPageCachedRegion{
+		cacheKey:  cacheKey,
+		fileStart: offset,
+		fileEnd:   end,
+		mapOffset: 0,
+		entry:     entry,
+	})
+	sort.Slice(c.regions, func(i, j int) bool {
+		if c.regions[i].cacheKey != c.regions[j].cacheKey {
+			return c.regions[i].cacheKey < c.regions[j].cacheKey
+		}
+		return c.regions[i].fileStart < c.regions[j].fileStart
+	})
+	c.releaseLocked([]*externalPageMmapEntry{entry})
+	c.evictLocked()
+	return nil
+}
+
 func mappedEntries(regions []externalPageMappedRegion) []*externalPageMmapEntry {
 	entries := make([]*externalPageMmapEntry, 0, len(regions))
 	for _, region := range regions {
@@ -669,7 +744,7 @@ func (c *externalPageMmapCache) getOrMap(path string) (*externalPageMmapEntry, e
 		return entry, nil
 	}
 
-	entry := &externalPageMmapEntry{key: path, data: mapped, refs: 1}
+	entry := &externalPageMmapEntry{key: path, data: mapped, refs: 1, mmap: true}
 	entry.elem = c.lru.PushBack(entry)
 	c.entries[path] = entry
 	c.mappedBytes += int64(len(mapped))
@@ -755,7 +830,9 @@ func (c *externalPageMmapCache) removeEntryLocked(entry *externalPageMmapEntry) 
 		}
 	}
 	c.regions = dst
-	_ = unix.Munmap(entry.data)
+	if entry.mmap {
+		_ = unix.Munmap(entry.data)
+	}
 	entry.data = nil
 }
 
@@ -778,7 +855,7 @@ func (c *externalPageMmapCache) close() {
 	c.mu.Unlock()
 
 	for _, entry := range entries {
-		if entry.data != nil {
+		if entry.mmap && entry.data != nil {
 			_ = unix.Munmap(entry.data)
 		}
 	}

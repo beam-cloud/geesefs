@@ -193,6 +193,49 @@ func TestExternalCacheReadIntoMissDoesNotQueueWholeObjectS3ReadThrough(t *testin
 	}
 }
 
+func TestExternalCachePrefetchFallsBackToReadInto(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	payload := bytes.Repeat([]byte("a"), int(externalPageMmapWindowBytes))
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			return nil, errContentNotFound
+		},
+		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			if hash != "hash" || opts.RoutingKey != "hash" || offset != 0 || len(dst) != len(payload) {
+				t.Fatalf("unexpected read-into prefetch: hash=%q routing=%q offset=%d len=%d", hash, opts.RoutingKey, offset, len(dst))
+			}
+			copy(dst, payload)
+			return int64(len(payload)), nil
+		},
+	}
+	fs := newUnitFS(flags)
+	defer fs.closeExternalPageMmapCache()
+	inode := NewInode(fs, nil, "file")
+	fh := NewFileHandle(inode)
+
+	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto))
+
+	deadline := time.After(2 * time.Second)
+	for {
+		data, cleanup, ok := fs.externalPageCache().lookup("hash", 0, uint64(len(payload)))
+		if ok {
+			if cleanup != nil {
+				defer cleanup()
+			}
+			if got := bytes.Join(data, nil); !bytes.Equal(got, payload) {
+				t.Fatalf("unexpected prefetched data")
+			}
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for read-into prefetch")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 func TestExternalCacheClientLocalPageFileViewEOFDoesNotCountAsMiss(t *testing.T) {
 	var calls int64
 	flags := cfg.DefaultFlags()
@@ -346,7 +389,7 @@ func TestExternalCachePrefetchDoesNotSkipWhenQueueFull(t *testing.T) {
 		}
 	}()
 
-	fh.scheduleExternalPagePrefetch("hash", 0, 2*externalPageMmapWindowBytes, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews))
+	fh.scheduleExternalPagePrefetch("hash", 0, 2*externalPageMmapWindowBytes, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), nil)
 	if fh.externalPrefetchNext != 0 {
 		t.Fatalf("prefetch advanced after queue-full drop: got %d", fh.externalPrefetchNext)
 	}
