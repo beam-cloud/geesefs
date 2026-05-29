@@ -80,7 +80,7 @@ func TestExternalCacheClientLocalPageFileViewReadUsesForegroundRange(t *testing.
 				offset int64
 				length int64
 			}{offset: offset, length: length})
-			if hash != "hash" || opts.RoutingKey != "hash" || length != 3 {
+			if hash != "hash" || opts.RoutingKey != "hash" {
 				t.Fatalf("unexpected client-local page-file request: hash=%q routing=%q offset=%d length=%d", hash, opts.RoutingKey, offset, length)
 			}
 			return []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: offset, Length: int(length)}}, nil
@@ -120,10 +120,10 @@ func TestExternalCacheClientLocalPageFileViewReadUsesForegroundRange(t *testing.
 	if cleanup != nil {
 		cleanup()
 	}
-	if len(calls) != 2 {
-		t.Fatalf("expected two foreground client-local page-file lookups, got %d", len(calls))
+	if len(calls) != 1 {
+		t.Fatalf("expected one windowed foreground client-local page-file lookup, got %d", len(calls))
 	}
-	if calls[0].offset != 0 || calls[0].length != 3 || calls[1].offset != 3 || calls[1].length != 3 {
+	if calls[0].offset != 0 || calls[0].length != 6 {
 		t.Fatalf("unexpected foreground page-file lookups: %+v", calls)
 	}
 }
@@ -223,5 +223,30 @@ func TestExternalPageMmapCacheEvictsUnreferencedEntries(t *testing.T) {
 	cache.mu.Unlock()
 	if entries != 1 || mappedBytes != 4 {
 		t.Fatalf("expected one mapped page after eviction, got entries=%d mappedBytes=%d", entries, mappedBytes)
+	}
+}
+
+func TestExternalCachePrefetchDoesNotSkipWhenQueueFull(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = &fakeContentCache{}
+	fs := newUnitFS(flags)
+	defer fs.closeExternalPageMmapCache()
+
+	inode := NewInode(fs, nil, "file")
+	fh := NewFileHandle(inode)
+	cache := fs.externalPageCache()
+
+	for i := 0; i < cap(cache.prefetchSem); i++ {
+		cache.prefetchSem <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < cap(cache.prefetchSem); i++ {
+			<-cache.prefetchSem
+		}
+	}()
+
+	fh.scheduleExternalPagePrefetch("hash", 0, 2*externalPageMmapWindowBytes, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews))
+	if fh.externalPrefetchNext != 0 {
+		t.Fatalf("prefetch advanced after queue-full drop: got %d", fh.externalPrefetchNext)
 	}
 }

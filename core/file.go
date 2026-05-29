@@ -43,6 +43,9 @@ type FileHandle struct {
 	lastReadSizes           []uint64
 	lastReadIdx             int
 	externalPageHitLogCount uint64
+	externalPrefetchMu      sync.Mutex
+	externalPrefetchHash    string
+	externalPrefetchNext    uint64
 }
 
 // On Linux and MacOS, IOV_MAX = 1024
