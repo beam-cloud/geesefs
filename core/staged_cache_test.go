@@ -127,7 +127,6 @@ func newUnitFS(flags *cfg.FlagStorage) *Goofys {
 		bufferPool:       NewBufferPool(int64(flags.MemoryLimit), uint64(flags.GCInterval)<<20),
 		cacheEventChan:   make(chan cacheEvent, 8),
 		cachingStatus:    make(map[string]bool),
-		cachedStatus:     make(map[string]time.Time),
 		flushPriorities:  make([]int64, MAX_FLUSH_PRIORITY+1),
 		inflightChanges:  make(map[string]int),
 		inflightListings: make(map[int]map[string]bool),
@@ -844,34 +843,6 @@ func TestCacheThroughFromFlushedBuffersUsesLocalBytes(t *testing.T) {
 	}
 	if _, _, err := inode.buffers.GetData(0, uint64(len(payload)), true); !errors.Is(err, ErrBufferIsMissing) {
 		t.Fatalf("expected flushed cache-through buffers to be released, got err=%v", err)
-	}
-}
-
-func TestExternalCacheStoreReservationDebouncesRecentlyCachedHash(t *testing.T) {
-	flags := cfg.DefaultFlags()
-	fs := newUnitFS(flags)
-	inode := NewInode(fs, nil, "file")
-	hash := "hash"
-	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte(hash)}
-
-	if !fs.reserveExternalCacheStore(inode, hash) {
-		t.Fatal("expected first reservation to succeed")
-	}
-	if fs.reserveExternalCacheStore(inode, hash) {
-		t.Fatal("expected duplicate in-flight reservation to be rejected")
-	}
-
-	fs.clearCachingStatus(hash)
-	fs.markCacheStored(hash)
-	if fs.reserveExternalCacheStore(inode, hash) {
-		t.Fatal("expected recently cached hash to be debounced")
-	}
-
-	fs.cachingStatusMu.Lock()
-	fs.cachedStatus[hash] = time.Now().Add(-time.Second)
-	fs.cachingStatusMu.Unlock()
-	if !fs.reserveExternalCacheStore(inode, hash) {
-		t.Fatal("expected reservation to succeed after debounce window expires")
 	}
 }
 
