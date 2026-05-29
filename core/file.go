@@ -683,6 +683,9 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 				done = fallbackDone
 				if fallbackDone > 0 {
 					cacheMissRead = true
+					if curOffset == 0 {
+						inode.fs.CacheFileInExternalCacheFromReadBuffers(inode)
+					}
 				}
 			}
 		} else {

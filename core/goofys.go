@@ -738,21 +738,37 @@ func (fs *Goofys) storeContentFromInodeBuffers(inode *Inode, path, hash string, 
 	done := make(chan struct{})
 	readErr := make(chan error, 1)
 
+	firstChunkSize := uint64(externalCacheStoreChunkSize)
+	if firstChunkSize > size {
+		firstChunkSize = size
+	}
+	if firstChunkSize > 0 {
+		firstChunk, err := inode.copyCacheThroughChunk(path, hash, size, 0, firstChunkSize)
+		if err != nil {
+			return "", err
+		}
+		chunks <- firstChunk
+	}
+
 	go func() {
 		defer close(chunks)
-		readErr <- fs.streamInodeBufferChunks(inode, path, hash, size, chunks, done)
+		readErr <- fs.streamInodeBufferChunks(inode, path, hash, size, firstChunkSize, chunks, done)
 	}()
 
 	actualHash, err := fs.flags.ExternalCacheClient.StoreContent(chunks, hash, struct{ RoutingKey string }{RoutingKey: hash})
 	close(done)
-	if readErrValue := <-readErr; err == nil && readErrValue != nil {
-		err = readErrValue
+	if readErrValue := <-readErr; readErrValue != nil {
+		if err != nil {
+			err = fmt.Errorf("%v; source read error: %w", err, readErrValue)
+		} else {
+			err = readErrValue
+		}
 	}
 	return actualHash, err
 }
 
-func (fs *Goofys) streamInodeBufferChunks(inode *Inode, path, hash string, size uint64, chunks chan<- []byte, done <-chan struct{}) error {
-	for offset := uint64(0); offset < size; {
+func (fs *Goofys) streamInodeBufferChunks(inode *Inode, path, hash string, size uint64, startOffset uint64, chunks chan<- []byte, done <-chan struct{}) error {
+	for offset := startOffset; offset < size; {
 		chunkSize := uint64(externalCacheStoreChunkSize)
 		if remaining := size - offset; chunkSize > remaining {
 			chunkSize = remaining
