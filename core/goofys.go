@@ -62,6 +62,7 @@ type cacheEvent struct {
 
 const externalCacheStoreAttempts = 5
 const externalCacheStoreChunkSize = 4 * 1024 * 1024
+const externalCacheStoreCooldown = 30 * time.Second
 
 var externalCacheStoreRetryDelay = func(attempt int) time.Duration {
 	delay := time.Duration(250*(1<<(attempt-1))) * time.Millisecond
@@ -146,6 +147,7 @@ type Goofys struct {
 
 	cacheEventChan    chan cacheEvent
 	cachingStatus     map[string]bool
+	cachedStatus      map[string]time.Time
 	cachingStatusMu   sync.Mutex
 	activeCacheEvents int64
 
@@ -378,6 +380,7 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 		flushPriorities: make([]int64, MAX_FLUSH_PRIORITY+1),
 		cacheEventChan:  make(chan cacheEvent, 10000),
 		cachingStatus:   make(map[string]bool),
+		cachedStatus:    make(map[string]time.Time),
 		cachingStatusMu: sync.Mutex{},
 	}
 
@@ -532,6 +535,7 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 			fs.clearCachingStatus(cacheEvent.hash)
 		} else if hash == cacheEvent.hash {
 			atomic.AddInt64(&fs.stats.cacheEventsSuccess, 1)
+			fs.markCacheStored(cacheEvent.hash)
 			log.Debugf("geesefs external cache store result: status=ok path=%q hash=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
 			if cacheEvent.inode != nil {
 				cacheEvent.inode.dropCleanBuffersAfterExternalCacheStore(cacheEvent.hash)
@@ -587,9 +591,22 @@ func (fs *Goofys) CacheFileInExternalCache(inode *Inode) {
 
 func (fs *Goofys) reserveExternalCacheStore(inode *Inode, hashString string) bool {
 	fs.cachingStatusMu.Lock()
+	if fs.cachingStatus == nil {
+		fs.cachingStatus = make(map[string]bool)
+	}
+	if fs.cachedStatus == nil {
+		fs.cachedStatus = make(map[string]time.Time)
+	}
 	if fs.cachingStatus[hashString] {
 		fs.cachingStatusMu.Unlock()
 		return false
+	}
+	if cachedUntil, ok := fs.cachedStatus[hashString]; ok {
+		if time.Now().Before(cachedUntil) {
+			fs.cachingStatusMu.Unlock()
+			return false
+		}
+		delete(fs.cachedStatus, hashString)
 	}
 	fs.cachingStatus[hashString] = true
 	fs.cachingStatusMu.Unlock()
@@ -680,6 +697,7 @@ func (fs *Goofys) CacheFileInExternalCacheFromBuffersLocked(inode *Inode) bool {
 		inode.mu.Lock()
 		if err == nil && actualHash == hashString {
 			atomic.AddInt64(&fs.stats.cacheEventsSuccess, 1)
+			fs.markCacheStored(hashString)
 			log.Debugf("geesefs external cache store result: status=ok path=%q hash=%q source=flushed_buffers size=%d", path, hashString, size)
 			return true
 		}
@@ -887,6 +905,18 @@ func (fs *Goofys) clearCachingStatus(hash string) {
 	fs.cachingStatusMu.Lock()
 	defer fs.cachingStatusMu.Unlock()
 	delete(fs.cachingStatus, hash)
+}
+
+func (fs *Goofys) markCacheStored(hash string) {
+	if hash == "" {
+		return
+	}
+	fs.cachingStatusMu.Lock()
+	if fs.cachedStatus == nil {
+		fs.cachedStatus = make(map[string]time.Time)
+	}
+	fs.cachedStatus[hash] = time.Now().Add(externalCacheStoreCooldown)
+	fs.cachingStatusMu.Unlock()
 }
 
 func (fs *Goofys) Shutdown() {
