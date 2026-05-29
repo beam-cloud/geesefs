@@ -18,6 +18,7 @@ package core
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"github.com/yandex-cloud/geesefs/core/cfg"
 
 	"context"
@@ -58,10 +59,12 @@ type cacheEvent struct {
 	inode            *Inode
 	localSourcePath  string
 	removeLocalAfter bool
+	fromBuffers      bool
 }
 
 const externalCacheStoreAttempts = 5
 const externalCacheStoreChunkSize = 4 * 1024 * 1024
+const externalCacheStoreBufferWait = 2 * time.Minute
 
 var externalCacheStoreRetryDelay = func(attempt int) time.Duration {
 	delay := time.Duration(250*(1<<(attempt-1))) * time.Millisecond
@@ -494,6 +497,8 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 	source := "s3"
 	if cacheEvent.localSourcePath != "" {
 		source = "local"
+	} else if cacheEvent.fromBuffers {
+		source = "read_buffers"
 	}
 	if cacheEvent.hash == "" {
 		log.Errorf("No hash found for inode, not caching inode in external cache: %v", cacheEvent.path)
@@ -556,6 +561,12 @@ func (fs *Goofys) storeCacheEventContent(cacheEvent cacheEvent) (string, error) 
 	if cacheEvent.localSourcePath != "" {
 		return fs.storeContentFromLocalFile(cacheEvent)
 	}
+	if cacheEvent.fromBuffers {
+		if cacheEvent.inode == nil {
+			return "", fmt.Errorf("inode is required for read-buffer cache event: %v", cacheEvent.path)
+		}
+		return fs.storeContentFromInodeBuffers(cacheEvent.inode, cacheEvent.path, cacheEvent.hash, cacheEvent.size)
+	}
 
 	s3, ok := fs.flags.Backend.(*cfg.S3Config)
 	if !ok {
@@ -585,6 +596,10 @@ func (fs *Goofys) CacheFileInExternalCache(inode *Inode) {
 	fs.CacheFileInExternalCacheFromSource(inode, "", false)
 }
 
+func (fs *Goofys) CacheFileInExternalCacheFromReadBuffers(inode *Inode) bool {
+	return fs.cacheFileInExternalCache(inode, "", false, true)
+}
+
 func (fs *Goofys) reserveExternalCacheStore(inode *Inode, hashString string) bool {
 	fs.cachingStatusMu.Lock()
 	if fs.cachingStatus == nil {
@@ -608,6 +623,10 @@ func (fs *Goofys) reserveExternalCacheStore(inode *Inode, hashString string) boo
 }
 
 func (fs *Goofys) CacheFileInExternalCacheFromSource(inode *Inode, localSourcePath string, removeLocalAfter bool) bool {
+	return fs.cacheFileInExternalCache(inode, localSourcePath, removeLocalAfter, false)
+}
+
+func (fs *Goofys) cacheFileInExternalCache(inode *Inode, localSourcePath string, removeLocalAfter bool, fromBuffers bool) bool {
 	if inode.userMetadata == nil {
 		log.Errorf("No metadata found for inode, not caching inode in external cache: %v", inode.FullName())
 		return false
@@ -631,6 +650,7 @@ func (fs *Goofys) CacheFileInExternalCacheFromSource(inode *Inode, localSourcePa
 		inode:            inode,
 		localSourcePath:  localSourcePath,
 		removeLocalAfter: removeLocalAfter,
+		fromBuffers:      fromBuffers,
 	}
 
 	// Submit cache event
@@ -771,50 +791,64 @@ func (inode *Inode) validateCacheThroughSourceLocked(path, hash string, size uin
 }
 
 func (inode *Inode) copyCacheThroughChunk(path, hash string, totalSize, offset, size uint64) ([]byte, error) {
-	inode.mu.Lock()
+	deadline := time.Now().Add(externalCacheStoreBufferWait)
 
-	if err := inode.validateCacheThroughSourceLocked(path, hash, totalSize); err != nil {
-		inode.mu.Unlock()
-		return nil, err
-	}
-	inode.LockRange(offset, size, false)
+	for {
+		inode.mu.Lock()
 
-	if err := inode.loadDiskBackedBuffers(offset, size); err != nil {
-		inode.UnlockRange(offset, size, false)
-		inode.mu.Unlock()
-		return nil, err
-	}
-	if err := inode.validateCacheThroughSourceLocked(path, hash, totalSize); err != nil {
-		inode.UnlockRange(offset, size, false)
-		inode.mu.Unlock()
-		return nil, err
-	}
+		if err := inode.validateCacheThroughSourceLocked(path, hash, totalSize); err != nil {
+			inode.mu.Unlock()
+			return nil, err
+		}
+		inode.LockRange(offset, size, false)
 
-	reader, _, err := inode.getMultiReader(offset, size)
-	if err != nil {
+		if err := inode.loadDiskBackedBuffers(offset, size); err != nil {
+			inode.UnlockRange(offset, size, false)
+			inode.mu.Unlock()
+			return nil, err
+		}
+		if err := inode.validateCacheThroughSourceLocked(path, hash, totalSize); err != nil {
+			inode.UnlockRange(offset, size, false)
+			inode.mu.Unlock()
+			return nil, err
+		}
+
+		reader, _, err := inode.getMultiReader(offset, size)
+		if errors.Is(err, ErrBufferIsLoading) || errors.Is(err, ErrBufferIsMissing) {
+			inode.UnlockRange(offset, size, false)
+			inode.mu.Unlock()
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("timed out waiting for read-through buffers: path=%q offset=%d size=%d err=%w", path, offset, size, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			inode.UnlockRange(offset, size, false)
+			inode.mu.Unlock()
+			return nil, err
+		}
+
+		chunk := make([]byte, int(size))
+		n, err := io.ReadFull(reader, chunk)
+		if err != nil {
+			inode.UnlockRange(offset, size, false)
+			inode.mu.Unlock()
+			return nil, err
+		}
+		if n != len(chunk) {
+			inode.UnlockRange(offset, size, false)
+			inode.mu.Unlock()
+			return nil, fmt.Errorf("short cache-through buffer read: path=%q offset=%d size=%d read=%d", path, offset, size, n)
+		}
 		inode.UnlockRange(offset, size, false)
+		freed := inode.dropCacheThroughChunkBuffersLocked(offset, size)
 		inode.mu.Unlock()
-		return nil, err
+		if freed != 0 {
+			inode.fs.bufferPool.Use(freed, true)
+		}
+		return chunk, nil
 	}
-	chunk := make([]byte, int(size))
-	n, err := io.ReadFull(reader, chunk)
-	if err != nil {
-		inode.UnlockRange(offset, size, false)
-		inode.mu.Unlock()
-		return nil, err
-	}
-	if n != len(chunk) {
-		inode.UnlockRange(offset, size, false)
-		inode.mu.Unlock()
-		return nil, fmt.Errorf("short cache-through buffer read: path=%q offset=%d size=%d read=%d", path, offset, size, n)
-	}
-	inode.UnlockRange(offset, size, false)
-	freed := inode.dropCacheThroughChunkBuffersLocked(offset, size)
-	inode.mu.Unlock()
-	if freed != 0 {
-		inode.fs.bufferPool.Use(freed, true)
-	}
-	return chunk, nil
 }
 
 // LOCKS_REQUIRED(inode.mu)

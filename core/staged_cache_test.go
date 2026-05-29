@@ -684,7 +684,7 @@ func TestCacheThroughUsesLocalStagedSource(t *testing.T) {
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		if atomic.LoadInt32(&storeContentCalls) == 1 {
+		if atomic.LoadInt32(&storeContentCalls) == 1 && atomic.LoadInt64(&fs.stats.cacheEventsSuccess) == 1 {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -843,6 +843,81 @@ func TestCacheThroughFromFlushedBuffersUsesLocalBytes(t *testing.T) {
 	}
 	if _, _, err := inode.buffers.GetData(0, uint64(len(payload)), true); !errors.Is(err, ErrBufferIsMissing) {
 		t.Fatalf("expected flushed cache-through buffers to be released, got err=%v", err)
+	}
+}
+
+func TestReadThroughFromBuffersUsesLocalBytes(t *testing.T) {
+	payload := bytes.Repeat([]byte("read-through-data-"), 256*1024)
+	sum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(sum[:])
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = "sha256"
+
+	var storeContentCalls int32
+	var storeFromS3Calls int32
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeContent: func(chunks chan []byte, hash string, opts struct{ RoutingKey string }) (string, error) {
+			atomic.AddInt32(&storeContentCalls, 1)
+			if hash != expectedHash || opts.RoutingKey != expectedHash {
+				t.Fatalf("unexpected store request: hash=%q routing=%q", hash, opts.RoutingKey)
+			}
+			hasher := sha256.New()
+			for chunk := range chunks {
+				if _, err := hasher.Write(chunk); err != nil {
+					return "", err
+				}
+			}
+			return hex.EncodeToString(hasher.Sum(nil)), nil
+		},
+		storeFromS3: func(source struct {
+			Path        string
+			BucketName  string
+			Region      string
+			EndpointURL string
+			AccessKey   string
+			SecretKey   string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			atomic.AddInt32(&storeFromS3Calls, 1)
+			return opts.RoutingKey, nil
+		},
+	}
+
+	fs := newUnitFS(flags)
+	defer close(fs.shutdownCh)
+	go fs.processCacheEvents()
+
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = uint64(len(payload))
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte(expectedHash)}
+	inode.buffers.Add(0, payload, BUF_CLEAN, false)
+
+	if !fs.CacheFileInExternalCacheFromReadBuffers(inode) {
+		t.Fatal("expected read-through cache event to be queued")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&storeContentCalls) == 1 && atomic.LoadInt64(&fs.stats.cacheEventsSuccess) == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&storeContentCalls); got != 1 {
+		t.Fatalf("expected one StoreContent call, got %d", got)
+	}
+	if got := atomic.LoadInt32(&storeFromS3Calls); got != 0 {
+		t.Fatalf("expected no StoreContentFromS3 calls, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsSuccess); got != 1 {
+		t.Fatalf("expected one successful cache event, got %d errors=%d mismatch=%d",
+			got,
+			atomic.LoadInt64(&fs.stats.cacheEventsErrors),
+			atomic.LoadInt64(&fs.stats.cacheEventsMismatch),
+		)
 	}
 }
 

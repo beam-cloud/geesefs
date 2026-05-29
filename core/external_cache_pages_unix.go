@@ -185,7 +185,6 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageLookupNanos, lookupElapsed.Nanoseconds())
 	if err != nil || len(views) == 0 {
 		fh.recordExternalPageMiss(path, hash, offset, size, "no_client_local_page_file", started, err)
-		fh.queueExternalCacheReadThrough(hash)
 		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
 	}
 
@@ -313,7 +312,6 @@ func (fh *FileHandle) tryReadExternalCacheInto(path, hash string, offset, size, 
 		if readErr != nil {
 			fh.recordExternalPageMiss(path, hash, offset, size, "read_into_miss", started, readErr)
 		}
-		fh.queueExternalCacheReadThrough(hash)
 		return nil, 0, nil, false, nil
 	}
 
@@ -339,13 +337,6 @@ func (fh *FileHandle) tryReadExternalCacheInto(path, hash string, offset, size, 
 	}
 	fh.logExternalPageHit(path, hash, offset, size, 0, "read_into", started, time.Time{}, hitCount)
 	return [][]byte{buf[:n]}, int(n), callback, true, nil
-}
-
-func (fh *FileHandle) queueExternalCacheReadThrough(hash string) {
-	if hash == "" {
-		return
-	}
-	fh.inode.fs.CacheFileInExternalCache(fh.inode)
 }
 
 func (fh *FileHandle) logExternalPageHit(path, hash string, offset, size uint64, views int, source string, started, mmapStarted time.Time, globalHitCount int64) {

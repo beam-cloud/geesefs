@@ -130,7 +130,7 @@ func TestExternalCacheClientLocalPageFileViewReadUsesForegroundRange(t *testing.
 	}
 }
 
-func TestExternalCachePageFileMissQueuesReadThrough(t *testing.T) {
+func TestExternalCachePageFileMissDoesNotQueueWholeObjectS3ReadThrough(t *testing.T) {
 	flags := cfg.DefaultFlags()
 	flags.ExternalCacheClient = &fakeContentCache{
 		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
@@ -156,15 +156,12 @@ func TestExternalCachePageFileMissQueuesReadThrough(t *testing.T) {
 
 	select {
 	case event := <-fs.cacheEventChan:
-		if event.hash != "hash" || event.path != "file" {
-			t.Fatalf("unexpected cache event: %+v", event)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected read-through cache event")
+		t.Fatalf("unexpected cache event before foreground EOF: %+v", event)
+	default:
 	}
 }
 
-func TestExternalCacheReadIntoMissQueuesReadThrough(t *testing.T) {
+func TestExternalCacheReadIntoMissDoesNotQueueWholeObjectS3ReadThrough(t *testing.T) {
 	flags := cfg.DefaultFlags()
 	flags.ExternalCacheClient = &fakeContentCache{
 		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
@@ -190,11 +187,8 @@ func TestExternalCacheReadIntoMissQueuesReadThrough(t *testing.T) {
 
 	select {
 	case event := <-fs.cacheEventChan:
-		if event.hash != "hash" || event.path != "file" {
-			t.Fatalf("unexpected cache event: %+v", event)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected read-through cache event")
+		t.Fatalf("unexpected cache event before foreground EOF: %+v", event)
+	default:
 	}
 }
 

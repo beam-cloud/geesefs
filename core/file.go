@@ -481,7 +481,6 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 		contentChan, err := inode.fs.flags.ExternalCacheClient.GetContentStream(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 		if err != nil || contentChan == nil {
 			atomic.AddInt64(&inode.fs.stats.externalStreamMisses, 1)
-			inode.fs.CacheFileInExternalCache(inode)
 			return 0, 0, errContentNotFound
 		}
 
@@ -491,7 +490,6 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 			}
 			if uint64(len(chunk)) > size-totalDone {
 				atomic.AddInt64(&inode.fs.stats.externalStreamMisses, 1)
-				inode.fs.CacheFileInExternalCache(inode)
 				return allocated, 0, errContentNotFound
 			}
 
@@ -504,7 +502,6 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 
 		if totalDone != size {
 			atomic.AddInt64(&inode.fs.stats.externalStreamMisses, 1)
-			inode.fs.CacheFileInExternalCache(inode)
 			return allocated, 0, errContentNotFound
 		}
 
@@ -517,7 +514,6 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 	if err != nil || buf == nil || uint64(len(buf)) != size {
 		atomic.AddInt64(&inode.fs.stats.externalUnaryMisses, 1)
-		inode.fs.CacheFileInExternalCache(inode)
 		return 0, 0, errContentNotFound
 	}
 
@@ -671,7 +667,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	// is temporarily unavailable (err would be io.EOF in that case)
 	allocated := int64(0)
 	curOffset, curSize := offset, size
-	queuedCacheReadThrough := false
+	cacheMissRead := false
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
 		var alloc int64 = 0
 		var done uint64 = 0
@@ -685,8 +681,8 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 				fallbackAlloc, fallbackDone, err = inode.sendRead(cloud, key, curOffset, curSize)
 				alloc += fallbackAlloc
 				done = fallbackDone
-				if fallbackDone > 0 && !queuedCacheReadThrough {
-					queuedCacheReadThrough = inode.fs.CacheFileInExternalCacheFromSource(inode, "", false)
+				if fallbackDone > 0 {
+					cacheMissRead = true
 				}
 			}
 		} else {
@@ -702,6 +698,10 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 		allocated += alloc
 		return err
 	})
+
+	if err == nil && cacheMissRead && hashFound && offset+size >= inode.Attributes.Size {
+		inode.fs.CacheFileInExternalCacheFromReadBuffers(inode)
+	}
 
 	if !inode.fs.flags.UseEnomem {
 		inode.fs.bufferPool.Use(int64(allocated), true)
