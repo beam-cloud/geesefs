@@ -667,7 +667,6 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	// is temporarily unavailable (err would be io.EOF in that case)
 	allocated := int64(0)
 	curOffset, curSize := offset, size
-	cacheMissRead := false
 	err := ReadBackoff(inode.fs.flags, func(attempt int) error {
 		var alloc int64 = 0
 		var done uint64 = 0
@@ -682,7 +681,6 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 				alloc += fallbackAlloc
 				done = fallbackDone
 				if fallbackDone > 0 {
-					cacheMissRead = true
 					if curOffset == 0 {
 						inode.fs.CacheFileInExternalCacheFromReadBuffers(inode)
 					}
@@ -701,10 +699,6 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 		allocated += alloc
 		return err
 	})
-
-	if err == nil && cacheMissRead && hashFound && offset+size >= inode.Attributes.Size {
-		inode.fs.CacheFileInExternalCacheFromReadBuffers(inode)
-	}
 
 	if !inode.fs.flags.UseEnomem {
 		inode.fs.bufferPool.Use(int64(allocated), true)

@@ -921,6 +921,47 @@ func TestReadThroughFromBuffersUsesLocalBytes(t *testing.T) {
 	}
 }
 
+func TestReadThroughFromBuffersDoesNotQueueFromPartialEOFRead(t *testing.T) {
+	payload := []byte("0123456789")
+	expectedHash := "hash"
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = "sha256"
+	flags.ExternalCacheClient = &fakeContentCache{
+		getContent: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]byte, error) {
+			return nil, errContentNotFound
+		},
+	}
+
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = uint64(len(payload))
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte(expectedHash)}
+	inode.readCond = sync.NewCond(&inode.mu)
+
+	backend := &TestBackend{
+		GetBlobFunc: func(param *GetBlobInput) (*GetBlobOutput, error) {
+			return &GetBlobOutput{
+				Body: io.NopCloser(bytes.NewReader(payload[param.Start : param.Start+param.Count])),
+				HeadBlobOutput: HeadBlobOutput{
+					BlobItemOutput: BlobItemOutput{Metadata: map[string]*string{}},
+				},
+			}, nil
+		},
+	}
+
+	inode.retryRead(backend, "file", 5, 5, false)
+
+	select {
+	case event := <-fs.cacheEventChan:
+		t.Fatalf("partial EOF read should not queue whole-file read-through cache event: %+v", event)
+	default:
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsQueued); got != 0 {
+		t.Fatalf("expected no queued cache events, got %d", got)
+	}
+}
+
 func TestDeferredHashMetadataPublishFailureDoesNotPoisonFlush(t *testing.T) {
 	flags := cfg.DefaultFlags()
 	flags.HashAttr = "sha256"
