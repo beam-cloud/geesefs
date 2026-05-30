@@ -715,9 +715,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 				alloc += fallbackAlloc
 				done = fallbackDone
 				if fallbackDone > 0 {
-					if curOffset == 0 {
-						inode.fs.CacheFileInExternalCacheFromReadBuffers(inode)
-					}
+					inode.fs.CacheFileInExternalCache(inode)
 				}
 			}
 		} else {
@@ -2641,7 +2639,7 @@ func (inode *Inode) queueCacheThroughAfterFlushLocked() {
 	if len(inode.userMetadata[inode.fs.flags.HashAttr]) == 0 {
 		return
 	}
-	inode.fs.CacheFileInExternalCacheFromBuffersLocked(inode)
+	inode.fs.CacheFileInExternalCacheFromObjectLocked(inode)
 }
 
 func (inode *Inode) dropCleanBuffersAfterExternalCacheStore(hash string) {

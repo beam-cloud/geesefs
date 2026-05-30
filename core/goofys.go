@@ -626,6 +626,43 @@ func (fs *Goofys) CacheFileInExternalCacheFromSource(inode *Inode, localSourcePa
 	return fs.cacheFileInExternalCache(inode, localSourcePath, removeLocalAfter, false)
 }
 
+// LOCKS_REQUIRED(inode.mu)
+func (fs *Goofys) CacheFileInExternalCacheFromObjectLocked(inode *Inode) bool {
+	if inode.userMetadata == nil {
+		log.Errorf("No metadata found for inode, not caching inode in external cache: %v", inode.FullName())
+		return false
+	}
+	hash, ok := inode.userMetadata[fs.flags.HashAttr]
+	if !ok || len(hash) == 0 {
+		log.Errorf("No hash found for inode, not caching inode in external cache: %v", inode.FullName())
+		return false
+	}
+
+	hashString := string(hash)
+	if !fs.reserveExternalCacheStore(inode, hashString) {
+		return false
+	}
+
+	event := cacheEvent{
+		path:  inode.FullName(),
+		size:  inode.Attributes.Size,
+		hash:  hashString,
+		inode: inode,
+	}
+
+	log.Debugf("Submitting cache event for file: %v", inode.FullName())
+	select {
+	case fs.cacheEventChan <- event:
+		atomic.AddInt64(&fs.stats.cacheEventsQueued, 1)
+		return true
+	default:
+		log.Warnf("External cache event queue is full, skipping cache for %v", inode.FullName())
+		atomic.AddInt64(&fs.stats.cacheEventsDropped, 1)
+		fs.clearCachingStatus(hashString)
+		return false
+	}
+}
+
 func (fs *Goofys) cacheFileInExternalCache(inode *Inode, localSourcePath string, removeLocalAfter bool, fromBuffers bool) bool {
 	if inode.userMetadata == nil {
 		log.Errorf("No metadata found for inode, not caching inode in external cache: %v", inode.FullName())
