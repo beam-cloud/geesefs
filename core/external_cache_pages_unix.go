@@ -197,6 +197,9 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageLookupNanos, lookupElapsed.Nanoseconds())
 	if err != nil || len(views) == 0 {
 		fh.recordExternalPageMiss(path, hash, offset, size, "no_client_local_page_file", started, err)
+		if err != nil && !isExternalCacheMiss(err) {
+			return nil, 0, nil, false, fmt.Errorf("%w: %w", errExternalCacheUnavailable, err)
+		}
 		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
 	}
 
@@ -327,6 +330,9 @@ func (fh *FileHandle) tryReadExternalCacheInto(path, hash string, offset, size, 
 		atomic.AddInt64(&fh.inode.fs.stats.externalReadIntoMisses, 1)
 		if readErr != nil {
 			fh.recordExternalPageMiss(path, hash, offset, size, "read_into_miss", started, readErr)
+			if !isExternalCacheMiss(readErr) {
+				return nil, 0, nil, false, fmt.Errorf("%w: %w", errExternalCacheUnavailable, readErr)
+			}
 		}
 		return nil, 0, nil, false, nil
 	}

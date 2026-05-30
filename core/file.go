@@ -53,7 +53,28 @@ const IOV_MAX = 1024
 const READ_BUF_SIZE = 128 * 1024
 const MAX_FLUSH_PRIORITY = 3
 
-var errContentNotFound = errors.New("content not found")
+var (
+	errContentNotFound          = errors.New("content not found")
+	errExternalCacheUnavailable = errors.New("external cache unavailable")
+)
+
+func isExternalCacheMiss(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, errContentNotFound) ||
+		strings.Contains(err.Error(), "content not found") ||
+		strings.Contains(err.Error(), "content cache miss")
+}
+
+func isExternalCacheUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, errExternalCacheUnavailable) ||
+		strings.Contains(err.Error(), "selected cache host unavailable") ||
+		strings.Contains(err.Error(), "content cache unavailable")
+}
 
 type multipartPartSource struct {
 	body       io.ReadSeeker
@@ -473,6 +494,10 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 			inode.readCond.Broadcast()
 			return allocated, size, nil
 		}
+		if err != nil && !isExternalCacheMiss(err) {
+			atomic.AddInt64(&inode.fs.stats.externalReadIntoMisses, 1)
+			return 0, 0, fmt.Errorf("%w: %w", errExternalCacheUnavailable, err)
+		}
 		atomic.AddInt64(&inode.fs.stats.externalReadIntoMisses, 1)
 	}
 
@@ -481,6 +506,9 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 		contentChan, err := inode.fs.flags.ExternalCacheClient.GetContentStream(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 		if err != nil || contentChan == nil {
 			atomic.AddInt64(&inode.fs.stats.externalStreamMisses, 1)
+			if err != nil && !isExternalCacheMiss(err) {
+				return 0, 0, fmt.Errorf("%w: %w", errExternalCacheUnavailable, err)
+			}
 			return 0, 0, errContentNotFound
 		}
 
@@ -514,6 +542,9 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
 	if err != nil || buf == nil || uint64(len(buf)) != size {
 		atomic.AddInt64(&inode.fs.stats.externalUnaryMisses, 1)
+		if err != nil && !isExternalCacheMiss(err) {
+			return 0, 0, fmt.Errorf("%w: %w", errExternalCacheUnavailable, err)
+		}
 		return 0, 0, errContentNotFound
 	}
 
@@ -675,6 +706,9 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 		if inode.fs.flags.ExternalCacheClient != nil && hashFound {
 			alloc, done, err = inode.loadFromExternalCache(curOffset, curSize, hash)
 			if err != nil {
+				if isExternalCacheUnavailable(err) {
+					return err
+				}
 				var fallbackAlloc int64
 				var fallbackDone uint64
 				fallbackAlloc, fallbackDone, err = inode.sendRead(cloud, key, curOffset, curSize)

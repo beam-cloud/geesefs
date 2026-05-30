@@ -20,6 +20,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -190,6 +191,31 @@ func TestExternalCacheReadIntoMissDoesNotQueueWholeObjectS3ReadThrough(t *testin
 	case event := <-fs.cacheEventChan:
 		t.Fatalf("unexpected cache event before foreground EOF: %+v", event)
 	default:
+	}
+}
+
+func TestExternalCacheReadIntoUnavailableReturnsError(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = &fakeContentCache{
+		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			return 0, errors.New("selected cache host unavailable")
+		},
+	}
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = 4
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	fh := NewFileHandle(inode)
+
+	_, _, _, ok, err := fh.tryReadExternalCacheInto("file", "hash", 0, 4, 4, false, time.Now())
+	if err == nil {
+		t.Fatal("expected unavailable error")
+	}
+	if !isExternalCacheUnavailable(err) {
+		t.Fatalf("expected external cache unavailable, got %v", err)
+	}
+	if ok {
+		t.Fatal("unexpected read-into hit")
 	}
 }
 
