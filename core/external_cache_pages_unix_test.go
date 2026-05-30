@@ -194,7 +194,7 @@ func TestExternalCacheReadIntoMissDoesNotQueueWholeObjectS3ReadThrough(t *testin
 	}
 }
 
-func TestExternalCacheReadIntoUnavailableReturnsError(t *testing.T) {
+func TestExternalCacheReadIntoUnavailableIsCacheMiss(t *testing.T) {
 	flags := cfg.DefaultFlags()
 	flags.ExternalCacheClient = &fakeContentCache{
 		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
@@ -208,11 +208,8 @@ func TestExternalCacheReadIntoUnavailableReturnsError(t *testing.T) {
 	fh := NewFileHandle(inode)
 
 	_, _, _, ok, err := fh.tryReadExternalCacheInto("file", "hash", 0, 4, 4, false, time.Now())
-	if err == nil {
-		t.Fatal("expected unavailable error")
-	}
-	if !isExternalCacheUnavailable(err) {
-		t.Fatalf("expected external cache unavailable, got %v", err)
+	if err != nil {
+		t.Fatalf("expected unavailable cache to degrade to miss, got %v", err)
 	}
 	if ok {
 		t.Fatal("unexpected read-into hit")
