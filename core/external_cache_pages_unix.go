@@ -79,6 +79,11 @@ type externalPageMmapCache struct {
 func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]byte, bytesRead int, callback func(), err error) {
 	offset := uint64(sOffset)
 	size := uint64(sLen)
+	started := time.Now()
+	var hashMetadataElapsed time.Duration
+	var bufferLookupElapsed time.Duration
+	var externalElapsed time.Duration
+	var fallbackElapsed time.Duration
 
 	fh.inode.logFuse("ReadFile", offset, size)
 	defer func() {
@@ -86,20 +91,46 @@ func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]
 		if err == io.EOF {
 			err = nil
 		}
+		if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+			log.Debugf(
+				"geesefs read stage timing: path=%q hash=%q offset=%d size=%d bytes=%d err=%v total=%s hash_metadata=%s buffer_lookup=%s external_cache=%s fallback=%s",
+				fh.inode.FullName(),
+				fh.inode.cacheHashForLog(),
+				offset,
+				size,
+				bytesRead,
+				err,
+				elapsed.Truncate(time.Microsecond),
+				hashMetadataElapsed.Truncate(time.Microsecond),
+				bufferLookupElapsed.Truncate(time.Microsecond),
+				externalElapsed.Truncate(time.Microsecond),
+				fallbackElapsed.Truncate(time.Microsecond),
+			)
+		}
 	}()
 
 	if fh.shouldRetrieveHash() {
+		hashMetadataStarted := time.Now()
 		fh.retrieveHashMetadata()
+		hashMetadataElapsed = time.Since(hashMetadataStarted)
+		atomic.AddInt64(&fh.inode.fs.stats.readHashMetadataCount, 1)
+		atomic.AddInt64(&fh.inode.fs.stats.readHashMetadataNanos, hashMetadataElapsed.Nanoseconds())
 	}
 
+	bufferLookupStarted := time.Now()
 	data, _, err = fh.inode.buffers.GetData(offset, size, false)
+	bufferLookupElapsed = time.Since(bufferLookupStarted)
+	atomic.AddInt64(&fh.inode.fs.stats.readBufferLookupCount, 1)
+	atomic.AddInt64(&fh.inode.fs.stats.readBufferLookupNanos, bufferLookupElapsed.Nanoseconds())
 	if err == nil {
 		atomic.AddInt64(&fh.inode.fs.stats.readBufferHits, 1)
 		atomic.AddInt64(&fh.inode.fs.stats.readBufferBytes, int64(size))
 		return data, int(size), nil, nil
 	}
 
+	externalStarted := time.Now()
 	data, bytesRead, callback, ok, err := fh.tryReadExternalCachePages(offset, size)
+	externalElapsed = time.Since(externalStarted)
 	if ok || err != nil {
 		if callback != nil {
 			path := fh.inode.FullName()
@@ -116,7 +147,11 @@ func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]
 		return data, bytesRead, callback, err
 	}
 
+	fallbackStarted := time.Now()
 	data, bytesRead, err = fh.readFileAfterHash(sOffset, sLen)
+	fallbackElapsed = time.Since(fallbackStarted)
+	atomic.AddInt64(&fh.inode.fs.stats.readFallbackCount, 1)
+	atomic.AddInt64(&fh.inode.fs.stats.readFallbackNanos, fallbackElapsed.Nanoseconds())
 	return data, bytesRead, nil, err
 }
 
@@ -191,10 +226,28 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
 	}
 
+	viewStarted := time.Now()
 	views, err := pageCache.ClientLocalPageFileViews(hash, int64(windowOffset), int64(windowSize), struct{ RoutingKey string }{RoutingKey: hash})
+	viewElapsed := time.Since(viewStarted)
+	atomic.AddInt64(&fh.inode.fs.stats.externalPageViewCount, 1)
+	atomic.AddInt64(&fh.inode.fs.stats.externalPageViewNanos, viewElapsed.Nanoseconds())
 	lookupElapsed := time.Since(started)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageLookupCount, 1)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageLookupNanos, lookupElapsed.Nanoseconds())
+	if viewElapsed > 100*time.Millisecond {
+		log.Debugf(
+			"geesefs external page-view lookup slow: path=%q hash=%q offset=%d size=%d window_offset=%d window_size=%d views=%d err=%v elapsed=%s",
+			path,
+			hash,
+			offset,
+			size,
+			windowOffset,
+			windowSize,
+			len(views),
+			err,
+			viewElapsed.Truncate(time.Millisecond),
+		)
+	}
 	if err != nil || len(views) == 0 {
 		fh.recordExternalPageMiss(path, hash, offset, size, "no_client_local_page_file", started, err)
 		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
@@ -321,7 +374,22 @@ func (fh *FileHandle) tryReadExternalCacheInto(path, hash string, offset, size, 
 	}
 
 	buf := make([]byte, int(size))
+	readIntoStarted := time.Now()
 	n, readErr := readIntoCache.ReadContentInto(context.Background(), hash, int64(offset), buf, struct{ RoutingKey string }{RoutingKey: hash})
+	readIntoElapsed := time.Since(readIntoStarted)
+	atomic.AddInt64(&fh.inode.fs.stats.externalReadIntoNanos, readIntoElapsed.Nanoseconds())
+	if readIntoElapsed > 100*time.Millisecond {
+		log.Debugf(
+			"geesefs external read-into slow: path=%q hash=%q offset=%d size=%d read=%d err=%v elapsed=%s",
+			path,
+			hash,
+			offset,
+			size,
+			n,
+			readErr,
+			readIntoElapsed.Truncate(time.Millisecond),
+		)
+	}
 	if readErr != nil || n != int64(size) {
 		fh.inode.fs.bufferPool.Use(-accounted, false)
 		atomic.AddInt64(&fh.inode.fs.stats.externalReadIntoMisses, 1)

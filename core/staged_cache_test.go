@@ -921,7 +921,54 @@ func TestReadThroughFromBuffersUsesLocalBytes(t *testing.T) {
 	}
 }
 
-func TestReadThroughFallbackQueuesObjectSourceCacheEvent(t *testing.T) {
+func TestReadThroughFallbackQueuesReadBufferCacheEvent(t *testing.T) {
+	payload := []byte("0123456789")
+	expectedHash := "hash"
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = "sha256"
+	flags.ExternalCacheClient = &fakeContentCache{
+		getContent: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]byte, error) {
+			return nil, errContentNotFound
+		},
+	}
+
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = uint64(len(payload))
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte(expectedHash)}
+	inode.readCond = sync.NewCond(&inode.mu)
+
+	backend := &TestBackend{
+		GetBlobFunc: func(param *GetBlobInput) (*GetBlobOutput, error) {
+			return &GetBlobOutput{
+				Body: io.NopCloser(bytes.NewReader(payload[param.Start : param.Start+param.Count])),
+				HeadBlobOutput: HeadBlobOutput{
+					BlobItemOutput: BlobItemOutput{Metadata: map[string]*string{}},
+				},
+			}, nil
+		},
+	}
+
+	inode.retryRead(backend, "file", 0, uint64(len(payload)), false)
+
+	select {
+	case event := <-fs.cacheEventChan:
+		if event.hash != expectedHash || event.path != "file" || event.size != uint64(len(payload)) {
+			t.Fatalf("unexpected read-through cache event: %+v", event)
+		}
+		if !event.fromBuffers || event.localSourcePath != "" {
+			t.Fatalf("expected read-buffer cache event, got %+v", event)
+		}
+	default:
+		t.Fatal("expected read-through read-buffer cache event")
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsQueued); got != 1 {
+		t.Fatalf("expected one queued cache event, got %d", got)
+	}
+}
+
+func TestReadThroughNonZeroFallbackQueuesObjectSourceCacheEvent(t *testing.T) {
 	payload := []byte("0123456789")
 	expectedHash := "hash"
 
@@ -962,9 +1009,6 @@ func TestReadThroughFallbackQueuesObjectSourceCacheEvent(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected read-through object-source cache event")
-	}
-	if got := atomic.LoadInt64(&fs.stats.cacheEventsQueued); got != 1 {
-		t.Fatalf("expected one queued cache event, got %d", got)
 	}
 }
 

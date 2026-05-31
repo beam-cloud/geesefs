@@ -715,7 +715,11 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 				alloc += fallbackAlloc
 				done = fallbackDone
 				if fallbackDone > 0 {
-					inode.fs.CacheFileInExternalCache(inode)
+					if curOffset == 0 {
+						inode.fs.CacheFileInExternalCacheFromReadBuffers(inode)
+					} else {
+						inode.fs.CacheFileInExternalCache(inode)
+					}
 				}
 			}
 		} else {
