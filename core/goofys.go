@@ -547,6 +547,7 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 		} else if hash == cacheEvent.hash {
 			atomic.AddInt64(&fs.stats.cacheEventsSuccess, 1)
 			log.Debugf("geesefs external cache store result: status=ok path=%q hash=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
+			fs.emitExternalCacheStoredEvent(cacheEvent, source)
 			if cacheEvent.inode != nil {
 				cacheEvent.inode.dropCleanBuffersAfterExternalCacheStore(cacheEvent.hash)
 			}
@@ -564,6 +565,22 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 			log.Warnf("Failed to remove staged cache source %v: %v", cacheEvent.localSourcePath, err)
 		}
 	}
+}
+
+func (fs *Goofys) emitExternalCacheStoredEvent(cacheEvent cacheEvent, source string) {
+	if fs.flags.EventCallback == nil {
+		return
+	}
+
+	fs.flags.EventCallback(cfg.EventCacheTriggered, map[string]interface{}{
+		"path":         cacheEvent.path,
+		"inode":        cacheEvent.path,
+		"hash":         cacheEvent.hash,
+		"content_hash": cacheEvent.hash,
+		"size":         cacheEvent.size,
+		"size_bytes":   cacheEvent.size,
+		"source":       source,
+	})
 }
 
 func (fs *Goofys) storeCacheEventContent(cacheEvent cacheEvent) (string, error) {
@@ -750,6 +767,12 @@ func (fs *Goofys) CacheFileInExternalCacheFromBuffersLocked(inode *Inode) bool {
 		if err == nil && actualHash == hashString {
 			atomic.AddInt64(&fs.stats.cacheEventsSuccess, 1)
 			log.Debugf("geesefs external cache store result: status=ok path=%q hash=%q source=flushed_buffers size=%d", path, hashString, size)
+			fs.emitExternalCacheStoredEvent(cacheEvent{
+				path:  path,
+				size:  size,
+				hash:  hashString,
+				inode: inode,
+			}, "flushed_buffers")
 			return true
 		}
 

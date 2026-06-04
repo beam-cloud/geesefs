@@ -510,6 +510,42 @@ func TestSuccessfulStagedFlushEmitsOneUploadEvent(t *testing.T) {
 	}
 }
 
+func TestExternalCacheStoreEventIncludesContentIdentity(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	var gotEvent cfg.EventType
+	var gotData map[string]interface{}
+	flags.EventCallback = func(event cfg.EventType, data map[string]interface{}) {
+		gotEvent = event
+		gotData = data
+	}
+	fs := newUnitFS(flags)
+
+	fs.emitExternalCacheStoredEvent(cacheEvent{
+		path: "/volumes/ws/files/data.bin",
+		hash: "hash",
+		size: 32 << 20,
+	}, "s3")
+
+	if gotEvent != cfg.EventCacheTriggered {
+		t.Fatalf("event = %q, want %q", gotEvent, cfg.EventCacheTriggered)
+	}
+	if gotData["path"] != "/volumes/ws/files/data.bin" {
+		t.Fatalf("path = %#v", gotData["path"])
+	}
+	if gotData["inode"] != "/volumes/ws/files/data.bin" {
+		t.Fatalf("inode = %#v", gotData["inode"])
+	}
+	if gotData["hash"] != "hash" || gotData["content_hash"] != "hash" {
+		t.Fatalf("hash payload = %#v", gotData)
+	}
+	if gotData["size_bytes"] != uint64(32<<20) || gotData["size"] != uint64(32<<20) {
+		t.Fatalf("size payload = %#v", gotData)
+	}
+	if gotData["source"] != "s3" {
+		t.Fatalf("source = %#v", gotData["source"])
+	}
+}
+
 func newStagedInodeForFlush(t *testing.T, fs *Goofys, root *Inode, data []byte) (*Inode, string) {
 	t.Helper()
 
