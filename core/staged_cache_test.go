@@ -622,6 +622,225 @@ func TestExternalCacheShortStreamFallsBackWithoutZeroPadding(t *testing.T) {
 	}
 }
 
+func TestExternalCacheReadIntoTimeoutFallsBackToCloud(t *testing.T) {
+	want := []byte("hello world")
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheReadTimeout = 10 * time.Millisecond
+	releaseCache := make(chan struct{})
+	cacheStarted := make(chan struct{})
+	var closeStarted sync.Once
+	flags.ExternalCacheClient = &fakeContentCache{
+		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			closeStarted.Do(func() { close(cacheStarted) })
+			<-releaseCache
+			return 0, errContentNotFound
+		},
+	}
+	defer close(releaseCache)
+
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = uint64(len(want))
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	inode.readCond = sync.NewCond(&inode.mu)
+	backend := &TestBackend{}
+	var getBlobCalls int32
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		atomic.AddInt32(&getBlobCalls, 1)
+		return &GetBlobOutput{
+			Body: io.NopCloser(bytes.NewReader(want[param.Start : param.Start+param.Count])),
+			HeadBlobOutput: HeadBlobOutput{
+				BlobItemOutput: BlobItemOutput{Metadata: map[string]*string{}},
+			},
+		}, nil
+	}
+
+	started := time.Now()
+	inode.retryRead(backend, "file", 0, uint64(len(want)), false)
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("cache timeout fallback took too long: %s", elapsed)
+	}
+	select {
+	case <-cacheStarted:
+	default:
+		t.Fatal("expected cache read-into call")
+	}
+	if got := atomic.LoadInt32(&getBlobCalls); got != 1 {
+		t.Fatalf("expected one S3 fallback read, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalCacheTimeouts); got != 1 {
+		t.Fatalf("expected one external cache timeout, got %d", got)
+	}
+	data, _, err := inode.buffers.GetData(0, uint64(len(want)), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytes.Join(data, nil); !bytes.Equal(got, want) {
+		t.Fatalf("fallback data mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestExternalCacheUnaryTimeoutFallsBackToCloud(t *testing.T) {
+	want := []byte("hello world")
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheReadTimeout = 10 * time.Millisecond
+	releaseCache := make(chan struct{})
+	cacheStarted := make(chan struct{})
+	var closeStarted sync.Once
+	flags.ExternalCacheClient = &fakeContentCache{
+		getContent: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]byte, error) {
+			closeStarted.Do(func() { close(cacheStarted) })
+			<-releaseCache
+			return nil, errContentNotFound
+		},
+	}
+	defer close(releaseCache)
+
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = uint64(len(want))
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	inode.readCond = sync.NewCond(&inode.mu)
+	backend := &TestBackend{}
+	var getBlobCalls int32
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		atomic.AddInt32(&getBlobCalls, 1)
+		return &GetBlobOutput{
+			Body: io.NopCloser(bytes.NewReader(want[param.Start : param.Start+param.Count])),
+			HeadBlobOutput: HeadBlobOutput{
+				BlobItemOutput: BlobItemOutput{Metadata: map[string]*string{}},
+			},
+		}, nil
+	}
+
+	started := time.Now()
+	inode.retryRead(backend, "file", 0, uint64(len(want)), false)
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("cache timeout fallback took too long: %s", elapsed)
+	}
+	select {
+	case <-cacheStarted:
+	default:
+		t.Fatal("expected cache unary call")
+	}
+	if got := atomic.LoadInt32(&getBlobCalls); got != 1 {
+		t.Fatalf("expected one S3 fallback read, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalCacheTimeouts); got != 1 {
+		t.Fatalf("expected one external cache timeout, got %d", got)
+	}
+	data, _, err := inode.buffers.GetData(0, uint64(len(want)), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytes.Join(data, nil); !bytes.Equal(got, want) {
+		t.Fatalf("fallback data mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestExternalCacheStreamStallFallsBackToCloud(t *testing.T) {
+	want := []byte("hello world")
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheStreamingEnabled = true
+	flags.ExternalCacheReadTimeout = 10 * time.Millisecond
+	streamCh := make(chan []byte)
+	flags.ExternalCacheClient = &fakeContentCache{
+		getContentStream: func(hash string, offset int64, length int64, opts struct {
+			RoutingKey string
+		}) (chan []byte, error) {
+			return streamCh, nil
+		},
+	}
+	defer close(streamCh)
+
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = uint64(len(want))
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	inode.readCond = sync.NewCond(&inode.mu)
+	backend := &TestBackend{}
+	var getBlobCalls int32
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		atomic.AddInt32(&getBlobCalls, 1)
+		return &GetBlobOutput{
+			Body: io.NopCloser(bytes.NewReader(want[param.Start : param.Start+param.Count])),
+			HeadBlobOutput: HeadBlobOutput{
+				BlobItemOutput: BlobItemOutput{Metadata: map[string]*string{}},
+			},
+		}, nil
+	}
+
+	started := time.Now()
+	inode.retryRead(backend, "file", 0, uint64(len(want)), false)
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("cache stream fallback took too long: %s", elapsed)
+	}
+	if got := atomic.LoadInt32(&getBlobCalls); got != 1 {
+		t.Fatalf("expected one S3 fallback read, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalCacheTimeouts); got != 1 {
+		t.Fatalf("expected one external cache timeout, got %d", got)
+	}
+	data, _, err := inode.buffers.GetData(0, uint64(len(want)), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytes.Join(data, nil); !bytes.Equal(got, want) {
+		t.Fatalf("fallback data mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestExternalCacheStreamProgressDoesNotTimeout(t *testing.T) {
+	want := []byte("hello world!")
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheStreamingEnabled = true
+	flags.ExternalCacheReadTimeout = 100 * time.Millisecond
+	streamCh := make(chan []byte)
+	flags.ExternalCacheClient = &fakeContentCache{
+		getContentStream: func(hash string, offset int64, length int64, opts struct {
+			RoutingKey string
+		}) (chan []byte, error) {
+			return streamCh, nil
+		},
+	}
+
+	fs := newUnitFS(flags)
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = uint64(len(want))
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	inode.readCond = sync.NewCond(&inode.mu)
+	backend := &TestBackend{}
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		t.Fatalf("stream with steady progress should not fall back to S3: %+v", param)
+		return nil, nil
+	}
+
+	go func() {
+		streamCh <- []byte("hello ")
+		time.Sleep(60 * time.Millisecond)
+		streamCh <- []byte("world")
+		time.Sleep(60 * time.Millisecond)
+		streamCh <- []byte("!")
+		close(streamCh)
+	}()
+
+	started := time.Now()
+	inode.retryRead(backend, "file", 0, uint64(len(want)), false)
+	if elapsed := time.Since(started); elapsed <= flags.ExternalCacheReadTimeout {
+		t.Fatalf("test did not exercise a stream longer than timeout: elapsed=%s timeout=%s", elapsed, flags.ExternalCacheReadTimeout)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalCacheTimeouts); got != 0 {
+		t.Fatalf("expected no external cache timeouts, got %d", got)
+	}
+	data, _, err := inode.buffers.GetData(0, uint64(len(want)), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytes.Join(data, nil); !bytes.Equal(got, want) {
+		t.Fatalf("stream data mismatch: got %q want %q", got, want)
+	}
+}
+
 func TestCacheStatusClearedByHash(t *testing.T) {
 	for _, tt := range []struct {
 		name     string

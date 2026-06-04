@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -129,6 +130,73 @@ func TestExternalCacheClientLocalPageFileViewReadUsesForegroundRange(t *testing.
 	}
 	if calls[0].offset != 0 || calls[0].length != 6 {
 		t.Fatalf("unexpected foreground page-file lookups: %+v", calls)
+	}
+}
+
+func TestExternalCacheClientLocalPageFileViewTimeoutFallsBackToCloud(t *testing.T) {
+	want := []byte("hello world")
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheReadTimeout = 10 * time.Millisecond
+	releaseCache := make(chan struct{})
+	cacheStarted := make(chan struct{})
+	var closeStarted atomic.Bool
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			if closeStarted.CompareAndSwap(false, true) {
+				close(cacheStarted)
+			}
+			<-releaseCache
+			return nil, errContentNotFound
+		},
+	}
+	defer close(releaseCache)
+
+	fs := newUnitFS(flags)
+	backend := &TestBackend{}
+	var getBlobCalls int32
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		atomic.AddInt32(&getBlobCalls, 1)
+		return &GetBlobOutput{
+			Body: io.NopCloser(bytes.NewReader(want[param.Start : param.Start+param.Count])),
+			HeadBlobOutput: HeadBlobOutput{
+				BlobItemOutput: BlobItemOutput{Metadata: map[string]*string{}},
+			},
+		}, nil
+	}
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "file")
+	inode.Attributes.Size = uint64(len(want))
+	inode.knownSize = uint64(len(want))
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	fh := NewFileHandle(inode)
+
+	started := time.Now()
+	data, bytesRead, cleanup, err := fh.ReadFileWithCallback(0, int64(len(want)))
+	if cleanup != nil {
+		cleanup()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("page-file timeout fallback took too long: %s", elapsed)
+	}
+	select {
+	case <-cacheStarted:
+	default:
+		t.Fatal("expected client-local page-file lookup")
+	}
+	if bytesRead != len(want) {
+		t.Fatalf("expected %d bytes read, got %d", len(want), bytesRead)
+	}
+	if got := bytes.Join(data, nil); !bytes.Equal(got, want) {
+		t.Fatalf("fallback data mismatch: got %q want %q", got, want)
+	}
+	if got := atomic.LoadInt32(&getBlobCalls); got != 1 {
+		t.Fatalf("expected one S3 fallback read, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalCacheTimeouts); got != 1 {
+		t.Fatalf("expected one external cache timeout, got %d", got)
 	}
 }
 

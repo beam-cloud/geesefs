@@ -16,7 +16,6 @@
 package core
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -56,6 +55,7 @@ const MAX_FLUSH_PRIORITY = 3
 var (
 	errContentNotFound          = errors.New("content not found")
 	errExternalCacheUnavailable = errors.New("external cache unavailable")
+	errExternalCacheTimeout     = errors.New("external cache read timed out")
 )
 
 func isExternalCacheMiss(err error) bool {
@@ -72,6 +72,7 @@ func isExternalCacheUnavailable(err error) bool {
 		return false
 	}
 	return errors.Is(err, errExternalCacheUnavailable) ||
+		errors.Is(err, errExternalCacheTimeout) ||
 		strings.Contains(err.Error(), "selected cache host unavailable") ||
 		strings.Contains(err.Error(), "content cache unavailable")
 }
@@ -484,7 +485,7 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 			return 0, 0, errContentNotFound
 		}
 		buf := make([]byte, int(size))
-		n, err := readIntoCache.ReadContentInto(context.Background(), string(hash), int64(offset), buf, struct{ RoutingKey string }{RoutingKey: hash})
+		n, err := inode.fs.externalCacheReadContentInto(readIntoCache, hash, int64(offset), buf)
 		if err == nil && n == int64(size) {
 			atomic.AddInt64(&inode.fs.stats.externalReadIntoHits, 1)
 			atomic.AddInt64(&inode.fs.stats.externalReadIntoBytes, n)
@@ -503,7 +504,7 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 
 	if inode.fs.flags.ExternalCacheStreamingEnabled {
 		atomic.AddInt64(&inode.fs.stats.externalStreamAttempts, 1)
-		contentChan, err := inode.fs.flags.ExternalCacheClient.GetContentStream(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
+		contentChan, err := inode.fs.externalCacheGetContentStream(inode.fs.flags.ExternalCacheClient, hash, int64(offset), int64(size))
 		if err != nil || contentChan == nil {
 			atomic.AddInt64(&inode.fs.stats.externalStreamMisses, 1)
 			if err != nil && !isExternalCacheMiss(err) {
@@ -512,7 +513,33 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 			return 0, 0, errContentNotFound
 		}
 
-		for chunk := range contentChan {
+		streamTimeout := inode.fs.externalCacheReadTimeout()
+		streamTimer := time.NewTimer(streamTimeout)
+		defer streamTimer.Stop()
+		resetStreamTimer := func() {
+			if !streamTimer.Stop() {
+				select {
+				case <-streamTimer.C:
+				default:
+				}
+			}
+			streamTimer.Reset(streamTimeout)
+		}
+		streamOpen := true
+		for streamOpen {
+			var chunk []byte
+			var ok bool
+			select {
+			case chunk, ok = <-contentChan:
+				if !ok {
+					streamOpen = false
+					continue
+				}
+				resetStreamTimer()
+			case <-streamTimer.C:
+				atomic.AddInt64(&inode.fs.stats.externalStreamMisses, 1)
+				return allocated, 0, inode.fs.externalCacheStreamReceiveTimeout("GetContentStream.receive", hash, streamTimeout)
+			}
 			if len(chunk) == 0 {
 				continue
 			}
@@ -539,7 +566,7 @@ func (inode *Inode) loadFromExternalCache(offset uint64, size uint64, hash strin
 	}
 
 	atomic.AddInt64(&inode.fs.stats.externalUnaryAttempts, 1)
-	buf, err := inode.fs.flags.ExternalCacheClient.GetContent(string(hash), int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: hash})
+	buf, err := inode.fs.externalCacheGetContent(inode.fs.flags.ExternalCacheClient, hash, int64(offset), int64(size))
 	if err != nil || buf == nil || uint64(len(buf)) != size {
 		atomic.AddInt64(&inode.fs.stats.externalUnaryMisses, 1)
 		if err != nil && !isExternalCacheMiss(err) {
@@ -706,9 +733,6 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 		if inode.fs.flags.ExternalCacheClient != nil && hashFound {
 			alloc, done, err = inode.loadFromExternalCache(curOffset, curSize, hash)
 			if err != nil {
-				if isExternalCacheUnavailable(err) {
-					return err
-				}
 				var fallbackAlloc int64
 				var fallbackDone uint64
 				fallbackAlloc, fallbackDone, err = inode.sendRead(cloud, key, curOffset, curSize)

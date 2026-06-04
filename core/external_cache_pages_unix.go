@@ -19,7 +19,6 @@ package core
 
 import (
 	"container/list"
-	"context"
 	"fmt"
 	"io"
 	"os"
@@ -227,7 +226,7 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	}
 
 	viewStarted := time.Now()
-	views, err := pageCache.ClientLocalPageFileViews(hash, int64(windowOffset), int64(windowSize), struct{ RoutingKey string }{RoutingKey: hash})
+	views, err := fh.inode.fs.externalCacheClientLocalPageFileViews(pageCache, hash, int64(windowOffset), int64(windowSize))
 	viewElapsed := time.Since(viewStarted)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageViewCount, 1)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageViewNanos, viewElapsed.Nanoseconds())
@@ -343,7 +342,7 @@ func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize 
 		if next+windowSize > fileSize {
 			windowSize = fileSize - next
 		}
-		if !cache.prefetchWindow(hash, next, windowSize, fileSize, pageCache, readIntoCache) {
+		if !cache.prefetchWindow(fh.inode.fs, hash, next, windowSize, fileSize, pageCache, readIntoCache) {
 			return
 		}
 		next += windowSize
@@ -375,7 +374,7 @@ func (fh *FileHandle) tryReadExternalCacheInto(path, hash string, offset, size, 
 
 	buf := make([]byte, int(size))
 	readIntoStarted := time.Now()
-	n, readErr := readIntoCache.ReadContentInto(context.Background(), hash, int64(offset), buf, struct{ RoutingKey string }{RoutingKey: hash})
+	n, readErr := fh.inode.fs.externalCacheReadContentInto(readIntoCache, hash, int64(offset), buf)
 	readIntoElapsed := time.Since(readIntoStarted)
 	atomic.AddInt64(&fh.inode.fs.stats.externalReadIntoNanos, readIntoElapsed.Nanoseconds())
 	if readIntoElapsed > 100*time.Millisecond {
@@ -554,7 +553,7 @@ func (c *externalPageMmapCache) lookup(cacheKey string, offset, size uint64) (da
 	return data, callback, true
 }
 
-func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto) bool {
+func (c *externalPageMmapCache) prefetchWindow(fs *Goofys, cacheKey string, offset, size, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto) bool {
 	if cacheKey == "" || (pageCache == nil && readIntoCache == nil) || size == 0 || offset >= fileSize {
 		return true
 	}
@@ -594,7 +593,7 @@ func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fi
 		}()
 
 		if pageCache != nil {
-			views, err := pageCache.ClientLocalPageFileViews(cacheKey, int64(offset), int64(size), struct{ RoutingKey string }{RoutingKey: cacheKey})
+			views, err := fs.externalCacheClientLocalPageFileViews(pageCache, cacheKey, int64(offset), int64(size))
 			if err == nil && len(views) > 0 {
 				if err := c.insertWindow(cacheKey, offset, views); err != nil {
 					return
@@ -614,7 +613,7 @@ func (c *externalPageMmapCache) prefetchWindow(cacheKey string, offset, size, fi
 			return
 		}
 		buf := make([]byte, int(size))
-		n, err := readIntoCache.ReadContentInto(context.Background(), cacheKey, int64(offset), buf, struct{ RoutingKey string }{RoutingKey: cacheKey})
+		n, err := fs.externalCacheReadContentInto(readIntoCache, cacheKey, int64(offset), buf)
 		if err != nil || n != int64(size) {
 			return
 		}
