@@ -56,7 +56,12 @@ var (
 	errContentNotFound          = errors.New("content not found")
 	errExternalCacheUnavailable = errors.New("external cache unavailable")
 	errExternalCacheTimeout     = errors.New("external cache read timed out")
+	errReadLoadingStalled       = errors.New("read loading stalled")
 )
+
+// stagedReadAfterAddLoadingHook is nil in production. Tests use it to make
+// staged-read races deterministic.
+var stagedReadAfterAddLoadingHook func()
 
 func isExternalCacheMiss(err error) bool {
 	if err == nil {
@@ -442,22 +447,26 @@ func (inode *Inode) loadDiskBackedBuffers(offset, size uint64) error {
 	return err
 }
 
-func (inode *Inode) loadFromStagedFile(diskRanges []Range) (buffers []struct {
+func (inode *Inode) loadFromStagedFile(stagedFile *StagedFile, diskRanges []Range) (buffers []struct {
 	offset uint64
 	data   []byte
 }, allocated int64, err error) {
-	inode.StagedFile.mu.Lock()
-	defer inode.StagedFile.mu.Unlock()
-
-	if inode.StagedFile.FD == nil {
+	if stagedFile == nil {
 		return nil, 0, syscall.EAGAIN
 	}
 
-	inode.StagedFile.lastReadAt = time.Now()
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
+	if stagedFile.FD == nil {
+		return nil, 0, syscall.EAGAIN
+	}
+
+	stagedFile.lastReadAt = time.Now()
 	for _, rr := range diskRanges {
 		readSize := rr.End - rr.Start
 		data := make([]byte, readSize)
-		n, err := inode.StagedFile.FD.ReadAt(data, int64(rr.Start))
+		n, err := stagedFile.FD.ReadAt(data, int64(rr.Start))
 		if err != nil {
 			return nil, 0, err
 		}
@@ -607,7 +616,8 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 		raSize = inode.Attributes.Size - offset
 	}
 
-	isStagedFile := inode.fs.flags.StagedWriteModeEnabled && inode.StagedFile != nil
+	stagedFile := inode.StagedFile
+	isStagedFile := inode.fs.flags.StagedWriteModeEnabled && stagedFile != nil
 
 	// Collect requests to the server and disk
 	readRanges, loading, flushCleared := inode.buffers.GetHoles(offset, raSize)
@@ -622,6 +632,9 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 
 		// If staged write mode is enabled, try to load from the staged file
 		if isStagedFile {
+			if maxStagedRead := inode.fs.flags.ReadAheadParallelKB * 1024; maxStagedRead > 0 {
+				readRanges = splitRA(readRanges, maxStagedRead)
+			}
 			for _, rr := range readRanges {
 				inode.buffers.AddLoading(rr.Start, rr.End-rr.Start)
 			}
@@ -629,18 +642,36 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 			if len(readRanges) > 0 {
 				// Unlock mutex before doing blocking I/O
 				inode.mu.Unlock()
-				buffers, allocated, err := inode.loadFromStagedFile(readRanges)
-				inode.fs.bufferPool.Use(allocated, true)
+				if stagedReadAfterAddLoadingHook != nil {
+					stagedReadAfterAddLoadingHook()
+				}
+				buffers, allocated, err := inode.loadFromStagedFile(stagedFile, readRanges)
+				if err == nil {
+					inode.fs.bufferPool.Use(allocated, true)
+				}
 				inode.mu.Lock()
 
-				// Return on error
 				if err != nil {
-					return miss, err
-				}
-
-				// Apply the loaded buffers while holding the mutex
-				for _, buf := range buffers {
-					inode.buffers.ReviveFromStagedFile(buf.offset, buf.data)
+					for _, rr := range readRanges {
+						inode.buffers.RemoveLoading(rr.Start, rr.End-rr.Start)
+					}
+					if inode.readCond != nil {
+						inode.readCond.Broadcast()
+					}
+					if inode.StagedFile == nil {
+						inode.loadFromServer(readRanges, readAheadSize, ignoreMemoryLimit)
+						err = nil
+					} else {
+						return miss, err
+					}
+				} else {
+					// Apply the loaded buffers while holding the mutex
+					for _, buf := range buffers {
+						inode.buffers.ReviveFromStagedFile(buf.offset, buf.data)
+					}
+					if inode.readCond != nil {
+						inode.readCond.Broadcast()
+					}
 				}
 			}
 		} else {
@@ -671,11 +702,20 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 		if inode.readCond == nil {
 			inode.readCond = sync.NewCond(&inode.mu)
 		}
+		waitDeadline := time.Now().Add(inode.fs.readLoadingTimeout())
 		for {
 			_, _, err := inode.buffers.GetData(offset, size, false)
 			if err == ErrBufferIsLoading {
+				if time.Now().After(waitDeadline) {
+					err = fmt.Errorf("%w: path=%q offset=%d size=%d timeout=%s", errReadLoadingStalled, inode.FullName(), offset, size, inode.fs.readLoadingTimeout())
+					log.Warnf("geesefs read loading stalled: %v", err)
+					inode.readError = errReadLoadingStalled
+					inode.buffers.RemoveLoading(offset, size)
+					inode.readCond.Broadcast()
+					return true, err
+				}
 				// still loading
-				inode.readCond.Wait()
+				inode.waitReadCondUntil(waitDeadline)
 			} else if err == ErrBufferIsMissing {
 				// loading buffer disappeared => read error
 				err = inode.readError
@@ -690,6 +730,29 @@ func (inode *Inode) LoadRange(offset, size uint64, readAheadSize uint64, ignoreM
 	}
 
 	return
+}
+
+func (fs *Goofys) readLoadingTimeout() time.Duration {
+	if fs != nil && fs.flags != nil && fs.flags.HTTPTimeout > 0 {
+		return fs.flags.HTTPTimeout
+	}
+	return 30 * time.Second
+}
+
+func (inode *Inode) waitReadCondUntil(deadline time.Time) {
+	if inode == nil || inode.readCond == nil {
+		return
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return
+	}
+
+	timer := time.AfterFunc(remaining, func() {
+		inode.readCond.Broadcast()
+	})
+	inode.readCond.Wait()
+	timer.Stop()
 }
 
 func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uint64, ignoreMemoryLimit bool) {
@@ -1016,10 +1079,23 @@ func (fh *FileHandle) readFileAfterHash(sOffset int64, sLen int64) (data [][]byt
 	fh.inode.LockRange(offset, size, false)
 	defer fh.inode.UnlockRange(offset, size, false)
 
-	// Check if anything requires to be loaded from the server
+	// Check if anything requires to be loaded from the server. If an earlier
+	// loader wedged after marking buffers as loading, clear those placeholders
+	// once and issue a fresh origin read instead of waiting forever.
 	ra := fh.getReadAhead()
 	fh.trackRead(offset, size)
-	miss, requestErr := fh.inode.CheckLoadRange(offset, size, ra, false)
+	var miss bool
+	var requestErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if errors.Is(requestErr, errReadLoadingStalled) {
+			fh.inode.readError = nil
+		}
+		miss, requestErr = fh.inode.CheckLoadRange(offset, size, ra, false)
+		if !errors.Is(requestErr, errReadLoadingStalled) {
+			break
+		}
+		log.Warnf("geesefs retrying stalled read loading: path=%q offset=%d size=%d attempt=%d", fh.inode.FullName(), offset, size, attempt+1)
+	}
 	if !miss {
 		atomic.AddInt64(&fh.inode.fs.stats.readHits, 1)
 	}

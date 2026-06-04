@@ -841,6 +841,311 @@ func TestExternalCacheStreamProgressDoesNotTimeout(t *testing.T) {
 	}
 }
 
+func TestStagedReadBroadcastsLoadedBuffersToWaiters(t *testing.T) {
+	want := bytes.Repeat([]byte{7}, 2*1024*1024)
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.ReadAheadKB = uint64(len(want) / 1024)
+	flags.ReadAheadLargeKB = flags.ReadAheadKB
+
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, &TestBackend{})
+	inode := NewInode(fs, root, "file")
+	inode.Attributes.Size = uint64(len(want))
+	inode.knownSize = uint64(len(want))
+
+	stagedPath := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(stagedPath, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := os.OpenFile(stagedPath, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+
+	inode.StagedFile = &StagedFile{
+		FH:          NewFileHandle(inode),
+		FD:          fd,
+		lastWriteAt: time.Now(),
+		lastReadAt:  time.Now(),
+		debounce:    time.Hour,
+	}
+
+	markedLoading := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	var hookOnce sync.Once
+	oldHook := stagedReadAfterAddLoadingHook
+	stagedReadAfterAddLoadingHook = func() {
+		hookOnce.Do(func() {
+			close(markedLoading)
+			<-releaseLoad
+		})
+	}
+	defer func() {
+		stagedReadAfterAddLoadingHook = oldHook
+	}()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		data, bytesRead, err := NewFileHandle(inode).ReadFile(0, int64(len(want)/2))
+		if err == nil && bytesRead != len(want)/2 {
+			err = errors.New("short first read")
+		}
+		if err == nil && !bytes.Equal(bytes.Join(data, nil), want[:len(want)/2]) {
+			err = errors.New("first read data mismatch")
+		}
+		firstDone <- err
+	}()
+
+	select {
+	case <-markedLoading:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for staged read to mark loading buffers")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		data, bytesRead, err := NewFileHandle(inode).ReadFile(int64(len(want)/2), int64(len(want)/2))
+		if err == nil && bytesRead != len(want)/2 {
+			err = errors.New("short second read")
+		}
+		if err == nil && !bytes.Equal(bytes.Join(data, nil), want[len(want)/2:]) {
+			err = errors.New("second read data mismatch")
+		}
+		secondDone <- err
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		inode.mu.Lock()
+		waiting := inode.readCond != nil
+		inode.mu.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for second staged read to block on loading buffers")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	close(releaseLoad)
+	for name, ch := range map[string]chan error{"first": firstDone, "second": secondDone} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("%s read failed: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s read did not complete after staged load broadcast", name)
+		}
+	}
+}
+
+func TestStagedReadSplitsLargeReadaheadLoads(t *testing.T) {
+	const maxChunk = 1024 * 1024
+	want := bytes.Repeat([]byte{3}, 8*maxChunk)
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.ReadAheadKB = uint64(len(want) / 1024)
+	flags.ReadAheadParallelKB = maxChunk / 1024
+
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, &TestBackend{})
+	inode := NewInode(fs, root, "file")
+	inode.Attributes.Size = uint64(len(want))
+	inode.knownSize = uint64(len(want))
+
+	stagedPath := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(stagedPath, want, 0600); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := os.OpenFile(stagedPath, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+
+	inode.StagedFile = &StagedFile{
+		FH:       NewFileHandle(inode),
+		FD:       fd,
+		debounce: time.Hour,
+	}
+
+	data, bytesRead, err := NewFileHandle(inode).ReadFile(0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytesRead != 1 || !bytes.Equal(bytes.Join(data, nil), want[:1]) {
+		t.Fatalf("unexpected read result: bytes=%d data=%q", bytesRead, bytes.Join(data, nil))
+	}
+
+	var loadedBuffers int
+	inode.buffers.at.Ascend(0, func(_ uint64, b *FileBuffer) bool {
+		if b.data != nil {
+			loadedBuffers++
+			if b.length > maxChunk {
+				t.Fatalf("staged read buffer length = %d, want <= %d", b.length, maxChunk)
+			}
+		}
+		return true
+	})
+	if loadedBuffers != len(want)/maxChunk {
+		t.Fatalf("loaded buffers = %d, want %d", loadedBuffers, len(want)/maxChunk)
+	}
+}
+
+func TestStagedReadErrorClearsLoadingBuffers(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, &TestBackend{})
+	inode := NewInode(fs, root, "file")
+	inode.Attributes.Size = 4
+	inode.knownSize = 4
+	inode.StagedFile = &StagedFile{
+		FH:       NewFileHandle(inode),
+		debounce: time.Hour,
+	}
+
+	_, _, err := NewFileHandle(inode).ReadFile(0, 4)
+	if !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("expected staged read EAGAIN, got %v", err)
+	}
+	_, loading, _ := inode.buffers.GetHoles(0, 4)
+	if loading {
+		t.Fatal("staged read error left loading buffers behind")
+	}
+}
+
+func TestStagedReadFallsBackToOriginWhenStagedFileDetachedDuringLoad(t *testing.T) {
+	want := []byte("origin data")
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+
+	fs := newUnitFS(flags)
+	backend := &TestBackend{}
+	var getBlobCalls int32
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		atomic.AddInt32(&getBlobCalls, 1)
+		start := int(param.Start)
+		end := int(param.Start + param.Count)
+		return &GetBlobOutput{
+			Body: io.NopCloser(bytes.NewReader(want[start:end])),
+			HeadBlobOutput: HeadBlobOutput{
+				BlobItemOutput: BlobItemOutput{Metadata: map[string]*string{}},
+			},
+		}, nil
+	}
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "file")
+	inode.Attributes.Size = uint64(len(want))
+	inode.knownSize = uint64(len(want))
+
+	stagedPath := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(stagedPath, bytes.Repeat([]byte("x"), len(want)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := os.OpenFile(stagedPath, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stagedFile := &StagedFile{
+		FH:       NewFileHandle(inode),
+		FD:       fd,
+		debounce: time.Hour,
+	}
+	inode.StagedFile = stagedFile
+
+	var hookOnce sync.Once
+	oldHook := stagedReadAfterAddLoadingHook
+	stagedReadAfterAddLoadingHook = func() {
+		hookOnce.Do(func() {
+			stagedFile.mu.Lock()
+			_ = stagedFile.FD.Close()
+			stagedFile.FD = nil
+			stagedFile.mu.Unlock()
+
+			inode.mu.Lock()
+			inode.StagedFile = nil
+			inode.SetCacheState(ST_CACHED)
+			inode.mu.Unlock()
+		})
+	}
+	defer func() {
+		stagedReadAfterAddLoadingHook = oldHook
+	}()
+
+	data, bytesRead, err := NewFileHandle(inode).ReadFile(0, int64(len(want)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytesRead != len(want) {
+		t.Fatalf("expected %d bytes read, got %d", len(want), bytesRead)
+	}
+	if got := bytes.Join(data, nil); !bytes.Equal(got, want) {
+		t.Fatalf("origin fallback data mismatch: got %q want %q", got, want)
+	}
+	if got := atomic.LoadInt32(&getBlobCalls); got != 1 {
+		t.Fatalf("expected one origin read, got %d", got)
+	}
+	_, loading, _ := inode.buffers.GetHoles(0, uint64(len(want)))
+	if loading {
+		t.Fatal("origin fallback left loading buffers behind")
+	}
+}
+
+func TestReadFileRetriesStalledLoadingBuffer(t *testing.T) {
+	want := []byte("hello world")
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.HTTPTimeout = 10 * time.Millisecond
+
+	fs := newUnitFS(flags)
+	backend := &TestBackend{}
+	var getBlobCalls int32
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		atomic.AddInt32(&getBlobCalls, 1)
+		return &GetBlobOutput{
+			Body: io.NopCloser(bytes.NewReader(want[param.Start : param.Start+param.Count])),
+			HeadBlobOutput: HeadBlobOutput{
+				BlobItemOutput: BlobItemOutput{Metadata: map[string]*string{}},
+			},
+		}, nil
+	}
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "file")
+	inode.Attributes.Size = uint64(len(want))
+	inode.knownSize = uint64(len(want))
+	inode.readCond = sync.NewCond(&inode.mu)
+	inode.buffers.AddLoading(0, uint64(len(want)))
+	fh := NewFileHandle(inode)
+
+	started := time.Now()
+	data, bytesRead, err := fh.ReadFile(0, int64(len(want)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("stalled loading retry took too long: %s", elapsed)
+	}
+	if bytesRead != len(want) {
+		t.Fatalf("expected %d bytes read, got %d", len(want), bytesRead)
+	}
+	if got := atomic.LoadInt32(&getBlobCalls); got != 1 {
+		t.Fatalf("expected one origin read after stale loading timeout, got %d", got)
+	}
+	if got := bytes.Join(data, nil); !bytes.Equal(got, want) {
+		t.Fatalf("origin data mismatch: got %q want %q", got, want)
+	}
+}
+
 func TestCacheStatusClearedByHash(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
