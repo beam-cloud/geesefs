@@ -1719,14 +1719,30 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 		return nil
 	}
 
-	localPath := stagedFile.FD.Name()
 	if syncErr := stagedFile.FD.Sync(); syncErr != nil {
 		stagedFile.mu.Unlock()
 		inode.mu.Unlock()
 		return syncErr
 	}
+	localPath, ok := stagedFile.pathLocked()
+	if !ok {
+		stagedFile.mu.Unlock()
+		inode.mu.Unlock()
+		return os.ErrClosed
+	}
+	localFile, openErr := os.Open(localPath)
+	if openErr != nil {
+		stagedFile.mu.Unlock()
+		inode.mu.Unlock()
+		return openErr
+	}
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
+	flushWeight := fs.flags.MaxParallelParts
+	if flushWeight < 1 {
+		flushWeight = 1
+	}
+	inode.IsFlushing += flushWeight
 	stagedFile.mu.Unlock()
 
 	totalSize := inode.Attributes.Size
@@ -1737,17 +1753,21 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	}
 	contentType := inode.fs.flags.GetMimeType(inode.FullName())
 	inode.mu.Unlock()
+	defer localFile.Close()
 
 	defer func() {
+		inode.mu.Lock()
+		inode.IsFlushing -= flushWeight
+		inode.mu.Unlock()
 		if err != nil {
 			stagedFile.ResetFlushForRetry()
-			fs.WakeupFlusher()
 		}
+		fs.WakeupFlusher()
 	}()
 
 	var hash []byte
 	if fs.flags.HashAttr != "" && totalSize >= fs.flags.MinFileSizeForHashKB*1024 {
-		hashString, hashErr := hashLocalFile(localPath)
+		hashString, hashErr := hashLocalFile(localFile, totalSize)
 		if hashErr != nil {
 			return hashErr
 		}
@@ -1765,7 +1785,7 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	inode.mu.Unlock()
 
 	log.Debugf("Directly flushing staged file: inode=%s size=%d path=%s", inode.FullName(), totalSize, localPath)
-	resp, err := fs.uploadStagedFileDirect(cloud, key, localPath, totalSize, contentType, metadata)
+	resp, err := fs.uploadStagedFileDirect(cloud, key, localFile, totalSize, contentType, metadata)
 	if err != nil {
 		log.Warnf("Failed direct staged file flush for %s: %v", inode.FullName(), err)
 		inode.mu.Lock()
@@ -1790,22 +1810,23 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	}
 	inode.mu.Unlock()
 
+	inode.mu.Lock()
+	var size uint64
+	size = inode.Attributes.Size
+	localPath, hasLocalPath := stagedFile.Path()
+	if inode.StagedFile == stagedFile {
+		inode.StagedFile = nil
+		inode.fs.stagedFiles.Delete(inode.Id)
+	}
+	inode.mu.Unlock()
+
 	preserveForCache := false
-	if fs.flags.CacheThroughModeEnabled && fs.flags.ExternalCacheClient != nil {
+	if fs.flags.CacheThroughModeEnabled && fs.flags.ExternalCacheClient != nil && hasLocalPath {
 		preserveForCache = fs.CacheFileInExternalCacheFromSource(inode, localPath, true)
 		if preserveForCache {
 			stagedFile.PreserveForCache(localPath)
 		}
 	}
-
-	inode.mu.Lock()
-	var size uint64
-	size = inode.Attributes.Size
-	if inode.StagedFile == stagedFile {
-		inode.StagedFile = nil
-	}
-	inode.fs.stagedFiles.Delete(inode.Id)
-	inode.mu.Unlock()
 
 	stagedFile.Cleanup()
 
@@ -1821,34 +1842,23 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	return nil
 }
 
-func hashLocalFile(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-
+func hashLocalFile(file *os.File, size uint64) (string, error) {
 	hasher := sha256.New()
 	buf := make([]byte, 4*1024*1024)
-	if _, err := io.CopyBuffer(hasher, file, buf); err != nil {
+	reader := io.NewSectionReader(file, 0, int64(size))
+	if _, err := io.CopyBuffer(hasher, reader, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key, localPath string, size uint64, contentType *string, metadata map[string]*string) (*MultipartBlobCommitOutput, error) {
-	file, err := os.Open(localPath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
+func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key string, file *os.File, size uint64, contentType *string, metadata map[string]*string) (*MultipartBlobCommitOutput, error) {
 	if size <= fs.flags.SinglePartMB*1024*1024 {
 		resp, err := cloud.PutBlob(&PutBlobInput{
 			Key:         key,
 			Metadata:    metadata,
 			ContentType: contentType,
-			Body:        file,
+			Body:        io.NewSectionReader(file, 0, int64(size)),
 			Size:        PUInt64(size),
 		})
 		if err != nil {

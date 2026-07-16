@@ -227,6 +227,7 @@ func (fh *FileHandle) getOrCreateStagedFile() (err error) {
 	fh.inode.StagedFile = &StagedFile{
 		FH:          fh,
 		FD:          stagingFD,
+		localPath:   stagingPath,
 		mu:          sync.Mutex{},
 		lastWriteAt: time.Now(),
 		lastReadAt:  time.Now(),

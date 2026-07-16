@@ -573,6 +573,214 @@ func newStagedInodeForFlush(t *testing.T, fs *Goofys, root *Inode, data []byte) 
 	return inode, stagedPath
 }
 
+type stagedRenameBackend struct {
+	TestBackend
+	deleteBlob func(*DeleteBlobInput) (*DeleteBlobOutput, error)
+}
+
+func (b *stagedRenameBackend) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOutput, error) {
+	if b.deleteBlob != nil {
+		return b.deleteBlob(param)
+	}
+	return b.TestBackend.DeleteBlob(param)
+}
+
+func newStagedRenameInode(t *testing.T, fs *Goofys, root *Inode, name string, data []byte) (*Inode, string) {
+	t.Helper()
+
+	inode := NewInode(fs, root, name)
+	inode.Id = 2
+	inode.SetCacheState(ST_CREATED)
+	inode.Attributes.Size = uint64(len(data))
+	root.insertChild(inode)
+
+	stagedPath := filepath.Join(fs.flags.StagedWritePath, name)
+	if err := os.MkdirAll(filepath.Dir(stagedPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := os.OpenFile(stagedPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fd.WriteAt(data, 0); err != nil {
+		t.Fatal(err)
+	}
+	inode.StagedFile = &StagedFile{
+		FH:          NewFileHandle(inode),
+		FD:          fd,
+		localPath:   stagedPath,
+		lastWriteAt: time.Now().Add(-time.Second),
+		lastReadAt:  time.Now().Add(-time.Second),
+	}
+	fs.stagedFiles.Store(inode.Id, inode)
+	return inode, stagedPath
+}
+
+func TestStagedRenameBeforeFlushUploadsFinalKey(t *testing.T) {
+	const (
+		oldName = "model.safetensors.incomplete"
+		newName = "model.safetensors"
+	)
+	payload := []byte("model weights")
+	var uploadedKey string
+	backend := &stagedRenameBackend{}
+	backend.PutBlobFunc = func(param *PutBlobInput) (*PutBlobOutput, error) {
+		uploadedKey = param.Key
+		got, err := io.ReadAll(param.Body)
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("uploaded data = %q, want %q", got, payload)
+		}
+		now := time.Now()
+		return &PutBlobOutput{ETag: PString("etag"), LastModified: &now}, nil
+	}
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, backend)
+	inode, oldPath := newStagedRenameInode(t, fs, root, oldName, payload)
+
+	if err := root.Rename(oldName, root, newName); err != nil {
+		t.Fatal(err)
+	}
+	newPath := filepath.Join(flags.StagedWritePath, newName)
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old staged path still exists: %v", err)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("renamed staged path is unavailable: %v", err)
+	}
+
+	if err := fs.flushStagedFile(inode); err != nil {
+		t.Fatal(err)
+	}
+	if uploadedKey != newName {
+		t.Fatalf("uploaded key = %q, want %q", uploadedKey, newName)
+	}
+	if inode.oldParent != nil {
+		t.Fatal("rename before flush should not require a remote rename")
+	}
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Fatalf("staged path was not cleaned up: %v", err)
+	}
+}
+
+func TestStagedRenameDuringFlushCompletesRemoteRename(t *testing.T) {
+	const (
+		oldName = "model.safetensors.incomplete"
+		newName = "model.safetensors"
+	)
+	payload := []byte("model weights")
+	uploadStarted := make(chan string, 1)
+	releaseUpload := make(chan struct{})
+	uploaded := make(chan []byte, 1)
+	copied := make(chan *CopyBlobInput, 1)
+	deleted := make(chan string, 1)
+	backend := &stagedRenameBackend{}
+	backend.PutBlobFunc = func(param *PutBlobInput) (*PutBlobOutput, error) {
+		uploadStarted <- param.Key
+		<-releaseUpload
+		data, err := io.ReadAll(param.Body)
+		if err != nil {
+			return nil, err
+		}
+		uploaded <- data
+		now := time.Now()
+		return &PutBlobOutput{ETag: PString("etag"), LastModified: &now}, nil
+	}
+	backend.CopyBlobFunc = func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+		copied <- param
+		return &CopyBlobOutput{}, nil
+	}
+	backend.deleteBlob = func(param *DeleteBlobInput) (*DeleteBlobOutput, error) {
+		deleted <- param.Key
+		return &DeleteBlobOutput{}, nil
+	}
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, backend)
+	inode, oldPath := newStagedRenameInode(t, fs, root, oldName, payload)
+
+	flushDone := make(chan error, 1)
+	go func() {
+		flushDone <- fs.flushStagedFile(inode)
+	}()
+
+	select {
+	case key := <-uploadStarted:
+		if key != oldName {
+			t.Fatalf("upload started at key %q, want %q", key, oldName)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for staged upload")
+	}
+
+	if err := root.Rename(oldName, root, newName); err != nil {
+		t.Fatal(err)
+	}
+	newPath := filepath.Join(flags.StagedWritePath, newName)
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old staged path still exists during upload: %v", err)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("renamed staged path is unavailable during upload: %v", err)
+	}
+	close(releaseUpload)
+
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for staged flush")
+	}
+	if got := <-uploaded; !bytes.Equal(got, payload) {
+		t.Fatalf("uploaded data = %q, want %q", got, payload)
+	}
+
+	inode.mu.Lock()
+	oldParent := inode.oldParent
+	flushes := inode.IsFlushing
+	inode.mu.Unlock()
+	if oldParent != root {
+		t.Fatal("rename during flush did not retain the old object location")
+	}
+	if flushes != 0 {
+		t.Fatalf("staged flush marker = %d, want 0", flushes)
+	}
+	if !inode.TryFlush(1) {
+		t.Fatal("remote rename was not scheduled")
+	}
+
+	select {
+	case copyInput := <-copied:
+		if copyInput.Source != oldName || copyInput.Destination != newName {
+			t.Fatalf("remote copy = %q -> %q, want %q -> %q", copyInput.Source, copyInput.Destination, oldName, newName)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for remote copy")
+	}
+	select {
+	case key := <-deleted:
+		if key != oldName {
+			t.Fatalf("deleted key = %q, want %q", key, oldName)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for old object deletion")
+	}
+	if _, err := os.Stat(newPath); !os.IsNotExist(err) {
+		t.Fatalf("staged path was not cleaned up: %v", err)
+	}
+}
+
 func TestExternalCacheShortStreamFallsBackWithoutZeroPadding(t *testing.T) {
 	want := []byte("hello world")
 	flags := cfg.DefaultFlags()

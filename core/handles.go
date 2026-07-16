@@ -88,6 +88,7 @@ type MPUPart struct {
 type StagedFile struct {
 	FH          *FileHandle
 	FD          *os.File
+	localPath   string
 	mu          sync.Mutex
 	lastWriteAt time.Time
 	lastReadAt  time.Time
@@ -134,7 +135,7 @@ func (stagedFile *StagedFile) Cleanup() {
 	}
 
 	fh := stagedFile.FH
-	fullPath := stagedFile.FD.Name()
+	fullPath, _ := stagedFile.pathLocked()
 	removePath := stagedFile.cachePath == ""
 	log.Debugf("Cleaning up staged file: %s", fh.inode.FullName())
 	stagedFile.FD.Close()
@@ -156,12 +157,37 @@ func (stagedFile *StagedFile) Cleanup() {
 func (stagedFile *StagedFile) Path() (string, bool) {
 	stagedFile.mu.Lock()
 	defer stagedFile.mu.Unlock()
+	return stagedFile.pathLocked()
+}
+
+func (stagedFile *StagedFile) pathLocked() (string, bool) {
 
 	if stagedFile.FD == nil {
 		return "", false
 	}
 
+	if stagedFile.localPath != "" {
+		return stagedFile.localPath, true
+	}
 	return stagedFile.FD.Name(), true
+}
+
+func (stagedFile *StagedFile) moveTo(path string) error {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+
+	oldPath, ok := stagedFile.pathLocked()
+	if !ok {
+		return nil
+	}
+	if oldPath == path {
+		return nil
+	}
+	if err := os.Rename(oldPath, path); err != nil {
+		return err
+	}
+	stagedFile.localPath = path
+	return nil
 }
 
 func (stagedFile *StagedFile) PreserveForCache(path string) {
