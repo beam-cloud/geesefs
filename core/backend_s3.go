@@ -757,7 +757,21 @@ func (s *S3Backend) mpuCopyPart(from string, to string, mpuId string, bytes stri
 
 	s3Log.Debug(params)
 
-	resp, err := s.UploadPartCopy(params)
+	var resp *s3.UploadPartCopyOutput
+	var err error
+	for attempt := 1; attempt <= s3WriteRetryAttempts; attempt++ {
+		var req *request.Request
+		req, resp = s.UploadPartCopyRequest(params)
+		err = req.Send()
+		if err == nil {
+			break
+		}
+		if !shouldRetry(err) || attempt == s3WriteRetryAttempts {
+			break
+		}
+		s3Log.Warnf("UploadPartCopy retrying key=%s part=%d attempt=%d/%d err=%v", to, part, attempt, s3WriteRetryAttempts, err)
+		time.Sleep(s3WriteRetryDelay(attempt))
+	}
 	if err != nil {
 		s3Log.Warnf("UploadPartCopy %v = %v", params, err)
 		return nil, err
