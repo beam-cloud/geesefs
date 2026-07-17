@@ -1559,7 +1559,7 @@ func (fs *Goofys) flushStagedFileBuffered(inode *Inode) (err error) {
 
 	defer func() {
 		if err != nil {
-			stagedFile.ResetFlushForRetry()
+			stagedFile.FinishFlush(true)
 			fs.WakeupFlusher()
 		}
 	}()
@@ -1622,9 +1622,7 @@ func (fs *Goofys) flushStagedFileBuffered(inode *Inode) (err error) {
 				inode.UnlockRange(uint64(offset), chunkSize, true)
 
 				// Reset flushing state so it can be retried
-				stagedFile.mu.Lock()
-				stagedFile.flushing = false
-				stagedFile.mu.Unlock()
+				stagedFile.FinishFlush(true)
 
 				inode.mu.Unlock()
 				return nil // Exit and let readers proceed, staged file will be retried later
@@ -1683,6 +1681,7 @@ func (fs *Goofys) flushStagedFileBuffered(inode *Inode) (err error) {
 	inode.fs.stagedFiles.Delete(inode.Id)
 	inode.mu.Unlock()
 
+	stagedFile.FinishFlush(false)
 	stagedFile.Cleanup()
 
 	if fs.flags.EventCallback != nil {
@@ -1705,9 +1704,13 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 		inode.mu.Unlock()
 		return nil
 	}
+	if inode.renamingTo {
+		inode.mu.Unlock()
+		return nil
+	}
 
 	stagedFile.mu.Lock()
-	if stagedFile.flushing {
+	if stagedFile.flushing || stagedFile.awaitingRemoteRename {
 		stagedFile.mu.Unlock()
 		inode.mu.Unlock()
 		return nil
@@ -1719,14 +1722,21 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 		return nil
 	}
 
-	localPath := stagedFile.FD.Name()
 	if syncErr := stagedFile.FD.Sync(); syncErr != nil {
 		stagedFile.mu.Unlock()
 		inode.mu.Unlock()
 		return syncErr
 	}
+	localFile := stagedFile.FD
+	localPath := localFile.Name()
+	flushGeneration := stagedFile.generation
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
+	flushWeight := fs.flags.MaxParallelParts
+	if flushWeight < 1 {
+		flushWeight = 1
+	}
+	inode.IsFlushing += flushWeight
 	stagedFile.mu.Unlock()
 
 	totalSize := inode.Attributes.Size
@@ -1738,16 +1748,20 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	contentType := inode.fs.flags.GetMimeType(inode.FullName())
 	inode.mu.Unlock()
 
+	flushFinished := false
 	defer func() {
-		if err != nil {
-			stagedFile.ResetFlushForRetry()
-			fs.WakeupFlusher()
+		if !flushFinished {
+			stagedFile.FinishFlush(true)
 		}
+		inode.mu.Lock()
+		inode.IsFlushing -= flushWeight
+		inode.mu.Unlock()
+		fs.WakeupFlusher()
 	}()
 
 	var hash []byte
 	if fs.flags.HashAttr != "" && totalSize >= fs.flags.MinFileSizeForHashKB*1024 {
-		hashString, hashErr := hashLocalFile(localPath)
+		hashString, hashErr := hashLocalFile(localFile, totalSize)
 		if hashErr != nil {
 			return hashErr
 		}
@@ -1765,7 +1779,7 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	inode.mu.Unlock()
 
 	log.Debugf("Directly flushing staged file: inode=%s size=%d path=%s", inode.FullName(), totalSize, localPath)
-	resp, err := fs.uploadStagedFileDirect(cloud, key, localPath, totalSize, contentType, metadata)
+	resp, err := fs.uploadStagedFileDirect(cloud, key, localFile, totalSize, contentType, metadata)
 	if err != nil {
 		log.Warnf("Failed direct staged file flush for %s: %v", inode.FullName(), err)
 		inode.mu.Lock()
@@ -1775,6 +1789,13 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	}
 
 	inode.mu.Lock()
+	if inode.StagedFile != stagedFile {
+		inode.mu.Unlock()
+		stagedFile.FinishFlush(false)
+		flushFinished = true
+		return nil
+	}
+
 	inode.recordFlushError(nil)
 	inode.updateFromFlush(totalSize, resp.ETag, resp.LastModified, resp.StorageClass)
 	inode.userMetadataDirty = 0
@@ -1788,27 +1809,54 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 			inode.SetCacheState(ST_MODIFIED)
 		}
 	}
+	stagedFile.mu.Lock()
+	generationChanged := stagedFile.generation != flushGeneration
+	pendingRemoteRename := !generationChanged && inode.oldParent != nil
+	if generationChanged {
+		stagedFile.awaitingRemoteRename = false
+		stagedFile.shouldFlush = true
+		if inode.CacheState == ST_CACHED {
+			inode.SetCacheState(ST_MODIFIED)
+		}
+	} else if pendingRemoteRename {
+		stagedFile.awaitingRemoteRename = true
+		stagedFile.shouldFlush = false
+	} else {
+		inode.StagedFile = nil
+		inode.fs.stagedFiles.Delete(inode.Id)
+	}
+	stagedFile.mu.Unlock()
+	size := inode.Attributes.Size
 	inode.mu.Unlock()
 
+	stagedFile.FinishFlush(generationChanged)
+	flushFinished = true
+
+	if generationChanged {
+		log.Debugf("Direct staged file changed during flush; retaining generation for retry: inode=%s size=%d", inode.FullName(), totalSize)
+		return nil
+	}
+	if pendingRemoteRename {
+		log.Debugf("Direct staged file upload complete; retaining generation through remote rename: inode=%s size=%d", inode.FullName(), totalSize)
+		return nil
+	}
+
+	preserveForCache := fs.finalizeStagedFile(inode, stagedFile, hash, size)
+	log.Debugf("Direct staged file flush complete: inode=%s size=%d hash=%s preserved_for_cache=%v", inode.FullName(), totalSize, string(hash), preserveForCache)
+	return nil
+}
+
+func (fs *Goofys) finalizeStagedFile(inode *Inode, stagedFile *StagedFile, hash []byte, size uint64) bool {
+	localPath, hasLocalPath := stagedFile.Path()
 	preserveForCache := false
-	if fs.flags.CacheThroughModeEnabled && fs.flags.ExternalCacheClient != nil {
-		preserveForCache = fs.CacheFileInExternalCacheFromSource(inode, localPath, true)
+	if fs.flags.CacheThroughModeEnabled && fs.flags.ExternalCacheClient != nil && hasLocalPath && len(hash) > 0 {
+		preserveForCache = fs.queueLocalFileForExternalCache(inode, localPath, string(hash), size)
 		if preserveForCache {
 			stagedFile.PreserveForCache(localPath)
 		}
 	}
 
-	inode.mu.Lock()
-	var size uint64
-	size = inode.Attributes.Size
-	if inode.StagedFile == stagedFile {
-		inode.StagedFile = nil
-	}
-	inode.fs.stagedFiles.Delete(inode.Id)
-	inode.mu.Unlock()
-
 	stagedFile.Cleanup()
-
 	if fs.flags.EventCallback != nil {
 		fs.flags.EventCallback(cfg.EventStagedFileUploaded, map[string]interface{}{
 			"inode": stagedFile.FH.inode.FullName(),
@@ -1816,39 +1864,51 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 			"size":  size,
 		})
 	}
-
-	log.Debugf("Direct staged file flush complete: inode=%s size=%d hash=%s preserved_for_cache=%v", inode.FullName(), totalSize, string(hash), preserveForCache)
-	return nil
+	return preserveForCache
 }
 
-func hashLocalFile(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
+func (fs *Goofys) queueLocalFileForExternalCache(inode *Inode, localPath, hash string, size uint64) bool {
+	if !fs.reserveExternalCacheStore(inode, hash) {
+		return false
 	}
-	defer file.Close()
 
+	event := cacheEvent{
+		path:             inode.FullName(),
+		size:             size,
+		hash:             hash,
+		inode:            inode,
+		localSourcePath:  localPath,
+		removeLocalAfter: true,
+	}
+	select {
+	case fs.cacheEventChan <- event:
+		atomic.AddInt64(&fs.stats.cacheEventsQueued, 1)
+		return true
+	default:
+		log.Warnf("External cache event queue is full, skipping cache for %v", inode.FullName())
+		atomic.AddInt64(&fs.stats.cacheEventsDropped, 1)
+		fs.clearCachingStatus(hash)
+		return false
+	}
+}
+
+func hashLocalFile(file *os.File, size uint64) (string, error) {
 	hasher := sha256.New()
 	buf := make([]byte, 4*1024*1024)
-	if _, err := io.CopyBuffer(hasher, file, buf); err != nil {
+	reader := io.NewSectionReader(file, 0, int64(size))
+	if _, err := io.CopyBuffer(hasher, reader, buf); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key, localPath string, size uint64, contentType *string, metadata map[string]*string) (*MultipartBlobCommitOutput, error) {
-	file, err := os.Open(localPath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
+func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key string, file *os.File, size uint64, contentType *string, metadata map[string]*string) (*MultipartBlobCommitOutput, error) {
 	if size <= fs.flags.SinglePartMB*1024*1024 {
 		resp, err := cloud.PutBlob(&PutBlobInput{
 			Key:         key,
 			Metadata:    metadata,
 			ContentType: contentType,
-			Body:        file,
+			Body:        io.NewSectionReader(file, 0, int64(size)),
 			Size:        PUInt64(size),
 		})
 		if err != nil {
@@ -2016,7 +2076,9 @@ func (fs *Goofys) WaitForFlush() {
 					)
 
 					hasStaged = true
-					if stagedFile.flushing {
+					if stagedFile.AwaitingRemoteRename() {
+						startedFlush = inode.TryFlush(1)
+					} else if stagedFile.flushing {
 					} else {
 						// Shutdown/unmount must persist every staged file regardless
 						// of the debounce window, otherwise recent writes can remain

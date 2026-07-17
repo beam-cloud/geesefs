@@ -671,7 +671,8 @@ func (dh *DirHandle) loadListing() error {
 	// we immediately switch to regular listings.
 	// Original implementation in Goofys in fact was similar in this aspect
 	// but it was ugly in several places, so ... sorry, it's reworked. O:-)
-	useSlurp := parent.dir.listMarker == "" && parent.fs.flags.StatCacheTTL != 0
+	useSlurp := parent.dir.listMarker == "" && parent.fs.flags.StatCacheTTL != 0 &&
+		!parent.fs.flags.NoPreloadDir
 
 	// the dir expired, so we need to fetch from the cloud. there
 	// may be static directories that we want to keep, so cloud
@@ -1650,28 +1651,7 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 
 		renameRecursive(fromInode, newParent, to)
 	} else {
-		// Handle staged file renames
-		if fromInode.StagedFile != nil && fromInode.StagedFile.FD != nil {
-
-			fs := fromInode.fs
-			oldStagedPath := fromInode.StagedFile.FD.Name()
-			newStagedDir := fs.flags.StagedWritePath + "/" + newParent.FullName()
-			newStagedPath := appendChildName(newStagedDir, to)
-
-			if err := os.MkdirAll(newStagedDir, fs.flags.DirMode); err == nil {
-				err := os.Rename(oldStagedPath, newStagedPath)
-				if err == nil {
-					// Reopen the file descriptor at the new path
-					newFD, openErr := os.OpenFile(newStagedPath, os.O_RDWR, fs.flags.FileMode)
-					if openErr == nil {
-						oldFD := fromInode.StagedFile.FD
-						fromInode.StagedFile.FD = newFD
-						oldFD.Close()
-					}
-				}
-			}
-		}
-
+		// Staged data has a generation-specific path; only the logical inode moves.
 		renameInCache(fromInode, newParent, to)
 	}
 
@@ -2039,91 +2019,86 @@ func (parent *Inode) LookUpInodeMaybeDir(name string) (*BlobItemOutput, error) {
 	key := appendChildName(parentKey, name)
 	parent.logFuse("Inode.LookUp", key)
 
-	var object, dirObject *HeadBlobOutput
-	var prefixList *ListBlobsOutput
-	var objectError, dirError, prefixError error
-	results := make(chan int, 3)
-	n := 0
-
-	for {
-		n++
-		go func() {
-			object, objectError = cloud.HeadBlob(&HeadBlobInput{Key: key})
-			results <- 1
-		}()
-		if cloud.Capabilities().DirBlob {
-			<-results
-			break
-		}
-		if parent.fs.flags.Cheap {
-			<-results
-			if mapAwsError(objectError) != syscall.ENOENT {
-				break
+	type lookupResult struct {
+		blob *BlobItemOutput
+		err  error
+	}
+	lookups := []func() lookupResult{
+		func() lookupResult {
+			object, err := cloud.HeadBlob(&HeadBlobInput{Key: key})
+			if object == nil {
+				return lookupResult{err: err}
 			}
-		}
+			return lookupResult{blob: &object.BlobItemOutput, err: err}
+		},
+	}
 
+	if !cloud.Capabilities().DirBlob {
 		if !parent.fs.flags.NoDirObject {
-			n++
-			go func() {
-				dirObject, dirError = cloud.HeadBlob(&HeadBlobInput{Key: key + "/"})
-				results <- 2
-			}()
-			if parent.fs.flags.Cheap {
-				<-results
-				if mapAwsError(dirError) != syscall.ENOENT {
-					break
+			lookups = append(lookups, func() lookupResult {
+				object, err := cloud.HeadBlob(&HeadBlobInput{Key: key + "/"})
+				if object == nil {
+					return lookupResult{err: err}
 				}
-			}
+				return lookupResult{blob: &object.BlobItemOutput, err: err}
+			})
 		}
-
 		if !parent.fs.flags.ExplicitDir {
-			n++
-			go func() {
-				prefixList, prefixError = RetryListBlobs(parent.fs.flags, cloud, &ListBlobsInput{
+			lookups = append(lookups, func() lookupResult {
+				listing, err := RetryListBlobs(parent.fs.flags, cloud, &ListBlobsInput{
 					Delimiter: PString("/"),
 					MaxKeys:   PUInt32(1),
 					Prefix:    PString(key + "/"),
 				})
-				results <- 3
-			}()
-			if parent.fs.flags.Cheap {
-				<-results
+				if err != nil || listing == nil || len(listing.Prefixes) == 0 && len(listing.Items) == 0 {
+					return lookupResult{err: err}
+				}
+				if len(listing.Items) != 0 && listing.Items[0].Key != nil &&
+					(*listing.Items[0].Key == key || strings.HasPrefix(*listing.Items[0].Key, key+"/")) {
+					return lookupResult{blob: &listing.Items[0]}
+				}
+				return lookupResult{blob: &BlobItemOutput{Key: PString(key + "/")}}
+			})
+		}
+	}
+
+	if parent.fs.flags.Cheap {
+		for _, lookup := range lookups {
+			result := lookup()
+			if result.blob != nil {
+				return result.blob, nil
+			}
+			if result.err != nil && mapAwsError(result.err) != syscall.ENOENT {
+				return nil, result.err
 			}
 		}
-
-		break
+		return nil, syscall.ENOENT
 	}
 
-	for n > 0 {
-		n--
-		if !cloud.Capabilities().DirBlob && !parent.fs.flags.Cheap {
-			<-results
-		}
-		if object != nil {
-			return &object.BlobItemOutput, nil
-		}
-		if dirObject != nil {
-			return &dirObject.BlobItemOutput, nil
-		}
-		if prefixList != nil && (len(prefixList.Prefixes) != 0 || len(prefixList.Items) != 0) {
-			if len(prefixList.Items) != 0 && (*prefixList.Items[0].Key == key ||
-				(*prefixList.Items[0].Key)[0:len(key)+1] == key+"/") {
-				return &prefixList.Items[0], nil
-			}
-			return &BlobItemOutput{
-				Key: PString(key + "/"),
-			}, nil
-		}
+	type indexedResult struct {
+		index int
+		lookupResult
+	}
+	completed := make(chan indexedResult, len(lookups))
+	for i, lookup := range lookups {
+		go func(index int, lookup func() lookupResult) {
+			completed <- indexedResult{index: index, lookupResult: lookup()}
+		}(i, lookup)
 	}
 
-	if objectError != nil && mapAwsError(objectError) != syscall.ENOENT {
-		return nil, objectError
+	results := make([]lookupResult, len(lookups))
+	for range lookups {
+		result := <-completed
+		if result.blob != nil {
+			return result.blob, nil
+		}
+		results[result.index] = result.lookupResult
 	}
-	if dirError != nil && mapAwsError(dirError) != syscall.ENOENT {
-		return nil, dirError
-	}
-	if prefixError != nil && mapAwsError(prefixError) != syscall.ENOENT {
-		return nil, prefixError
+
+	for _, result := range results {
+		if result.err != nil && mapAwsError(result.err) != syscall.ENOENT {
+			return nil, result.err
+		}
 	}
 	return nil, syscall.ENOENT
 }

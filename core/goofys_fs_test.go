@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -592,6 +593,75 @@ func (s *GoofysTest) TestSlurpLookupNoCloud(t *C) {
 
 	_, err = s.fs.LookupPath("testdir")
 	t.Assert(err, IsNil)
+}
+
+func (s *GoofysTest) TestReadDirNoPreloadScopedNoCloud(t *C) {
+	flags := cfg.DefaultFlags()
+	flags.NoPreloadDir = true
+
+	targetPrefix := "workspace/models/snapshots/revision/"
+	type listRequest struct {
+		prefix    string
+		delimiter string
+		maxKeys   uint32
+	}
+	var mu sync.Mutex
+	var requests []listRequest
+
+	backend := &TestBackend{
+		err: syscall.ENOENT,
+		HeadBlobFunc: func(*HeadBlobInput) (*HeadBlobOutput, error) {
+			return nil, syscall.ENOENT
+		},
+		ListBlobsFunc: func(param *ListBlobsInput) (*ListBlobsOutput, error) {
+			request := listRequest{
+				prefix:    NilStr(param.Prefix),
+				delimiter: NilStr(param.Delimiter),
+				maxKeys:   NilUInt32(param.MaxKeys),
+			}
+			mu.Lock()
+			requests = append(requests, request)
+			mu.Unlock()
+
+			if request.maxKeys == 1 {
+				return &ListBlobsOutput{
+					Prefixes: []BlobPrefixOutput{{Prefix: PString(request.prefix)}},
+				}, nil
+			}
+			if request.prefix == targetPrefix && request.delimiter == "/" {
+				return &ListBlobsOutput{
+					Items: []BlobItemOutput{{
+						Key:  PString(targetPrefix + "model.safetensors"),
+						Size: 5,
+					}},
+				}, nil
+			}
+			return nil, syscall.EINVAL
+		},
+	}
+
+	fs, err := newGoofys(context.Background(), "test", flags, func(string, *cfg.FlagStorage) (StorageBackend, error) {
+		return backend, nil
+	})
+	t.Assert(err, IsNil)
+
+	inode, err := fs.LookupPath("workspace/models/snapshots/revision")
+	t.Assert(err, IsNil)
+	dh := inode.OpenDir()
+	t.Assert(namesOf(s.readDirFully(t, dh)), DeepEquals, []string{"model.safetensors"})
+	t.Assert(dh.CloseDir(), IsNil)
+
+	mu.Lock()
+	defer mu.Unlock()
+	scopedListings := 0
+	for _, request := range requests {
+		if request.maxKeys == 0 {
+			t.Assert(request.prefix, Equals, targetPrefix)
+			t.Assert(request.delimiter, Equals, "/")
+			scopedListings++
+		}
+	}
+	t.Assert(scopedListings, Equals, 1)
 }
 
 // Case # 1 - check that a directory longer than eviction limit is listed correctly

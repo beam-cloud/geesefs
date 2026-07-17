@@ -213,21 +213,24 @@ func (fh *FileHandle) getOrCreateStagedFile() (err error) {
 		return nil
 	}
 
-	stagingPath := filepath.Join(fh.inode.fs.flags.StagedWritePath, fh.inode.FullName())
-	parentDir := filepath.Dir(stagingPath)
+	parentDir := filepath.Join(fh.inode.fs.flags.StagedWritePath, filepath.Dir(fh.inode.FullName()))
 	if err := os.MkdirAll(parentDir, fh.inode.fs.flags.DirMode); err != nil {
 		return err
 	}
 
-	stagingFD, err := os.OpenFile(stagingPath, os.O_CREATE|os.O_RDWR, fh.inode.fs.flags.FileMode)
+	stagingFD, err := os.CreateTemp(parentDir, ".geesefs-staged-*")
 	if err != nil {
+		return err
+	}
+	if err := stagingFD.Chmod(fh.inode.fs.flags.FileMode); err != nil {
+		stagingFD.Close()
+		_ = os.Remove(stagingFD.Name())
 		return err
 	}
 
 	fh.inode.StagedFile = &StagedFile{
 		FH:          fh,
 		FD:          stagingFD,
-		mu:          sync.Mutex{},
 		lastWriteAt: time.Now(),
 		lastReadAt:  time.Now(),
 		shouldFlush: false,
@@ -253,12 +256,9 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 	}
 
 	if fh.inode.fs.flags.StagedWriteModeEnabled {
-		_, ok := fh.inode.fs.stagedFiles.Load(fh.inode.Id)
-		if !ok {
-			err = fh.getOrCreateStagedFile()
-			if err != nil {
-				return err
-			}
+		err = fh.getOrCreateStagedFile()
+		if err != nil {
+			return err
 		}
 	}
 
@@ -269,14 +269,25 @@ func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
 	}
 	defer fh.inode.mu.Unlock()
 
-	_, err = fh.inode.StagedFile.FD.WriteAt(data, offset)
+	stagedFile := fh.inode.StagedFile
+	if stagedFile == nil {
+		return syscall.EAGAIN
+	}
+	stagedFile.mu.Lock()
+	if stagedFile.FD == nil || stagedFile.cleanupPending {
+		stagedFile.mu.Unlock()
+		return syscall.EAGAIN
+	}
+	_, err = stagedFile.FD.WriteAt(data, offset)
 	if err != nil {
+		stagedFile.mu.Unlock()
 		return err
 	}
-
-	fh.inode.StagedFile.mu.Lock()
-	fh.inode.StagedFile.lastWriteAt = time.Now()
-	fh.inode.StagedFile.mu.Unlock()
+	stagedFile.generation++
+	stagedFile.awaitingRemoteRename = false
+	stagedFile.shouldFlush = true
+	stagedFile.lastWriteAt = time.Now()
+	stagedFile.mu.Unlock()
 
 	fh.inode.checkPauseWriters()
 	if fh.inode.Attributes.Size < end {
@@ -1214,7 +1225,7 @@ func (inode *Inode) recordFlushError(err error) {
 
 func (inode *Inode) TryFlush(priority int) bool {
 	inode.mu.Lock()
-	if inode.StagedFile != nil {
+	if inode.hasUnpersistedStagedFileLocked() {
 		// Staged-write files are persisted by Goofys.flushStagedFileDirect.
 		// Letting the generic dirty-part flusher run here can try to copy
 		// ranges from a cloud object that has not been created yet.
@@ -1235,6 +1246,9 @@ func (inode *Inode) TryFlush(priority int) bool {
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
 	if inode.Parent != parent {
+		return false
+	}
+	if inode.hasUnpersistedStagedFileLocked() {
 		return false
 	}
 
@@ -1265,6 +1279,11 @@ func (inode *Inode) TryFlush(priority int) bool {
 	}
 
 	return false
+}
+
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) hasUnpersistedStagedFileLocked() bool {
+	return inode.StagedFile != nil && !inode.StagedFile.AwaitingRemoteRename()
 }
 
 func (inode *Inode) sendUpload(priority int) bool {
@@ -1412,43 +1431,77 @@ func (inode *Inode) sendRename() {
 					err = nil
 					notFoundIgnore = true
 				} else if mappedErr == syscall.ENOENT || mappedErr == syscall.ERANGE {
-					s3Log.Warnf("Conflict detected (inode %v): failed to copy %v to %v: %v. File is removed remotely, dropping cache", inode.Id, from, key, err)
 					inode.mu.Lock()
-					newParent := inode.Parent
-					oldParent := inode.oldParent
-					oldName := inode.oldName
-					inode.oldParent = nil
-					inode.oldName = ""
-					inode.renamingTo = false
-					inode.resetCache()
-					inode.mu.Unlock()
-					newParent.removeChild(inode)
-					if oldParent != nil {
-						oldParent.mu.Lock()
-						if _, ok := oldParent.dir.DeletedChildren[oldName]; ok {
-							delete(oldParent.dir.DeletedChildren, oldName)
-							oldParent.addModified(-1)
+					stagedFile := inode.StagedFile
+					retryFromLocal := stagedFile != nil && stagedFile.AwaitingRemoteRename() && stagedFile.PrepareDirectUpload()
+					if retryFromLocal {
+						retryParent := inode.oldParent
+						retryName := inode.oldName
+						inode.oldParent = nil
+						inode.oldName = ""
+						inode.renamingTo = false
+						inode.recordFlushError(nil)
+						if inode.CacheState == ST_CACHED {
+							inode.SetCacheState(ST_MODIFIED)
 						}
-						oldParent.mu.Unlock()
+						inode.mu.Unlock()
+
+						s3Log.Warnf("Remote rename source %v was unavailable for inode %v; preserving the staged generation and uploading %v directly", from, inode.Id, key)
+						if retryParent != nil {
+							retryParent.mu.Lock()
+							if retryParent.dir.DeletedChildren[retryName] == inode {
+								delete(retryParent.dir.DeletedChildren, retryName)
+								retryParent.addModified(-1)
+							}
+							retryParent.mu.Unlock()
+						}
+						inode.fs.WakeupFlusher()
+					} else {
+						newParent := inode.Parent
+						conflictParent := inode.oldParent
+						conflictName := inode.oldName
+						inode.oldParent = nil
+						inode.oldName = ""
+						inode.renamingTo = false
+						inode.resetCache()
+						inode.mu.Unlock()
+
+						s3Log.Warnf("Conflict detected (inode %v): failed to copy %v to %v: %v. File is removed remotely, dropping cache", inode.Id, from, key, err)
+						newParent.removeChild(inode)
+						if conflictParent != nil {
+							conflictParent.mu.Lock()
+							if _, ok := conflictParent.dir.DeletedChildren[conflictName]; ok {
+								delete(conflictParent.dir.DeletedChildren, conflictName)
+								conflictParent.addModified(-1)
+							}
+							conflictParent.mu.Unlock()
+						}
 					}
 				} else {
 					log.Warnf("Failed to copy %v to %v (rename): %v", from, key, err)
 					inode.mu.Lock()
+					var completedStagedFile *StagedFile
+					var completedHash []byte
+					var completedSize uint64
 					inode.recordFlushError(err)
+					inode.renamingTo = false
 					if inode.Parent == oldParent && inode.Name == oldName {
 						// Someone renamed the inode back to the original name
 						// ...while we failed to copy it :)
 						inode.oldParent = nil
 						inode.oldName = ""
-						inode.renamingTo = false
 						inode.Parent.addModified(-1)
 						if (inode.CacheState == ST_MODIFIED || inode.CacheState == ST_CREATED) &&
-							!inode.isStillDirty() {
+							!inode.isStillDirty() && !inode.hasUnpersistedStagedFileLocked() {
 							inode.SetCacheState(ST_CACHED)
 							inode.SetAttrTime(time.Now())
 						}
+						completedStagedFile, completedHash, completedSize = inode.detachUploadedStagedFileLocked()
 					}
 					inode.mu.Unlock()
+					if completedStagedFile != nil {
+						inode.fs.finalizeStagedFile(inode, completedStagedFile, completedHash, completedSize)
+					}
 				}
 			}
 			if err == nil {
@@ -1457,6 +1510,9 @@ func (inode *Inode) sendRename() {
 				delParent := oldParent
 				delName := oldName
 				inode.mu.Lock()
+				var completedStagedFile *StagedFile
+				var completedHash []byte
+				var completedSize uint64
 				// Now we know that the object is accessible by the new name
 				if inode.Parent == newParent && inode.Name == newName {
 					// Just clear the old path
@@ -1476,12 +1532,16 @@ func (inode *Inode) sendRename() {
 					inode.oldName = newName
 				}
 				if (inode.CacheState == ST_MODIFIED || inode.CacheState == ST_CREATED) &&
-					!inode.isStillDirty() {
+					!inode.isStillDirty() && !inode.hasUnpersistedStagedFileLocked() {
 					inode.SetCacheState(ST_CACHED)
 					inode.SetAttrTime(time.Now())
 				}
 				inode.renamingTo = false
+				completedStagedFile, completedHash, completedSize = inode.detachUploadedStagedFileLocked()
 				inode.mu.Unlock()
+				if completedStagedFile != nil {
+					inode.fs.finalizeStagedFile(inode, completedStagedFile, completedHash, completedSize)
+				}
 				// Now delete the old key
 				if !notFoundIgnore {
 					inode.fs.addInflightChange(delKey)
@@ -1522,6 +1582,22 @@ func (inode *Inode) sendRename() {
 		inode.fs.WakeupFlusher()
 		inode.mu.Unlock()
 	}()
+}
+
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) detachUploadedStagedFileLocked() (*StagedFile, []byte, uint64) {
+	if inode.oldParent != nil || inode.StagedFile == nil || !inode.StagedFile.AwaitingRemoteRename() {
+		return nil, nil, 0
+	}
+
+	stagedFile := inode.StagedFile
+	inode.StagedFile = nil
+	inode.fs.stagedFiles.Delete(inode.Id)
+	var hash []byte
+	if inode.userMetadata != nil {
+		hash = append(hash, inode.userMetadata[inode.fs.flags.HashAttr]...)
+	}
+	return stagedFile, hash, inode.Attributes.Size
 }
 
 func (inode *Inode) sendUpdateMeta() {
@@ -2138,9 +2214,7 @@ func (inode *Inode) resetCache() {
 	// Clean up staged file if present
 	if inode.StagedFile != nil {
 		inode.fs.stagedFiles.Delete(inode.Id)
-		if inode.StagedFile.FD != nil {
-			inode.StagedFile.Cleanup()
-		}
+		inode.StagedFile.Cleanup()
 		inode.StagedFile = nil
 	}
 
