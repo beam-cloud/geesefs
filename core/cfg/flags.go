@@ -364,8 +364,8 @@ MISC OPTIONS:
 
 		cli.BoolFlag{
 			Name: "no-preload-dir",
-			Usage: "Disable directory listing pre-loading when you open individual files" +
-				" and don't do any READDIR calls. Default is to always pre-load listing" +
+			Usage: "Disable speculative directory listing pre-loading for file lookups and READDIR." +
+				" READDIR still lists the requested directory with a delimiter. Default is to pre-load listings" +
 				" which helps in a lot of cases, for example when you use rsync. Note" +
 				" that you should also enable --no-implicit-dir if you want to fully avoid" +
 				" ListObjects requests during file lookups.",
