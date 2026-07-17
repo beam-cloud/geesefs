@@ -86,23 +86,25 @@ type MPUPart struct {
 }
 
 type StagedFile struct {
-	FH          *FileHandle
-	FD          *os.File
-	localPath   string
-	mu          sync.Mutex
-	lastWriteAt time.Time
-	lastReadAt  time.Time
-	shouldFlush bool
-	flushing    bool
-	debounce    time.Duration
-	cachePath   string
+	FH                   *FileHandle
+	FD                   *os.File
+	mu                   sync.Mutex
+	lastWriteAt          time.Time
+	lastReadAt           time.Time
+	shouldFlush          bool
+	flushing             bool
+	cleanupPending       bool
+	awaitingRemoteRename bool
+	generation           uint64
+	debounce             time.Duration
+	cachePath            string
 }
 
 func (stagedFile *StagedFile) ReadyToFlush() bool {
 	stagedFile.mu.Lock()
 	defer stagedFile.mu.Unlock()
 
-	if stagedFile.flushing {
+	if stagedFile.flushing || stagedFile.awaitingRemoteRename {
 		return false
 	}
 
@@ -130,28 +132,39 @@ func (stagedFile *StagedFile) Cleanup() {
 	if stagedFile.FD == nil {
 		stagedFile.flushing = false
 		stagedFile.shouldFlush = false
+		stagedFile.cleanupPending = false
+		stagedFile.awaitingRemoteRename = false
+		stagedFile.mu.Unlock()
+		return
+	}
+	if stagedFile.flushing {
+		stagedFile.cleanupPending = true
 		stagedFile.mu.Unlock()
 		return
 	}
 
 	fh := stagedFile.FH
-	fullPath, _ := stagedFile.pathLocked()
-	removePath := stagedFile.cachePath == ""
+	fullPath := stagedFile.FD.Name()
+	removePath := stagedFile.cachePath == "" && stagedFile.ownsPathLocked(fullPath)
 	log.Debugf("Cleaning up staged file: %s", fh.inode.FullName())
 	stagedFile.FD.Close()
 	stagedFile.FD = nil
 	stagedFile.flushing = false
 	stagedFile.shouldFlush = false
+	stagedFile.cleanupPending = false
+	stagedFile.awaitingRemoteRename = false
 	stagedFile.mu.Unlock()
 
+	removed := false
 	if removePath {
-		err := os.RemoveAll(fullPath)
-		if err != nil {
+		err := os.Remove(fullPath)
+		removed = err == nil || os.IsNotExist(err)
+		if !removed {
 			log.Warnf("Failed to remove staged file: %v", err)
 		}
 	}
 
-	log.Debugf("Removed staged file: %s", fh.inode.FullName())
+	log.Debugf("Staged file cleanup complete: inode=%s path=%s removed=%t", fh.inode.FullName(), fullPath, removed)
 }
 
 func (stagedFile *StagedFile) Path() (string, bool) {
@@ -161,33 +174,24 @@ func (stagedFile *StagedFile) Path() (string, bool) {
 }
 
 func (stagedFile *StagedFile) pathLocked() (string, bool) {
-
 	if stagedFile.FD == nil {
 		return "", false
 	}
 
-	if stagedFile.localPath != "" {
-		return stagedFile.localPath, true
+	path := stagedFile.FD.Name()
+	if !stagedFile.ownsPathLocked(path) {
+		return "", false
 	}
-	return stagedFile.FD.Name(), true
+	return path, true
 }
 
-func (stagedFile *StagedFile) moveTo(path string) error {
-	stagedFile.mu.Lock()
-	defer stagedFile.mu.Unlock()
-
-	oldPath, ok := stagedFile.pathLocked()
-	if !ok {
-		return nil
+func (stagedFile *StagedFile) ownsPathLocked(path string) bool {
+	fdInfo, err := stagedFile.FD.Stat()
+	if err != nil {
+		return false
 	}
-	if oldPath == path {
-		return nil
-	}
-	if err := os.Rename(oldPath, path); err != nil {
-		return err
-	}
-	stagedFile.localPath = path
-	return nil
+	pathInfo, err := os.Stat(path)
+	return err == nil && os.SameFile(fdInfo, pathInfo)
 }
 
 func (stagedFile *StagedFile) PreserveForCache(path string) {
@@ -197,14 +201,38 @@ func (stagedFile *StagedFile) PreserveForCache(path string) {
 	stagedFile.cachePath = path
 }
 
-func (stagedFile *StagedFile) ResetFlushForRetry() {
+func (stagedFile *StagedFile) FinishFlush(retry bool) {
 	stagedFile.mu.Lock()
-	defer stagedFile.mu.Unlock()
-
-	if stagedFile.FD != nil {
-		stagedFile.flushing = false
+	stagedFile.flushing = false
+	if retry && stagedFile.FD != nil && !stagedFile.cleanupPending {
 		stagedFile.shouldFlush = true
 	}
+	cleanup := stagedFile.cleanupPending
+	stagedFile.mu.Unlock()
+
+	if cleanup {
+		stagedFile.Cleanup()
+	}
+}
+
+func (stagedFile *StagedFile) AwaitingRemoteRename() bool {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+	return stagedFile.FD != nil && stagedFile.awaitingRemoteRename
+}
+
+func (stagedFile *StagedFile) PrepareDirectUpload() bool {
+	stagedFile.mu.Lock()
+	defer stagedFile.mu.Unlock()
+	if stagedFile.FD == nil || stagedFile.cleanupPending {
+		return false
+	}
+
+	stagedFile.awaitingRemoteRename = false
+	stagedFile.shouldFlush = true
+	stagedFile.lastWriteAt = time.Time{}
+	stagedFile.lastReadAt = time.Time{}
+	return true
 }
 
 type Inode struct {

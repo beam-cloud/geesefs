@@ -1650,19 +1650,7 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 
 		renameRecursive(fromInode, newParent, to)
 	} else {
-		// Handle staged file renames
-		if stagedFile := fromInode.StagedFile; stagedFile != nil {
-			fs := fromInode.fs
-			newStagedDir := fs.flags.StagedWritePath + "/" + newParent.FullName()
-			newStagedPath := appendChildName(newStagedDir, to)
-
-			if err := os.MkdirAll(newStagedDir, fs.flags.DirMode); err != nil {
-				log.Warnf("Failed to create staged file directory during rename: %v", err)
-			} else if err := stagedFile.moveTo(newStagedPath); err != nil {
-				log.Warnf("Failed to move staged file during rename: %v", err)
-			}
-		}
-
+		// Staged data has a generation-specific path; only the logical inode moves.
 		renameInCache(fromInode, newParent, to)
 	}
 
