@@ -37,6 +37,8 @@ const (
 	externalPageMmapMaxBytes          = 2 * 1024 * 1024 * 1024
 	externalPagePrefetchAheadBytes    = 1024 * 1024 * 1024
 	externalPagePrefetchMaxConcurrent = 8
+	externalPagePrefetchMaxQueued     = 8
+	externalPagePrefetchMaxWait       = 250 * time.Millisecond
 )
 
 type externalPageMmapEntry struct {
@@ -63,16 +65,35 @@ type externalPageMappedRegion struct {
 	entry     *externalPageMmapEntry
 }
 
+type externalPagePrefetchKey struct {
+	cacheKey string
+	offset   uint64
+	end      uint64
+}
+
+type externalPagePrefetchState struct {
+	done chan struct{}
+}
+
+type externalPagePrefetchJob struct {
+	fs            *Goofys
+	key           externalPagePrefetchKey
+	state         *externalPagePrefetchState
+	pageCache     cfg.ContentCacheClientLocalPageFileViews
+	readIntoCache cfg.ContentCacheReadInto
+}
+
 type externalPageMmapCache struct {
-	mu          sync.Mutex
-	entries     map[string]*externalPageMmapEntry
-	regions     []externalPageCachedRegion
-	lru         *list.List
-	prefetching map[string]struct{}
-	prefetchSem chan struct{}
-	mappedBytes int64
-	maxBytes    int64
-	closed      bool
+	mu             sync.Mutex
+	entries        map[string]*externalPageMmapEntry
+	regions        []externalPageCachedRegion
+	lru            *list.List
+	prefetching    map[externalPagePrefetchKey]*externalPagePrefetchState
+	prefetchQueue  []externalPagePrefetchJob
+	prefetchActive int
+	mappedBytes    int64
+	maxBytes       int64
+	closed         bool
 }
 
 func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]byte, bytesRead int, callback func(), err error) {
@@ -227,6 +248,59 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
 	}
 	windowSize := windowEnd - windowOffset
+	prefetchEnd := windowOffset + externalPageMmapWindowBytes
+	if prefetchEnd > fileSize {
+		prefetchEnd = fileSize
+	}
+	if offset+size <= prefetchEnd {
+		prefetchDone := mmapCache.prefetchDone(hash, windowOffset, prefetchEnd)
+		joined := prefetchDone != nil
+		finished := false
+		if joined {
+			atomic.AddInt64(&fh.inode.fs.stats.externalPrefetch.waitCount, 1)
+			waitStarted := time.Now()
+			waitTimeout := fh.inode.fs.externalPagePrefetchWaitTimeout()
+			if waitTimeout > 0 {
+				timer := time.NewTimer(waitTimeout)
+				select {
+				case <-prefetchDone:
+					finished = true
+				case <-timer.C:
+				}
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+			atomic.AddInt64(&fh.inode.fs.stats.externalPrefetch.waitNanos, time.Since(waitStarted).Nanoseconds())
+			if !finished {
+				atomic.AddInt64(&fh.inode.fs.stats.externalPrefetch.waitTimeouts, 1)
+			}
+		}
+
+		// A prefetch may finish between the first mmap lookup and finding its
+		// in-flight record. Always retry once before issuing a duplicate cache
+		// request for the same window.
+		if data, callback, ok := mmapCache.lookup(hash, offset, size); ok {
+			if joined {
+				atomic.AddInt64(&fh.inode.fs.stats.externalPrefetch.waitHits, 1)
+			}
+			atomic.AddInt64(&fh.inode.fs.stats.readHits, 1)
+			hitCount := atomic.AddInt64(&fh.inode.fs.stats.externalPageHits, 1)
+			atomic.AddInt64(&fh.inode.fs.stats.externalPageBytes, int64(size))
+			if sequential {
+				fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
+			}
+			source := "mmap_cache_race"
+			if joined {
+				source = "mmap_prefetch_wait"
+			}
+			fh.logExternalPageHit(path, hash, offset, size, 0, source, started, time.Time{}, hitCount)
+			return data, int(size), callback, true, nil
+		}
+	}
 
 	if pageCache == nil {
 		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
@@ -480,12 +554,12 @@ func newExternalPageMmapCache(maxBytes int64) *externalPageMmapCache {
 		maxBytes = externalPageMmapMaxBytes
 	}
 	return &externalPageMmapCache{
-		entries:     make(map[string]*externalPageMmapEntry),
-		regions:     make([]externalPageCachedRegion, 0, 128),
-		lru:         list.New(),
-		prefetching: make(map[string]struct{}),
-		prefetchSem: make(chan struct{}, externalPagePrefetchMaxConcurrent),
-		maxBytes:    maxBytes,
+		entries:       make(map[string]*externalPageMmapEntry),
+		regions:       make([]externalPageCachedRegion, 0, 128),
+		lru:           list.New(),
+		prefetching:   make(map[externalPagePrefetchKey]*externalPagePrefetchState),
+		prefetchQueue: make([]externalPagePrefetchJob, 0, externalPagePrefetchMaxQueued),
+		maxBytes:      maxBytes,
 	}
 }
 
@@ -498,6 +572,14 @@ func externalPageWindowEnd(offset uint64) uint64 {
 		return externalPageMmapWindowBytes
 	}
 	return ((offset + externalPageMmapWindowBytes - 1) / externalPageMmapWindowBytes) * externalPageMmapWindowBytes
+}
+
+func (fs *Goofys) externalPagePrefetchWaitTimeout() time.Duration {
+	timeout := fs.externalCacheReadTimeout()
+	if timeout > externalPagePrefetchMaxWait {
+		return externalPagePrefetchMaxWait
+	}
+	return timeout
 }
 
 func (c *externalPageMmapCache) lookup(cacheKey string, offset, size uint64) (data [][]byte, callback func(), ok bool) {
@@ -567,76 +649,140 @@ func (c *externalPageMmapCache) prefetchWindow(fs *Goofys, cacheKey string, offs
 	if offset+size > fileSize {
 		size = fileSize - offset
 	}
-	end := offset + size
-	prefetchKey := fmt.Sprintf("%s:%d:%d", cacheKey, offset, end)
+	key := externalPagePrefetchKey{cacheKey: cacheKey, offset: offset, end: offset + size}
 
 	c.mu.Lock()
-	if c.closed || c.hasRangeLocked(cacheKey, offset, end) {
+	if c.closed || c.hasRangeLocked(cacheKey, offset, key.end) {
 		c.mu.Unlock()
 		return true
 	}
-	if _, ok := c.prefetching[prefetchKey]; ok {
+	if _, ok := c.prefetching[key]; ok {
 		c.mu.Unlock()
+		atomic.AddInt64(&fs.stats.externalPrefetch.coalesced, 1)
 		return true
 	}
-	c.prefetching[prefetchKey] = struct{}{}
-	c.mu.Unlock()
-
-	select {
-	case c.prefetchSem <- struct{}{}:
-	default:
-		c.mu.Lock()
-		delete(c.prefetching, prefetchKey)
+	if c.prefetchActive >= externalPagePrefetchMaxConcurrent && len(c.prefetchQueue) >= externalPagePrefetchMaxQueued {
 		c.mu.Unlock()
+		atomic.AddInt64(&fs.stats.externalPrefetch.queueFull, 1)
 		return false
 	}
 
-	go func() {
-		defer func() {
-			<-c.prefetchSem
-			c.mu.Lock()
-			delete(c.prefetching, prefetchKey)
-			c.mu.Unlock()
-		}()
+	state := &externalPagePrefetchState{done: make(chan struct{})}
+	job := externalPagePrefetchJob{
+		fs:            fs,
+		key:           key,
+		state:         state,
+		pageCache:     pageCache,
+		readIntoCache: readIntoCache,
+	}
+	c.prefetching[key] = state
+	startNow := c.prefetchActive < externalPagePrefetchMaxConcurrent
+	if startNow {
+		c.prefetchActive++
+	} else {
+		c.prefetchQueue = append(c.prefetchQueue, job)
+	}
+	c.mu.Unlock()
 
-		if pageCache != nil {
-			views, err := fs.externalCacheClientLocalPageFileViews(pageCache, cacheKey, int64(offset), int64(size))
-			if err == nil && len(views) > 0 {
-				if err := c.insertWindow(cacheKey, offset, views); err != nil {
-					return
-				}
-				if data, cleanup, ok := c.lookup(cacheKey, offset, size); ok {
-					for _, segment := range data {
-						prefaultMappedContentCache(segment)
-					}
-					if cleanup != nil {
-						cleanup()
-					}
-				}
-				return
-			}
-		}
-		if readIntoCache == nil || size > uint64(int(^uint(0)>>1)) {
-			return
-		}
-		buf := make([]byte, int(size))
-		n, err := fs.externalCacheReadContentInto(readIntoCache, cacheKey, int64(offset), buf)
-		if err != nil || n != int64(size) {
-			return
-		}
-		if err := c.insertBytesWindow(cacheKey, offset, buf[:n]); err != nil {
-			return
-		}
-		if data, cleanup, ok := c.lookup(cacheKey, offset, size); ok {
-			for _, segment := range data {
-				prefaultMappedContentCache(segment)
-			}
-			if cleanup != nil {
-				cleanup()
-			}
-		}
-	}()
+	atomic.AddInt64(&fs.stats.externalPrefetch.queued, 1)
+	if startNow {
+		c.startPrefetch(job)
+	}
 	return true
+}
+
+func (c *externalPageMmapCache) startPrefetch(job externalPagePrefetchJob) {
+	atomic.AddInt64(&job.fs.stats.externalPrefetch.started, 1)
+	go func() {
+		success := c.runPrefetch(job)
+		c.finishPrefetch(job, success)
+	}()
+}
+
+func (c *externalPageMmapCache) runPrefetch(job externalPagePrefetchJob) bool {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return false
+	}
+
+	size := job.key.end - job.key.offset
+	if job.pageCache != nil {
+		views, err := job.fs.externalCacheClientLocalPageFileViews(job.pageCache, job.key.cacheKey, int64(job.key.offset), int64(size))
+		if err == nil && len(views) > 0 {
+			if err := c.insertWindow(job.key.cacheKey, job.key.offset, views); err != nil {
+				return false
+			}
+			c.prefault(job.key.cacheKey, job.key.offset, size)
+			return true
+		}
+	}
+	if job.readIntoCache == nil || size > uint64(int(^uint(0)>>1)) {
+		return false
+	}
+	buf := make([]byte, int(size))
+	n, err := job.fs.externalCacheReadContentInto(job.readIntoCache, job.key.cacheKey, int64(job.key.offset), buf)
+	if err != nil || n != int64(size) {
+		return false
+	}
+	if err := c.insertBytesWindow(job.key.cacheKey, job.key.offset, buf[:n]); err != nil {
+		return false
+	}
+	c.prefault(job.key.cacheKey, job.key.offset, size)
+	return true
+}
+
+func (c *externalPageMmapCache) prefault(cacheKey string, offset, size uint64) {
+	if data, cleanup, ok := c.lookup(cacheKey, offset, size); ok {
+		for _, segment := range data {
+			prefaultMappedContentCache(segment)
+		}
+		if cleanup != nil {
+			cleanup()
+		}
+	}
+}
+
+func (c *externalPageMmapCache) finishPrefetch(job externalPagePrefetchJob, success bool) {
+	if success {
+		atomic.AddInt64(&job.fs.stats.externalPrefetch.completed, 1)
+	} else {
+		atomic.AddInt64(&job.fs.stats.externalPrefetch.misses, 1)
+	}
+
+	c.mu.Lock()
+	if state := c.prefetching[job.key]; state == job.state {
+		delete(c.prefetching, job.key)
+	}
+	close(job.state.done)
+	if c.prefetchActive > 0 {
+		c.prefetchActive--
+	}
+	var next *externalPagePrefetchJob
+	if !c.closed && len(c.prefetchQueue) > 0 {
+		queued := c.prefetchQueue[0]
+		c.prefetchQueue[0] = externalPagePrefetchJob{}
+		c.prefetchQueue = c.prefetchQueue[1:]
+		c.prefetchActive++
+		next = &queued
+	}
+	c.mu.Unlock()
+
+	if next != nil {
+		c.startPrefetch(*next)
+	}
+}
+
+func (c *externalPageMmapCache) prefetchDone(cacheKey string, offset, end uint64) <-chan struct{} {
+	key := externalPagePrefetchKey{cacheKey: cacheKey, offset: offset, end: end}
+	c.mu.Lock()
+	state := c.prefetching[key]
+	c.mu.Unlock()
+	if state == nil {
+		return nil
+	}
+	return state.done
 }
 
 func (c *externalPageMmapCache) hasRangeLocked(cacheKey string, start, end uint64) bool {
@@ -923,7 +1069,13 @@ func (c *externalPageMmapCache) close() {
 	}
 	c.entries = make(map[string]*externalPageMmapEntry)
 	c.regions = nil
-	c.prefetching = make(map[string]struct{})
+	for _, job := range c.prefetchQueue {
+		if state := c.prefetching[job.key]; state == job.state {
+			delete(c.prefetching, job.key)
+		}
+		close(job.state.done)
+	}
+	c.prefetchQueue = nil
 	c.lru.Init()
 	c.mappedBytes = 0
 	c.mu.Unlock()

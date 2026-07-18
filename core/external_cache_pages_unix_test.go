@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -461,27 +462,376 @@ func TestExternalPageMmapCacheEvictsUnreferencedEntries(t *testing.T) {
 	}
 }
 
-func TestExternalCachePrefetchDoesNotSkipWhenQueueFull(t *testing.T) {
+func TestExternalCachePrefetchQueueSustainsConcurrency(t *testing.T) {
+	started := make(chan int64, externalPagePrefetchMaxConcurrent+externalPagePrefetchMaxQueued)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer closeRelease()
+
 	flags := cfg.DefaultFlags()
-	flags.ExternalCacheClient = &fakeContentCache{}
+	var startedCount atomic.Int64
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			count := startedCount.Add(1)
+			started <- count
+			<-release
+			return nil, errContentNotFound
+		},
+	}
 	fs := newUnitFS(flags)
 	defer fs.closeExternalPageMmapCache()
 
 	inode := NewInode(fs, nil, "file")
 	fh := NewFileHandle(inode)
 	cache := fs.externalPageCache()
+	fileSize := uint64(externalPageMmapWindowBytes * (externalPagePrefetchMaxConcurrent + externalPagePrefetchMaxQueued))
 
-	for i := 0; i < cap(cache.prefetchSem); i++ {
-		cache.prefetchSem <- struct{}{}
-	}
-	defer func() {
-		for i := 0; i < cap(cache.prefetchSem); i++ {
-			<-cache.prefetchSem
+	fh.scheduleExternalPagePrefetch("hash", 0, fileSize, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), nil)
+
+	for i := 0; i < externalPagePrefetchMaxConcurrent; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for initial prefetch %d", i+1)
 		}
-	}()
-
-	fh.scheduleExternalPagePrefetch("hash", 0, 2*externalPageMmapWindowBytes, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), nil)
-	if fh.externalPrefetchNext != 0 {
-		t.Fatalf("prefetch advanced after queue-full drop: got %d", fh.externalPrefetchNext)
 	}
+	cache.mu.Lock()
+	active := cache.prefetchActive
+	queued := len(cache.prefetchQueue)
+	inflight := len(cache.prefetching)
+	cache.mu.Unlock()
+	if active != externalPagePrefetchMaxConcurrent || queued != externalPagePrefetchMaxQueued || inflight != externalPagePrefetchMaxConcurrent+externalPagePrefetchMaxQueued {
+		t.Fatalf("unexpected prefetch scheduler state: active=%d queued=%d inflight=%d", active, queued, inflight)
+	}
+	if fh.externalPrefetchNext != fileSize {
+		t.Fatalf("prefetch did not retain the full read-ahead range: got %d want %d", fh.externalPrefetchNext, fileSize)
+	}
+	if cache.prefetchWindow(fs, "overflow", 0, externalPageMmapWindowBytes, externalPageMmapWindowBytes, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), nil) {
+		t.Fatal("prefetch scheduler accepted work beyond its bounded queue")
+	}
+
+	select {
+	case release <- struct{}{}:
+	case <-time.After(time.Second):
+		t.Fatal("timed out releasing an active prefetch")
+	}
+	select {
+	case count := <-started:
+		if count != externalPagePrefetchMaxConcurrent+1 {
+			t.Fatalf("unexpected next prefetch start count: %d", count)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued prefetch did not start when an active slot completed")
+	}
+
+	closeRelease()
+	waitForExternalPageCondition(t, 2*time.Second, func() bool {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		return cache.prefetchActive == 0 && len(cache.prefetchQueue) == 0 && len(cache.prefetching) == 0
+	}, "prefetch queue to drain")
+	if got := atomic.LoadInt64(&fs.stats.externalPrefetch.queued); got != int64(externalPagePrefetchMaxConcurrent+externalPagePrefetchMaxQueued) {
+		t.Fatalf("unexpected queued prefetch metric: %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalPrefetch.started); got != int64(externalPagePrefetchMaxConcurrent+externalPagePrefetchMaxQueued) {
+		t.Fatalf("unexpected started prefetch metric: %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalPrefetch.queueFull); got != 1 {
+		t.Fatalf("unexpected queue-full metric: %d", got)
+	}
+}
+
+func TestExternalCacheCloseCancelsQueuedPrefetch(t *testing.T) {
+	started := make(chan struct{}, externalPagePrefetchMaxConcurrent)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer closeRelease()
+
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			started <- struct{}{}
+			<-release
+			return nil, errContentNotFound
+		},
+	}
+	fs := newUnitFS(flags)
+	cache := fs.externalPageCache()
+	pageCache := flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
+	fileSize := uint64(externalPageMmapWindowBytes * (externalPagePrefetchMaxConcurrent + 1))
+	for i := 0; i < externalPagePrefetchMaxConcurrent+1; i++ {
+		offset := uint64(i * externalPageMmapWindowBytes)
+		if !cache.prefetchWindow(fs, "hash", offset, externalPageMmapWindowBytes, fileSize, pageCache, nil) {
+			t.Fatalf("prefetch %d was unexpectedly rejected", i)
+		}
+	}
+	for i := 0; i < externalPagePrefetchMaxConcurrent; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for active prefetch %d", i+1)
+		}
+	}
+	queuedOffset := uint64(externalPagePrefetchMaxConcurrent * externalPageMmapWindowBytes)
+	queuedDone := cache.prefetchDone("hash", queuedOffset, queuedOffset+externalPageMmapWindowBytes)
+	if queuedDone == nil {
+		t.Fatal("queued prefetch was not tracked")
+	}
+
+	fs.closeExternalPageMmapCache()
+	select {
+	case <-queuedDone:
+	case <-time.After(time.Second):
+		t.Fatal("close did not release queued prefetch waiter")
+	}
+	closeRelease()
+	waitForExternalPageCondition(t, 2*time.Second, func() bool {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		return cache.prefetchActive == 0 && len(cache.prefetchQueue) == 0 && len(cache.prefetching) == 0
+	}, "active prefetches to finish after close")
+	select {
+	case <-started:
+		t.Fatal("queued prefetch started after cache close")
+	default:
+	}
+}
+
+func TestExternalCacheForegroundJoinsInflightPrefetch(t *testing.T) {
+	const fileSize = 4 * 1024 * 1024
+	pagePath := filepath.Join(t.TempDir(), "page")
+	if err := os.WriteFile(pagePath, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(pagePath, fileSize); err != nil {
+		t.Fatal(err)
+	}
+
+	prefetchStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	var pageCalls atomic.Int64
+	var readIntoCalls atomic.Int64
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheReadTimeout = time.Second
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			if pageCalls.Add(1) != 1 {
+				return nil, errContentNotFound
+			}
+			close(prefetchStarted)
+			<-release
+			return []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: 0, Length: int(length)}}, nil
+		},
+		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			readIntoCalls.Add(1)
+			for i := range dst {
+				dst[i] = 'r'
+			}
+			return int64(len(dst)), nil
+		},
+	}
+	fs := newUnitFS(flags)
+	defer func() {
+		closeRelease()
+		fs.closeExternalPageMmapCache()
+	}()
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = fileSize
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	fh := NewFileHandle(inode)
+	cache := fs.externalPageCache()
+	cache.prefetchWindow(fs, "hash", 0, fileSize, fileSize, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto))
+
+	select {
+	case <-prefetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for prefetch to start")
+	}
+	type readResult struct {
+		data     [][]byte
+		bytes    int
+		callback func()
+		err      error
+	}
+	readDone := make(chan readResult, 1)
+	go func() {
+		data, bytesRead, callback, err := fh.ReadFileWithCallback(0, 1024*1024)
+		readDone <- readResult{data: data, bytes: bytesRead, callback: callback, err: err}
+	}()
+	waitForExternalPageCondition(t, time.Second, func() bool {
+		return atomic.LoadInt64(&fs.stats.externalPrefetch.waitCount) == 1
+	}, "foreground read to join prefetch")
+	closeRelease()
+
+	var result readResult
+	select {
+	case result = <-readDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for joined foreground read")
+	}
+	if result.callback != nil {
+		defer result.callback()
+	}
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	if result.bytes != 1024*1024 || len(result.data) == 0 {
+		t.Fatalf("unexpected joined read result: bytes=%d segments=%d", result.bytes, len(result.data))
+	}
+	if got := pageCalls.Load(); got != 1 {
+		t.Fatalf("foreground issued a duplicate page lookup: calls=%d", got)
+	}
+	if got := readIntoCalls.Load(); got != 0 {
+		t.Fatalf("foreground issued a duplicate read-into: calls=%d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalPrefetch.waitHits); got != 1 {
+		t.Fatalf("unexpected joined-hit metric: %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalPrefetch.waitTimeouts); got != 0 {
+		t.Fatalf("unexpected join timeout metric: %d", got)
+	}
+}
+
+func TestExternalCacheForegroundPrefetchJoinTimesOut(t *testing.T) {
+	const fileSize = 4 * 1024 * 1024
+	pagePath := filepath.Join(t.TempDir(), "page")
+	if err := os.WriteFile(pagePath, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(pagePath, fileSize); err != nil {
+		t.Fatal(err)
+	}
+
+	prefetchStarted := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	var pageCalls atomic.Int64
+	var readIntoCalls atomic.Int64
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheReadTimeout = time.Second
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			if pageCalls.Add(1) == 1 {
+				close(prefetchStarted)
+				<-release
+				return []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: 0, Length: int(length)}}, nil
+			}
+			return nil, errContentNotFound
+		},
+		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			readIntoCalls.Add(1)
+			for i := range dst {
+				dst[i] = 'r'
+			}
+			return int64(len(dst)), nil
+		},
+	}
+	fs := newUnitFS(flags)
+	defer func() {
+		closeRelease()
+		fs.closeExternalPageMmapCache()
+	}()
+	inode := NewInode(fs, nil, "file")
+	inode.Attributes.Size = fileSize
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	fh := NewFileHandle(inode)
+	cache := fs.externalPageCache()
+	cache.prefetchWindow(fs, "hash", 0, fileSize, fileSize, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto))
+
+	select {
+	case <-prefetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for prefetch to start")
+	}
+	started := time.Now()
+	data, bytesRead, callback, err := fh.ReadFileWithCallback(0, 1024*1024)
+	if callback != nil {
+		defer callback()
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed < externalPagePrefetchMaxWait || elapsed > 750*time.Millisecond {
+		t.Fatalf("prefetch join did not fail open promptly: %s", elapsed)
+	}
+	if bytesRead != 1024*1024 || len(data) != 1 || data[0][0] != 'r' {
+		t.Fatalf("unexpected fail-open read result: bytes=%d segments=%d", bytesRead, len(data))
+	}
+	if got := pageCalls.Load(); got != 2 {
+		t.Fatalf("expected prefetch and foreground page lookups, got %d", got)
+	}
+	if got := readIntoCalls.Load(); got != 1 {
+		t.Fatalf("expected one fail-open read-into, got %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalPrefetch.waitTimeouts); got != 1 {
+		t.Fatalf("unexpected join-timeout metric: %d", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalPrefetch.waitHits); got != 0 {
+		t.Fatalf("unexpected joined-hit metric: %d", got)
+	}
+
+	closeRelease()
+	waitForExternalPageCondition(t, time.Second, func() bool {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		return cache.prefetchActive == 0
+	}, "timed-out prefetch to finish")
+}
+
+func waitForExternalPageCondition(t *testing.T, timeout time.Duration, condition func() bool, description string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", description)
+}
+
+var externalPageBenchmarkSink byte
+
+func BenchmarkExternalPageMmapLookupCopySequential1MiB(b *testing.B) {
+	const (
+		windowSize = 64 * 1024 * 1024
+		readSize   = 1024 * 1024
+	)
+	pagePath := filepath.Join(b.TempDir(), "page")
+	if err := os.WriteFile(pagePath, nil, 0644); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.Truncate(pagePath, windowSize); err != nil {
+		b.Fatal(err)
+	}
+	cache := newExternalPageMmapCache(2 * windowSize)
+	defer cache.close()
+	if err := cache.insertWindow("hash", 0, []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: 0, Length: windowSize}}); err != nil {
+		b.Fatal(err)
+	}
+	dst := make([]byte, readSize)
+	b.ReportAllocs()
+	b.SetBytes(readSize)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		offset := uint64((i * readSize) % windowSize)
+		data, cleanup, ok := cache.lookup("hash", offset, readSize)
+		if !ok {
+			b.Fatal("mmap cache lookup missed")
+		}
+		written := 0
+		for _, segment := range data {
+			written += copy(dst[written:], segment)
+		}
+		if cleanup != nil {
+			cleanup()
+		}
+		externalPageBenchmarkSink ^= dst[written-1]
+	}
+	b.ReportMetric(float64(b.N*readSize)/(1024*1024)/b.Elapsed().Seconds(), "MiB/s")
 }

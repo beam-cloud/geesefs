@@ -162,6 +162,19 @@ type Goofys struct {
 	stagedFiles sync.Map
 }
 
+type externalPrefetchOpStats struct {
+	queued       int64
+	started      int64
+	completed    int64
+	misses       int64
+	queueFull    int64
+	coalesced    int64
+	waitCount    int64
+	waitHits     int64
+	waitTimeouts int64
+	waitNanos    int64
+}
+
 type OpStats struct {
 	reads                    int64
 	readBytes                int64
@@ -192,6 +205,7 @@ type OpStats struct {
 	externalPageViewNanos    int64
 	externalPageMmapCount    int64
 	externalPageMmapNanos    int64
+	externalPrefetch         externalPrefetchOpStats
 	externalReadIntoAttempts int64
 	externalReadIntoHits     int64
 	externalReadIntoMisses   int64
@@ -1149,6 +1163,16 @@ func (fs *Goofys) StatPrinter() {
 		externalPageViewNanos := atomic.SwapInt64(&fs.stats.externalPageViewNanos, 0)
 		externalPageMmapCount := atomic.SwapInt64(&fs.stats.externalPageMmapCount, 0)
 		externalPageMmapNanos := atomic.SwapInt64(&fs.stats.externalPageMmapNanos, 0)
+		externalPrefetchQueued := atomic.SwapInt64(&fs.stats.externalPrefetch.queued, 0)
+		externalPrefetchStarted := atomic.SwapInt64(&fs.stats.externalPrefetch.started, 0)
+		externalPrefetchCompleted := atomic.SwapInt64(&fs.stats.externalPrefetch.completed, 0)
+		externalPrefetchMisses := atomic.SwapInt64(&fs.stats.externalPrefetch.misses, 0)
+		externalPrefetchQueueFull := atomic.SwapInt64(&fs.stats.externalPrefetch.queueFull, 0)
+		externalPrefetchCoalesced := atomic.SwapInt64(&fs.stats.externalPrefetch.coalesced, 0)
+		externalPrefetchWaitCount := atomic.SwapInt64(&fs.stats.externalPrefetch.waitCount, 0)
+		externalPrefetchWaitHits := atomic.SwapInt64(&fs.stats.externalPrefetch.waitHits, 0)
+		externalPrefetchWaitTimeouts := atomic.SwapInt64(&fs.stats.externalPrefetch.waitTimeouts, 0)
+		externalPrefetchWaitNanos := atomic.SwapInt64(&fs.stats.externalPrefetch.waitNanos, 0)
 		externalReadIntoAttempts := atomic.SwapInt64(&fs.stats.externalReadIntoAttempts, 0)
 		externalReadIntoHits := atomic.SwapInt64(&fs.stats.externalReadIntoHits, 0)
 		externalReadIntoMisses := atomic.SwapInt64(&fs.stats.externalReadIntoMisses, 0)
@@ -1186,7 +1210,7 @@ func (fs *Goofys) StatPrinter() {
 		if reads == 0 {
 			readsOr1 = 1
 		}
-		hasActivity := reads+readBytes+readSlow+readErrors+readHandlerCount+readCallbackCount+readHashMetadataCount+readBufferLookupCount+readFallbackCount+readBufferHits+externalPageAttempts+externalPageHits+externalPageMisses+externalPageMmapFailures+externalPageViewCount+externalReadIntoAttempts+externalStreamAttempts+externalUnaryAttempts+externalCacheTimeouts+cacheEventsQueued+cacheEventsStarted+cacheEventsSuccess+cacheEventsErrors+cacheEventsMismatch+cacheEventsDropped+cloudReadRequests+writes+flushes+metadataReads+metadataWrites+noops+evicts > 0
+		hasActivity := reads+readBytes+readSlow+readErrors+readHandlerCount+readCallbackCount+readHashMetadataCount+readBufferLookupCount+readFallbackCount+readBufferHits+externalPageAttempts+externalPageHits+externalPageMisses+externalPageMmapFailures+externalPageViewCount+externalPrefetchQueued+externalPrefetchStarted+externalPrefetchCompleted+externalPrefetchMisses+externalPrefetchQueueFull+externalPrefetchCoalesced+externalPrefetchWaitCount+externalPrefetchWaitTimeouts+externalReadIntoAttempts+externalStreamAttempts+externalUnaryAttempts+externalCacheTimeouts+cacheEventsQueued+cacheEventsStarted+cacheEventsSuccess+cacheEventsErrors+cacheEventsMismatch+cacheEventsDropped+cloudReadRequests+writes+flushes+metadataReads+metadataWrites+noops+evicts > 0
 		if !hasActivity {
 			continue
 		}
@@ -1204,9 +1228,9 @@ func (fs *Goofys) StatPrinter() {
 			float64(evicts)/d,
 			float64(flushes)/d,
 		)
-		if readSlow+readErrors+readBufferHits+readHandlerCount+readCallbackCount+readHashMetadataCount+readBufferLookupCount+readFallbackCount+externalPageAttempts+externalReadIntoAttempts+externalStreamAttempts+externalUnaryAttempts+externalCacheTimeouts+cacheEventsQueued+cacheEventsStarted+cacheEventsSuccess+cacheEventsErrors+cacheEventsMismatch+cacheEventsDropped+cloudReadRequests > 0 {
+		if readSlow+readErrors+readBufferHits+readHandlerCount+readCallbackCount+readHashMetadataCount+readBufferLookupCount+readFallbackCount+externalPageAttempts+externalPrefetchQueued+externalPrefetchStarted+externalPrefetchCompleted+externalPrefetchMisses+externalPrefetchQueueFull+externalPrefetchCoalesced+externalPrefetchWaitCount+externalPrefetchWaitTimeouts+externalReadIntoAttempts+externalStreamAttempts+externalUnaryAttempts+externalCacheTimeouts+cacheEventsQueued+cacheEventsStarted+cacheEventsSuccess+cacheEventsErrors+cacheEventsMismatch+cacheEventsDropped+cloudReadRequests > 0 {
 			log.Debugf(
-				"geesefs read path summary: fuse_reads=%d fuse_read=%.2fMiB slow=%d errors=%d timing(handler_count=%d handler_avg=%s callback_count=%d callback=%.2fMiB callback_avg=%s hash_metadata=%d/%s buffer_lookup=%d/%s fallback=%d/%s) buffer_hit=%d buffer=%.2fMiB mmap_page(attempt=%d hit=%d miss=%d mmap_fail=%d %.2fMiB lookup_count=%d lookup_avg=%s view_lookup=%d/%s mmap_count=%d mmap_avg=%s) read_into(attempt=%d hit=%d miss=%d %.2fMiB avg=%s) stream(attempt=%d hit=%d miss=%d %.2fMiB) unary(attempt=%d hit=%d miss=%d %.2fMiB) external_cache(timeout=%d) cache_event(queued=%d started=%d ok=%d err=%d mismatch=%d dropped=%d %.2fMiB) cloud(req=%d %.2fMiB)",
+				"geesefs read path summary: fuse_reads=%d fuse_read=%.2fMiB slow=%d errors=%d timing(handler_count=%d handler_avg=%s callback_count=%d callback=%.2fMiB callback_avg=%s hash_metadata=%d/%s buffer_lookup=%d/%s fallback=%d/%s) buffer_hit=%d buffer=%.2fMiB mmap_page(attempt=%d hit=%d miss=%d mmap_fail=%d %.2fMiB lookup_count=%d lookup_avg=%s view_lookup=%d/%s mmap_count=%d mmap_avg=%s) prefetch(queued=%d started=%d ok=%d miss=%d queue_full=%d coalesced=%d wait=%d wait_hit=%d wait_timeout=%d wait_avg=%s) read_into(attempt=%d hit=%d miss=%d %.2fMiB avg=%s) stream(attempt=%d hit=%d miss=%d %.2fMiB) unary(attempt=%d hit=%d miss=%d %.2fMiB) external_cache(timeout=%d) cache_event(queued=%d started=%d ok=%d err=%d mismatch=%d dropped=%d %.2fMiB) cloud(req=%d %.2fMiB)",
 				reads,
 				float64(readBytes)/(1024*1024),
 				readSlow,
@@ -1235,6 +1259,16 @@ func (fs *Goofys) StatPrinter() {
 				avgDuration(externalPageViewNanos, externalPageViewCount),
 				externalPageMmapCount,
 				avgDuration(externalPageMmapNanos, externalPageMmapCount),
+				externalPrefetchQueued,
+				externalPrefetchStarted,
+				externalPrefetchCompleted,
+				externalPrefetchMisses,
+				externalPrefetchQueueFull,
+				externalPrefetchCoalesced,
+				externalPrefetchWaitCount,
+				externalPrefetchWaitHits,
+				externalPrefetchWaitTimeouts,
+				avgDuration(externalPrefetchWaitNanos, externalPrefetchWaitCount),
 				externalReadIntoAttempts,
 				externalReadIntoHits,
 				externalReadIntoMisses,
