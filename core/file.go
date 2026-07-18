@@ -45,6 +45,9 @@ type FileHandle struct {
 	externalPrefetchMu      sync.Mutex
 	externalPrefetchHash    string
 	externalPrefetchNext    uint64
+	lazyReadMu              sync.Mutex
+	lazyReadStage           *lazyReadStage
+	lazyReadDisabled        bool
 }
 
 // On Linux and MacOS, IOV_MAX = 1024
@@ -1034,6 +1037,9 @@ func (fh *FileHandle) retrieveHashMetadata() {
 	fh.inode.mu.Unlock()
 	head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
 	if err == nil {
+		// Refresh the object identity along with its metadata. Lazy read-through
+		// population must be tied to the exact ETag and size that were read.
+		fh.inode.SetFromBlobItem(&head.BlobItemOutput)
 		fh.inode.mu.Lock()
 		fh.inode.setMetadata(head.Metadata)
 		fh.inode.hashMetadataChecked = true
@@ -1044,10 +1050,16 @@ func (fh *FileHandle) retrieveHashMetadata() {
 }
 
 func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesRead int, err error) {
+	if sOffset < 0 || sLen < 0 {
+		fh.abandonLazyRead("negative read offset or length", syscall.EINVAL)
+		return nil, 0, syscall.EINVAL
+	}
 	if fh.shouldRetrieveHash() {
 		fh.retrieveHashMetadata()
 	}
-	return fh.readFileAfterHash(sOffset, sLen)
+	data, bytesRead, err = fh.readFileAfterHash(sOffset, sLen)
+	fh.recordLazyRead(uint64(sOffset), uint64(sLen), data, bytesRead, err)
+	return
 }
 
 func (fh *FileHandle) readFileAfterHash(sOffset int64, sLen int64) (data [][]byte, bytesRead int, err error) {
@@ -1142,6 +1154,8 @@ func (fh *FileHandle) readFileAfterHash(sOffset int64, sLen int64) (data [][]byt
 }
 
 func (fh *FileHandle) Release() {
+	fh.abandonLazyRead("file handle released", nil)
+
 	// LookUpInode accesses fileHandles without mutex taken, so use atomics for now
 	n := atomic.AddInt32(&fh.inode.fileHandles, -1)
 	if n == -1 {
@@ -1694,6 +1708,10 @@ func (inode *Inode) sendHashUpdateMeta() {
 			if mappedErr == syscall.EBUSY || mappedErr == syscall.ENOENT || mappedErr == syscall.ERANGE {
 				s3Log.Warnf("Deferred hash metadata publish lost compare-and-swap for %v, invalidating local cached metadata: %v", key, err)
 				inode.hashMetadataDirty = false
+				if inode.userMetadata != nil {
+					delete(inode.userMetadata, inode.fs.flags.HashAttr)
+				}
+				inode.hashMetadataChecked = false
 				inode.resetCache()
 				return
 			}

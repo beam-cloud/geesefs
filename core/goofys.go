@@ -60,6 +60,8 @@ type cacheEvent struct {
 	localSourcePath  string
 	removeLocalAfter bool
 	fromBuffers      bool
+	lazyReadIdentity *lazyReadIdentity
+	skipCacheStatus  bool
 }
 
 const externalCacheStoreAttempts = 5
@@ -154,6 +156,8 @@ type Goofys struct {
 
 	externalPageMmapCache   *externalPageMmapCache
 	externalPageMmapCacheMu sync.Mutex
+	lazyReadClaims          map[lazyReadIdentity]struct{}
+	lazyReadClaimsMu        sync.Mutex
 
 	stagedFiles sync.Map
 }
@@ -502,6 +506,9 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 	started := time.Now()
 	atomic.AddInt64(&fs.activeCacheEvents, 1)
 	defer atomic.AddInt64(&fs.activeCacheEvents, -1)
+	if cacheEvent.lazyReadIdentity != nil {
+		defer fs.releaseLazyReadClaim(*cacheEvent.lazyReadIdentity)
+	}
 	atomic.AddInt64(&fs.stats.cacheEventsStarted, 1)
 	atomic.AddInt64(&fs.stats.cacheEventsBytes, int64(cacheEvent.size))
 	source := "s3"
@@ -544,20 +551,22 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 		} else if hash != cacheEvent.hash {
 			atomic.AddInt64(&fs.stats.cacheEventsMismatch, 1)
 			log.Warnf("geesefs external cache store result: status=hash_mismatch path=%q expected=%q actual=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
-			fs.clearCachingStatus(cacheEvent.hash)
 		} else if hash == cacheEvent.hash {
 			atomic.AddInt64(&fs.stats.cacheEventsSuccess, 1)
 			log.Debugf("geesefs external cache store result: status=ok path=%q hash=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
 			fs.emitExternalCacheStoredEvent(cacheEvent, source)
 			if cacheEvent.inode != nil {
+				if cacheEvent.lazyReadIdentity != nil {
+					cacheEvent.inode.publishLazyReadHash(*cacheEvent.lazyReadIdentity, cacheEvent.hash)
+				}
 				cacheEvent.inode.dropCleanBuffersAfterExternalCacheStore(cacheEvent.hash)
 			}
 		}
 
-		fs.clearCachingStatus(cacheEvent.hash)
+		fs.clearCacheEventStatus(cacheEvent)
 	} else {
 		log.Debugf("geesefs external cache store result: status=empty path=%q hash=%q source=%s elapsed=%s", cacheEvent.path, cacheEvent.hash, source, time.Since(started).Truncate(time.Millisecond))
-		fs.clearCachingStatus(cacheEvent.hash)
+		fs.clearCacheEventStatus(cacheEvent)
 	}
 
 	if cacheEvent.removeLocalAfter {
@@ -565,6 +574,12 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 		if err != nil {
 			log.Warnf("Failed to remove staged cache source %v: %v", cacheEvent.localSourcePath, err)
 		}
+	}
+}
+
+func (fs *Goofys) clearCacheEventStatus(cacheEvent cacheEvent) {
+	if !cacheEvent.skipCacheStatus {
+		fs.clearCachingStatus(cacheEvent.hash)
 	}
 }
 

@@ -2316,6 +2316,12 @@ func TestDeferredHashMetadataPublishCASFailureInvalidatesLocalView(t *testing.T)
 	if inode.hashMetadataDirty {
 		t.Fatal("expected CAS failure to stop retrying stale hash metadata")
 	}
+	if got := string(inode.userMetadata[flags.HashAttr]); got != "" {
+		t.Fatalf("expected CAS failure to remove stale hash metadata, got %q", got)
+	}
+	if inode.hashMetadataChecked {
+		t.Fatal("expected CAS failure to force metadata revalidation")
+	}
 	if inode.buffers.AnyUnclean() {
 		t.Fatal("expected resetCache to drop local buffer state")
 	}
