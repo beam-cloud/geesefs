@@ -28,6 +28,7 @@ type fakeContentCache struct {
 	storeContent func(chunks chan []byte, hash string, opts struct{ RoutingKey string }) (string, error)
 	storeFromS3  func(source struct {
 		Path        string
+		CachePath   string
 		BucketName  string
 		Region      string
 		EndpointURL string
@@ -75,6 +76,7 @@ func (c *fakeContentCache) StoreContent(chunks chan []byte, hash string, opts st
 
 func (c *fakeContentCache) StoreContentFromS3(source struct {
 	Path        string
+	CachePath   string
 	BucketName  string
 	Region      string
 	EndpointURL string
@@ -1764,6 +1766,7 @@ func TestCacheStatusClearedByHash(t *testing.T) {
 			flags.ExternalCacheClient = &fakeContentCache{
 				storeFromS3: func(source struct {
 					Path        string
+					CachePath   string
 					BucketName  string
 					Region      string
 					EndpointURL string
@@ -1823,6 +1826,7 @@ func TestCacheThroughUsesLocalStagedSource(t *testing.T) {
 		},
 		storeFromS3: func(source struct {
 			Path        string
+			CachePath   string
 			BucketName  string
 			Region      string
 			EndpointURL string
@@ -1960,6 +1964,7 @@ func TestCacheThroughFromFlushedBuffersUsesLocalBytes(t *testing.T) {
 		},
 		storeFromS3: func(source struct {
 			Path        string
+			CachePath   string
 			BucketName  string
 			Region      string
 			EndpointURL string
@@ -2036,6 +2041,7 @@ func TestReadThroughFromBuffersUsesLocalBytes(t *testing.T) {
 		},
 		storeFromS3: func(source struct {
 			Path        string
+			CachePath   string
 			BucketName  string
 			Region      string
 			EndpointURL string

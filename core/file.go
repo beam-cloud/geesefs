@@ -45,9 +45,6 @@ type FileHandle struct {
 	externalPrefetchMu      sync.Mutex
 	externalPrefetchHash    string
 	externalPrefetchNext    uint64
-	lazyReadMu              sync.Mutex
-	lazyReadStage           *lazyReadStage
-	lazyReadDisabled        bool
 }
 
 // On Linux and MacOS, IOV_MAX = 1024
@@ -1051,14 +1048,13 @@ func (fh *FileHandle) retrieveHashMetadata() {
 
 func (fh *FileHandle) ReadFile(sOffset int64, sLen int64) (data [][]byte, bytesRead int, err error) {
 	if sOffset < 0 || sLen < 0 {
-		fh.abandonLazyRead("negative read offset or length", syscall.EINVAL)
 		return nil, 0, syscall.EINVAL
 	}
 	if fh.shouldRetrieveHash() {
 		fh.retrieveHashMetadata()
 	}
+	fh.materializeReadThrough(uint64(sOffset))
 	data, bytesRead, err = fh.readFileAfterHash(sOffset, sLen)
-	fh.recordLazyRead(uint64(sOffset), uint64(sLen), data, bytesRead, err)
 	return
 }
 
@@ -1154,8 +1150,6 @@ func (fh *FileHandle) readFileAfterHash(sOffset int64, sLen int64) (data [][]byt
 }
 
 func (fh *FileHandle) Release() {
-	fh.abandonLazyRead("file handle released", nil)
-
 	// LookUpInode accesses fileHandles without mutex taken, so use atomics for now
 	n := atomic.AddInt32(&fh.inode.fileHandles, -1)
 	if n == -1 {

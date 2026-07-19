@@ -60,8 +60,6 @@ type cacheEvent struct {
 	localSourcePath  string
 	removeLocalAfter bool
 	fromBuffers      bool
-	lazyReadIdentity *lazyReadIdentity
-	skipCacheStatus  bool
 }
 
 const externalCacheStoreAttempts = 5
@@ -154,10 +152,10 @@ type Goofys struct {
 	cachingStatusMu   sync.Mutex
 	activeCacheEvents int64
 
-	externalPageMmapCache   *externalPageMmapCache
-	externalPageMmapCacheMu sync.Mutex
-	lazyReadClaims          map[lazyReadIdentity]struct{}
-	lazyReadClaimsMu        sync.Mutex
+	externalPageMmapCache       *externalPageMmapCache
+	externalPageMmapCacheMu     sync.Mutex
+	readThroughMaterializations map[readThroughIdentity]*readThroughMaterialization
+	readThroughMu               sync.Mutex
 
 	stagedFiles sync.Map
 }
@@ -520,9 +518,6 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 	started := time.Now()
 	atomic.AddInt64(&fs.activeCacheEvents, 1)
 	defer atomic.AddInt64(&fs.activeCacheEvents, -1)
-	if cacheEvent.lazyReadIdentity != nil {
-		defer fs.releaseLazyReadClaim(*cacheEvent.lazyReadIdentity)
-	}
 	atomic.AddInt64(&fs.stats.cacheEventsStarted, 1)
 	atomic.AddInt64(&fs.stats.cacheEventsBytes, int64(cacheEvent.size))
 	source := "s3"
@@ -570,9 +565,6 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 			log.Debugf("geesefs external cache store result: status=ok path=%q hash=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
 			fs.emitExternalCacheStoredEvent(cacheEvent, source)
 			if cacheEvent.inode != nil {
-				if cacheEvent.lazyReadIdentity != nil {
-					cacheEvent.inode.publishLazyReadHash(*cacheEvent.lazyReadIdentity, cacheEvent.hash)
-				}
 				cacheEvent.inode.dropCleanBuffersAfterExternalCacheStore(cacheEvent.hash)
 			}
 		}
@@ -592,9 +584,7 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 }
 
 func (fs *Goofys) clearCacheEventStatus(cacheEvent cacheEvent) {
-	if !cacheEvent.skipCacheStatus {
-		fs.clearCachingStatus(cacheEvent.hash)
-	}
+	fs.clearCachingStatus(cacheEvent.hash)
 }
 
 func (fs *Goofys) emitExternalCacheStoredEvent(cacheEvent cacheEvent, source string) {
@@ -630,6 +620,7 @@ func (fs *Goofys) storeCacheEventContent(cacheEvent cacheEvent) (string, error) 
 	}
 	return fs.flags.ExternalCacheClient.StoreContentFromS3(struct {
 		Path        string
+		CachePath   string
 		BucketName  string
 		Region      string
 		EndpointURL string

@@ -98,7 +98,6 @@ type externalPageMmapCache struct {
 
 func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]byte, bytesRead int, callback func(), err error) {
 	if sOffset < 0 || sLen < 0 {
-		fh.abandonLazyRead("negative read offset or length", syscall.EINVAL)
 		return nil, 0, nil, syscall.EINVAL
 	}
 	offset := uint64(sOffset)
@@ -132,10 +131,6 @@ func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]
 			)
 		}
 	}()
-	defer func() {
-		fh.recordLazyRead(offset, size, data, bytesRead, err)
-	}()
-
 	if fh.shouldRetrieveHash() {
 		hashMetadataStarted := time.Now()
 		fh.retrieveHashMetadata()
@@ -143,6 +138,7 @@ func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]
 		atomic.AddInt64(&fh.inode.fs.stats.readHashMetadataCount, 1)
 		atomic.AddInt64(&fh.inode.fs.stats.readHashMetadataNanos, hashMetadataElapsed.Nanoseconds())
 	}
+	fh.materializeReadThrough(offset)
 
 	bufferLookupStarted := time.Now()
 	data, _, err = fh.inode.buffers.GetData(offset, size, false)
