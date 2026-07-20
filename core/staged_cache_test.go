@@ -1537,6 +1537,131 @@ func TestExternalCacheShortStreamFallsBackWithoutZeroPadding(t *testing.T) {
 	}
 }
 
+func TestLoadFromServerPinsOneETagAcrossParallelRanges(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 2*1024)
+	flags := cfg.DefaultFlags()
+	flags.ReadAheadParallelKB = 1
+	flags.ReadMergeKB = 0
+	fs := newUnitFS(flags)
+	ifMatches := make(chan string, 2)
+	backend := &TestBackend{GetBlobFunc: func(param *GetBlobInput) (*GetBlobOutput, error) {
+		if param.IfMatch == nil {
+			ifMatches <- ""
+		} else {
+			ifMatches <- *param.IfMatch
+		}
+		end := param.Start + param.Count
+		etag := "etag-v1"
+		return &GetBlobOutput{
+			Body: io.NopCloser(bytes.NewReader(payload[param.Start:end])),
+			HeadBlobOutput: HeadBlobOutput{BlobItemOutput: BlobItemOutput{
+				Key: &param.Key, ETag: &etag, Size: param.Count, Metadata: map[string]*string{},
+			}},
+		}, nil
+	}}
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "model.bin")
+	inode.Attributes.Size = uint64(len(payload))
+	inode.knownSize = uint64(len(payload))
+	inode.knownETag = "etag-v1"
+	inode.SetCacheState(ST_CACHED)
+
+	inode.mu.Lock()
+	inode.loadFromServer([]Range{{Start: 0, End: uint64(len(payload))}}, 0, false)
+	// The range goroutines cannot acquire inode.mu until this unlock. Changing
+	// the inode identity here proves they use the launch-time snapshot.
+	inode.knownETag = "etag-v2"
+	inode.mu.Unlock()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-ifMatches:
+			if got != "etag-v1" {
+				t.Fatalf("parallel range %d If-Match = %q, want etag-v1", i, got)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for parallel origin range")
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		inode.mu.Lock()
+		loading := len(inode.readRanges)
+		inode.mu.Unlock()
+		if loading == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("parallel origin ranges did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestParallelReadPreservesConditionalConflictFromEarlierRange(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 2*1024)
+	flags := cfg.DefaultFlags()
+	flags.ReadAheadParallelKB = 1
+	flags.ReadMergeKB = 0
+	fs := newUnitFS(flags)
+	var inode *Inode
+	var successObservedConflict atomic.Bool
+	backend := &TestBackend{GetBlobFunc: func(param *GetBlobInput) (*GetBlobOutput, error) {
+		if param.Start != 0 {
+			return nil, syscall.EBUSY
+		}
+		deadline := time.Now().Add(time.Second)
+		for {
+			inode.mu.Lock()
+			conflictRecorded := errors.Is(mapAwsError(inode.readError), syscall.EBUSY)
+			inode.mu.Unlock()
+			if conflictRecorded {
+				successObservedConflict.Store(true)
+				break
+			}
+			if time.Now().After(deadline) {
+				return nil, errors.New("timed out waiting for parallel conflict")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		etag := "etag-v1"
+		return &GetBlobOutput{
+			Body: io.NopCloser(bytes.NewReader(payload[:param.Count])),
+			HeadBlobOutput: HeadBlobOutput{BlobItemOutput: BlobItemOutput{
+				Key: &param.Key, ETag: &etag, Size: param.Count, Metadata: map[string]*string{},
+			}},
+		}, nil
+	}}
+	root := newRootWithBackend(fs, backend)
+	inode = NewInode(fs, root, "model.bin")
+	inode.Attributes.Size = uint64(len(payload))
+	inode.knownSize = uint64(len(payload))
+	inode.knownETag = "etag-v1"
+	inode.SetCacheState(ST_CACHED)
+
+	inode.mu.Lock()
+	inode.loadFromServer([]Range{{Start: 0, End: uint64(len(payload))}}, 0, false)
+	inode.mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		inode.mu.Lock()
+		loading := len(inode.readRanges)
+		readErr := inode.readError
+		inode.mu.Unlock()
+		if loading == 0 && successObservedConflict.Load() {
+			if !errors.Is(mapAwsError(readErr), syscall.EBUSY) {
+				t.Fatalf("last successful range overwrote conditional conflict: %v", readErr)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("parallel origin ranges did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestExternalCacheReadIntoTimeoutFallsBackToCloud(t *testing.T) {
 	want := []byte("hello world")
 	flags := cfg.DefaultFlags()

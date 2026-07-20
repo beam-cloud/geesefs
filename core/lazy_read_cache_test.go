@@ -879,7 +879,7 @@ func TestLazyReadMutationFailsConditionalOriginReadWithoutPublishing(t *testing.
 		stores.Add(1)
 		return opts.RoutingKey, nil
 	}}
-	fs, _, fh := newLazyReadTestFile(t, firstVersion, stageDir, cache, backend)
+	fs, inode, fh := newLazyReadTestFile(t, firstVersion, stageDir, cache, backend)
 	defer close(fs.shutdownCh)
 	defer fh.Release()
 
@@ -904,6 +904,16 @@ func TestLazyReadMutationFailsConditionalOriginReadWithoutPublishing(t *testing.
 	}
 	if stores.Load() != 0 || copies.Load() != 0 {
 		t.Fatalf("mixed-version bytes reached publication: stores=%d copies=%d", stores.Load(), copies.Load())
+	}
+	inode.mu.Lock()
+	metadataChecked := inode.hashMetadataChecked
+	_, _, staleBufferErr := inode.buffers.GetData(0, uint64(split), false)
+	inode.mu.Unlock()
+	if metadataChecked {
+		t.Fatal("precondition conflict retained the stale hash-metadata identity")
+	}
+	if !errors.Is(staleBufferErr, ErrBufferIsMissing) {
+		t.Fatalf("precondition conflict retained stale clean bytes: %v", staleBufferErr)
 	}
 	fs.lazyReadClaimsMu.Lock()
 	reserved := fs.lazyReadStagedBytes

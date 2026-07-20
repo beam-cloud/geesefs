@@ -464,9 +464,10 @@ func (inode *Inode) loadFromServer(readRanges []Range, readAheadSize uint64, ign
 		_, key = inode.oldParent.cloud()
 		key = appendChildName(key, inode.oldName)
 	}
+	knownETag := inode.knownETag
 
 	for _, rr := range readRanges {
-		go inode.retryRead(cloud, key, rr.Start, rr.End-rr.Start, ignoreMemoryLimit)
+		go inode.retryReadWithETag(cloud, key, rr.Start, rr.End-rr.Start, ignoreMemoryLimit, knownETag)
 	}
 }
 
@@ -813,13 +814,20 @@ func (inode *Inode) waitReadCondUntil(deadline time.Time) {
 }
 
 func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uint64, ignoreMemoryLimit bool) {
+	inode.mu.Lock()
+	knownETag := inode.knownETag
+	inode.mu.Unlock()
+	inode.retryReadWithETag(cloud, key, offset, size, ignoreMemoryLimit, knownETag)
+}
+
+func (inode *Inode) retryReadWithETag(cloud StorageBackend, key string, offset, size uint64, ignoreMemoryLimit bool, knownETag string) {
 	// Maybe free some buffers first
 	if inode.fs.flags.UseEnomem {
 		err := inode.fs.bufferPool.Use(int64(size), ignoreMemoryLimit)
 		if err != nil {
 			log.Errorf("Error reading %v +%v of %v: %v", offset, size, key, err)
 			inode.mu.Lock()
-			inode.readError = err
+			inode.setReadErrorLocked(err)
 			inode.buffers.RemoveLoading(offset, size)
 			inode.mu.Unlock()
 			inode.readCond.Broadcast()
@@ -839,8 +847,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 			hashFound = true
 		}
 	}
-	if inode.knownETag != "" {
-		knownETag := inode.knownETag
+	if knownETag != "" {
 		ifMatch = &knownETag
 	}
 	inode.mu.Unlock()
@@ -894,7 +901,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	inode.mu.Lock()
 	inode.buffers.RemoveLoading(offset, size)
 	inode.UnlockRange(offset, size, false)
-	inode.readError = err
+	inode.setReadErrorLocked(err)
 	inode.mu.Unlock()
 	if err != nil {
 		inode.readCond.Broadcast()
@@ -1192,7 +1199,15 @@ func (fh *FileHandle) readFileAfterHash(sOffset int64, sLen int64) (data [][]byt
 	mappedErr := mapAwsError(requestErr)
 	if requestErr != nil {
 		err = requestErr
-		if mappedErr == syscall.ENOENT || mappedErr == syscall.ERANGE {
+		if mappedErr == syscall.EBUSY && fh.inode.canInvalidateReadConflictLocked() {
+			log.Warnf("File %v changed remotely during a conditional read, discarding the stale cached identity", fh.inode.FullName())
+			fh.inode.resetCache()
+			if fh.inode.userMetadata != nil && fh.inode.fs.flags.HashAttr != "" {
+				delete(fh.inode.userMetadata, fh.inode.fs.flags.HashAttr)
+			}
+			fh.inode.hashMetadataChecked = false
+			fh.inode.readError = nil
+		} else if mappedErr == syscall.ENOENT || mappedErr == syscall.ERANGE {
 			// Object is deleted or resized remotely (416). Discard local version
 			log.Warnf("File %v is deleted or resized remotely, discarding local changes", fh.inode.FullName())
 			fh.inode.resetCache()
@@ -1217,6 +1232,25 @@ func (fh *FileHandle) readFileAfterHash(sOffset int64, sLen int64) (data [][]byt
 
 	bytesRead = int(size)
 	return
+}
+
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) canInvalidateReadConflictLocked() bool {
+	return inode.CacheState == ST_CACHED && inode.StagedFile == nil &&
+		!inode.buffers.AnyUnclean() && inode.userMetadataDirty == 0 &&
+		inode.oldParent == nil && !inode.renamingTo &&
+		!inode.hashMetadataDirty && !inode.hashMetadataSync
+}
+
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) setReadErrorLocked(err error) {
+	// Parallel range loaders share readError. Once any range discovers that the
+	// pinned object identity changed, a later successful range must not erase
+	// that conflict before the waiting foreground read can invalidate the inode.
+	if mapAwsError(inode.readError) == syscall.EBUSY && mapAwsError(err) != syscall.EBUSY {
+		return
+	}
+	inode.readError = err
 }
 
 func (fh *FileHandle) Release() {
