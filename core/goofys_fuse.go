@@ -1075,9 +1075,9 @@ type FuseMfsWrapper struct {
 }
 
 func (m *FuseMfsWrapper) Unmount() error {
-	err := TryUnmount(m.mountPoint)
-	m.fs.Shutdown()
-	return err
+	return m.fs.detachFlushAndShutdown(func() error {
+		return TryUnmount(m.mountPoint)
+	}, true)
 }
 
 func convertFuseOptions(flags *cfg.FlagStorage) map[string]string {

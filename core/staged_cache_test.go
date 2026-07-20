@@ -708,6 +708,116 @@ func (b *stagedRenameBackend) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOut
 	return b.TestBackend.DeleteBlob(param)
 }
 
+type stagedMultipartBackend struct {
+	TestBackend
+
+	mu                sync.Mutex
+	nextUpload        int
+	parts             map[string]map[uint32][]byte
+	committed         [][]byte
+	mutateFirstPart   func() error
+	mutateFirstPartDo sync.Once
+}
+
+func (b *stagedMultipartBackend) MultipartBlobBegin(param *MultipartBlobBeginInput) (*MultipartBlobCommitInput, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.nextUpload++
+	uploadID := fmt.Sprintf("upload-%d", b.nextUpload)
+	key := param.Key
+	if b.parts == nil {
+		b.parts = make(map[string]map[uint32][]byte)
+	}
+	b.parts[uploadID] = make(map[uint32][]byte)
+	return &MultipartBlobCommitInput{
+		Key:      &key,
+		Metadata: param.Metadata,
+		UploadId: &uploadID,
+		Parts:    make([]*string, 10000),
+	}, nil
+}
+
+func (b *stagedMultipartBackend) MultipartBlobAdd(param *MultipartBlobAddInput) (*MultipartBlobAddOutput, error) {
+	var mutationErr error
+	b.mutateFirstPartDo.Do(func() {
+		if b.mutateFirstPart != nil {
+			mutationErr = b.mutateFirstPart()
+		}
+	})
+	if mutationErr != nil {
+		return nil, mutationErr
+	}
+
+	data, err := io.ReadAll(param.Body)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(data)) != param.Size {
+		return nil, fmt.Errorf("multipart part %d length = %d, want %d", param.PartNumber, len(data), param.Size)
+	}
+	if param.Commit == nil || param.Commit.UploadId == nil {
+		return nil, errors.New("missing multipart upload id")
+	}
+
+	uploadID := *param.Commit.UploadId
+	partID := fmt.Sprintf("%s-part-%d", uploadID, param.PartNumber)
+	b.mu.Lock()
+	parts := b.parts[uploadID]
+	if parts == nil {
+		b.mu.Unlock()
+		return nil, fmt.Errorf("unknown multipart upload %q", uploadID)
+	}
+	parts[param.PartNumber] = append([]byte(nil), data...)
+	b.mu.Unlock()
+	return &MultipartBlobAddOutput{PartId: &partID}, nil
+}
+
+func (b *stagedMultipartBackend) MultipartBlobCommit(param *MultipartBlobCommitInput) (*MultipartBlobCommitOutput, error) {
+	if param == nil || param.UploadId == nil {
+		return nil, errors.New("missing multipart upload id")
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	parts := b.parts[*param.UploadId]
+	var generation []byte
+	for partNum := uint32(1); partNum <= param.NumParts; partNum++ {
+		part, ok := parts[partNum]
+		if !ok {
+			return nil, fmt.Errorf("multipart upload %q missing part %d", *param.UploadId, partNum)
+		}
+		generation = append(generation, part...)
+	}
+	if param.Size == nil || uint64(len(generation)) != *param.Size {
+		return nil, fmt.Errorf("committed generation length = %d, want %v", len(generation), param.Size)
+	}
+	b.committed = append(b.committed, generation)
+	delete(b.parts, *param.UploadId)
+	etag := fmt.Sprintf("etag-%d", len(b.committed))
+	now := time.Now()
+	return &MultipartBlobCommitOutput{ETag: &etag, LastModified: &now}, nil
+}
+
+func (b *stagedMultipartBackend) MultipartBlobAbort(param *MultipartBlobCommitInput) (*MultipartBlobAbortOutput, error) {
+	if param != nil && param.UploadId != nil {
+		b.mu.Lock()
+		delete(b.parts, *param.UploadId)
+		b.mu.Unlock()
+	}
+	return &MultipartBlobAbortOutput{}, nil
+}
+
+func (b *stagedMultipartBackend) committedGenerations() [][]byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	result := make([][]byte, len(b.committed))
+	for i, generation := range b.committed {
+		result[i] = append([]byte(nil), generation...)
+	}
+	return result
+}
+
 func newStagedRenameInode(t *testing.T, fs *Goofys, root *Inode, name string, data []byte) (*Inode, string) {
 	t.Helper()
 
@@ -1231,6 +1341,101 @@ func TestDirectStagedPutUsesImmutableGeneration(t *testing.T) {
 	}
 	if !bytes.Equal(gotUploads[1], replacement) {
 		t.Fatalf("second upload = %q, want %q", gotUploads[1], replacement)
+	}
+}
+
+func TestDirectStagedMultipartUsesImmutableGenerationAcrossTruncate(t *testing.T) {
+	const partSize = uint64(1024 * 1024)
+	initial := make([]byte, stagedUploadMemorySnapshotLimit+int(partSize)+137)
+	for offset := 0; offset < len(initial); offset += int(partSize) {
+		end := offset + int(partSize)
+		if end > len(initial) {
+			end = len(initial)
+		}
+		for i := offset; i < end; i++ {
+			initial[i] = byte(offset/int(partSize) + 1)
+		}
+	}
+	replacement := bytes.Repeat([]byte("next-generation-"), 70000)
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	flags.SinglePartMB = 1
+	flags.MaxParallelParts = 1
+	flags.PartSizes = []cfg.PartSizeConfig{{PartSize: partSize, PartCount: 10000}}
+	fs := newUnitFS(flags)
+	backend := &stagedMultipartBackend{}
+	root := newRootWithBackend(fs, backend)
+	inode, stagedPath := newStagedRenameInode(t, fs, root, "model.bin", initial)
+
+	var snapshotPath string
+	backend.mutateFirstPart = func() error {
+		matches, err := filepath.Glob(filepath.Join(filepath.Dir(stagedPath), ".geesefs-upload-*"))
+		if err != nil {
+			return err
+		}
+		if len(matches) != 1 {
+			return fmt.Errorf("file-backed upload snapshots = %v, want exactly one", matches)
+		}
+		snapshotPath = matches[0]
+
+		if err := inode.SetAttributes(PUInt64(0), nil, nil, nil, nil); err != nil {
+			return err
+		}
+		return inode.StagedFile.FH.WriteFileStaged(0, replacement)
+	}
+
+	if err := fs.flushStagedFile(inode); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotPath == "" {
+		t.Fatal("multipart upload did not use a file-backed immutable snapshot")
+	}
+	if _, err := os.Stat(snapshotPath); !os.IsNotExist(err) {
+		t.Fatalf("multipart snapshot was not cleaned after upload: %v", err)
+	}
+	committed := backend.committedGenerations()
+	if len(committed) != 1 {
+		t.Fatalf("first multipart commits = %d, want 1", len(committed))
+	}
+	if !bytes.Equal(committed[0], initial) {
+		t.Fatalf("first multipart commit mixed generations: size=%d want=%d", len(committed[0]), len(initial))
+	}
+
+	inode.mu.Lock()
+	stagedFile := inode.StagedFile
+	cacheState := inode.CacheState
+	inode.mu.Unlock()
+	if stagedFile == nil {
+		t.Fatal("next staged generation was discarded after multipart commit")
+	}
+	stagedFile.mu.Lock()
+	nextDirty := stagedFile.shouldFlush && !stagedFile.flushing && !stagedFile.awaitingRemoteRename
+	stagedFile.mu.Unlock()
+	if !nextDirty || cacheState != ST_MODIFIED {
+		t.Fatalf("next staged generation is not dirty: should_flush=%v cache_state=%d", nextDirty, cacheState)
+	}
+
+	if err := fs.flushStagedFile(inode); err != nil {
+		t.Fatal(err)
+	}
+	committed = backend.committedGenerations()
+	if len(committed) != 2 {
+		t.Fatalf("multipart commits = %d, want 2", len(committed))
+	}
+	if !bytes.Equal(committed[1], replacement) {
+		t.Fatalf("second multipart commit size = %d, want replacement size %d", len(committed[1]), len(replacement))
+	}
+	inode.mu.Lock()
+	stagedFile = inode.StagedFile
+	inode.mu.Unlock()
+	if stagedFile != nil {
+		t.Fatal("stable replacement generation remained attached after upload")
+	}
+	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
+		t.Fatalf("live staged path was not cleaned after replacement upload: %v", err)
 	}
 }
 
@@ -2877,6 +3082,80 @@ func TestWaitForFlushWaitsForExternalCachePublish(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for WaitForFlush")
 	}
+}
+
+func TestDetachFlushAndShutdownOrdersSuccessfulUnmount(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWriteFlushTimeout = time.Second
+	fs := newUnitFS(flags)
+
+	var detached atomic.Bool
+	var uploaded atomic.Bool
+	backend := &TestBackend{}
+	backend.PutBlobFunc = func(param *PutBlobInput) (*PutBlobOutput, error) {
+		if !detached.Load() {
+			return nil, errors.New("staged flush ran before filesystem detach")
+		}
+		if atomic.LoadInt32(&fs.shutdown) != 0 {
+			return nil, errors.New("filesystem shut down before staged flush")
+		}
+		if _, err := io.Copy(io.Discard, param.Body); err != nil {
+			return nil, err
+		}
+		uploaded.Store(true)
+		now := time.Now()
+		return &PutBlobOutput{ETag: PString("etag"), LastModified: &now}, nil
+	}
+	root := newRootWithBackend(fs, backend)
+	inode, _ := newStagedInodeForFlush(t, fs, root, []byte("accepted before detach"))
+
+	err := fs.detachFlushAndShutdown(func() error {
+		if uploaded.Load() {
+			return errors.New("staged flush ran before detach callback")
+		}
+		detached.Store(true)
+		return nil
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !uploaded.Load() {
+		t.Fatal("successful detach did not flush accepted staged data")
+	}
+	if atomic.LoadInt32(&fs.shutdown) != 1 {
+		t.Fatal("filesystem did not shut down after staged flush")
+	}
+	inode.mu.Lock()
+	stagedFile := inode.StagedFile
+	inode.mu.Unlock()
+	if stagedFile != nil {
+		t.Fatal("staged file remained attached after successful unmount lifecycle")
+	}
+}
+
+func TestDetachFlushAndShutdownPreservesUnmountErrorPolicies(t *testing.T) {
+	detachErr := errors.New("detach failed")
+
+	unixLike := newUnitFS(cfg.DefaultFlags())
+	err := unixLike.detachFlushAndShutdown(func() error { return detachErr }, true)
+	if !errors.Is(err, detachErr) {
+		t.Fatalf("Unix-like detach error = %v, want %v", err, detachErr)
+	}
+	if atomic.LoadInt32(&unixLike.shutdown) != 1 {
+		t.Fatal("Unix-like detach failure did not preserve shutdown cleanup")
+	}
+
+	windowsLike := newUnitFS(cfg.DefaultFlags())
+	err = windowsLike.detachFlushAndShutdown(func() error { return detachErr }, false)
+	if !errors.Is(err, detachErr) {
+		t.Fatalf("Windows-like detach error = %v, want %v", err, detachErr)
+	}
+	if atomic.LoadInt32(&windowsLike.shutdown) != 0 {
+		t.Fatal("Windows-like detach failure stopped a still-mounted filesystem")
+	}
+	windowsLike.Shutdown()
 }
 
 func TestOrdinaryCacheProducerCallbackCanShutdown(t *testing.T) {

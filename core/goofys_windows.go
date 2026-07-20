@@ -1085,10 +1085,10 @@ func (fs *GoofysWin) Unmount() error {
 	if !fs.initialized {
 		return fmt.Errorf("not mounted")
 	}
-	r := fs.host.Unmount()
-	if !r {
-		return fmt.Errorf("unmounting failed")
-	}
-	fs.Shutdown()
-	return nil
+	return fs.Goofys.detachFlushAndShutdown(func() error {
+		if !fs.host.Unmount() {
+			return fmt.Errorf("unmounting failed")
+		}
+		return nil
+	}, false)
 }

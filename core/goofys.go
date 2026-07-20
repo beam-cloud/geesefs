@@ -1838,19 +1838,15 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	localFile := stagedFile.FD
 	localPath := localFile.Name()
 	totalSize := inode.Attributes.Size
-	var uploadSource io.ReaderAt = localFile
-	cleanupUploadSource := func() {}
-	if totalSize <= fs.flags.SinglePartMB*1024*1024 {
-		// PutObject retries derive Content-Length from the section size. Snapshot
-		// small generations while writes are excluded so a later SQLite truncate
-		// cannot make the seekable body shorter than the advertised length.
-		var snapshotErr error
-		uploadSource, cleanupUploadSource, snapshotErr = snapshotStagedUpload(localFile, totalSize)
-		if snapshotErr != nil {
-			stagedFile.mu.Unlock()
-			inode.mu.Unlock()
-			return snapshotErr
-		}
+	// Every direct upload must read one immutable staged generation. PutObject
+	// retries require a stable Content-Length, and multipart workers must not
+	// observe a mixture of parts when the live file is truncated or rewritten
+	// while an upload is in flight. Large generations use a file-backed snapshot.
+	uploadSource, cleanupUploadSource, snapshotErr := snapshotStagedUpload(localFile, totalSize)
+	if snapshotErr != nil {
+		stagedFile.mu.Unlock()
+		inode.mu.Unlock()
+		return snapshotErr
 	}
 	defer cleanupUploadSource()
 	flushGeneration := stagedFile.generation
@@ -2282,6 +2278,24 @@ func (fs *Goofys) WaitForFlush() {
 		case <-time.After(1 * time.Second):
 		}
 	}
+}
+
+// detachFlushAndShutdown serializes the production unmount lifecycle: stop new
+// filesystem operations first, persist all accepted writes, then stop background
+// workers. Unix historically shut workers down even when detach failed, while
+// WinFSP left the mounted filesystem running; callers select that error policy.
+func (fs *Goofys) detachFlushAndShutdown(detach func() error, shutdownOnDetachError bool) error {
+	err := detach()
+	if err != nil {
+		if shutdownOnDetachError {
+			fs.Shutdown()
+		}
+		return err
+	}
+
+	fs.WaitForFlush()
+	fs.Shutdown()
+	return nil
 }
 
 func (fs *Goofys) MetaEvictor() {
