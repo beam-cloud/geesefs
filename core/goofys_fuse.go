@@ -615,13 +615,25 @@ func (fs *GoofysFuse) ReadFile(
 			}
 			responseElapsed := time.Since(responseStarted)
 			if fdResponse != nil {
+				transport := "unknown"
+				var transportCount int64
 				switch fdResponse.Transfer {
 				case fuseops.ReadFileFDTransferSplice:
-					addExternalFDCounter(&fs.stats.externalFDRead.spliceTransfers, &fs.externalFDReadLifetime.spliceTransfers, 1)
+					transport = "splice"
+					transportCount = addExternalFDCounter(&fs.stats.externalFDRead.spliceTransfers, &fs.externalFDReadLifetime.spliceTransfers, 1)
 				case fuseops.ReadFileFDTransferPread:
-					addExternalFDCounter(&fs.stats.externalFDRead.preadTransfers, &fs.externalFDReadLifetime.preadTransfers, 1)
+					transport = "pread"
+					transportCount = addExternalFDCounter(&fs.stats.externalFDRead.preadTransfers, &fs.externalFDReadLifetime.preadTransfers, 1)
 				default:
-					addExternalFDCounter(&fs.stats.externalFDRead.unknownTransfers, &fs.externalFDReadLifetime.unknownTransfers, 1)
+					transportCount = addExternalFDCounter(&fs.stats.externalFDRead.unknownTransfers, &fs.externalFDReadLifetime.unknownTransfers, 1)
+				}
+				if transportCount == 1 {
+					log.Infof(
+						"geesefs external fd read first response: transport=%s bytes=%d splice_fallback=%v",
+						transport,
+						fdResponse.BytesTransferred,
+						fdResponse.SpliceFallback,
+					)
 				}
 				if fdResponse.BytesTransferred > 0 {
 					addExternalFDCounter(&fs.stats.externalFDRead.transferBytes, &fs.externalFDReadLifetime.transferBytes, int64(fdResponse.BytesTransferred))

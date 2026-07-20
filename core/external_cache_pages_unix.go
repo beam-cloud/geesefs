@@ -94,9 +94,9 @@ type externalCacheFDRead struct {
 // inode mutation between opening a page file and revalidation deterministic.
 var externalCacheFDAfterOpenHook func(*FileHandle)
 
-func addExternalFDCounter(interval, lifetime *int64, value int64) {
+func addExternalFDCounter(interval, lifetime *int64, value int64) int64 {
 	atomic.AddInt64(interval, value)
-	atomic.AddInt64(lifetime, value)
+	return atomic.AddInt64(lifetime, value)
 }
 
 type externalPageMmapCache struct {
@@ -428,7 +428,10 @@ func (fh *FileHandle) tryReadExternalCachePagesWithFD(offset, size uint64, allow
 }
 
 func (fh *FileHandle) tryReadExternalCacheFD(pageCache cfg.ContentCacheClientLocalPageFileViews, path, hash string, offset, size, fileSize uint64, started time.Time) (fdRead *externalCacheFDRead, callback func(), ok bool) {
-	addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.attempts, &fh.inode.fs.externalFDReadLifetime.attempts, 1)
+	attemptCount := addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.attempts, &fh.inode.fs.externalFDReadLifetime.attempts, 1)
+	if attemptCount == 1 {
+		log.Infof("geesefs external fd read first attempt: offset=%d size=%d", offset, size)
+	}
 	if pageCache == nil || hash == "" || size == 0 || size > uint64(int(^uint(0)>>1)) {
 		fh.recordExternalFDFallback(path, hash, offset, size, "invalid_request", started, nil)
 		return nil, nil, false
@@ -489,8 +492,11 @@ func (fh *FileHandle) tryReadExternalCacheFD(pageCache cfg.ContentCacheClientLoc
 		return nil, nil, false
 	}
 
-	addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.hits, &fh.inode.fs.externalFDReadLifetime.hits, 1)
+	hitCount := addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.hits, &fh.inode.fs.externalFDReadLifetime.hits, 1)
 	addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.bytes, &fh.inode.fs.externalFDReadLifetime.bytes, int64(size))
+	if hitCount == 1 {
+		log.Infof("geesefs external fd read first hit: offset=%d size=%d page_file_offset=%d", offset, size, view.Offset)
+	}
 	var closed int32
 	callback = func() {
 		if atomic.CompareAndSwapInt32(&closed, 0, 1) {
@@ -501,9 +507,12 @@ func (fh *FileHandle) tryReadExternalCacheFD(pageCache cfg.ContentCacheClientLoc
 }
 
 func (fh *FileHandle) recordExternalFDFallback(path, hash string, offset, size uint64, reason string, started time.Time, err error) {
-	addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.fallbacks, &fh.inode.fs.externalFDReadLifetime.fallbacks, 1)
-	fallbackCount := atomic.LoadInt64(&fh.inode.fs.externalFDReadLifetime.fallbacks)
+	fallbackCount := addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.fallbacks, &fh.inode.fs.externalFDReadLifetime.fallbacks, 1)
 	handleCount := atomic.AddUint64(&fh.externalFDLogCount, 1)
+	if fallbackCount == 1 {
+		log.Infof("geesefs external fd read first fallback: offset=%d size=%d reason=%s err=%v", offset, size, reason, err)
+		return
+	}
 	if handleCount > 8 && fallbackCount%1024 != 0 && time.Since(started) <= 100*time.Millisecond {
 		return
 	}
