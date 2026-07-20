@@ -36,7 +36,6 @@ const (
 	externalPageMmapWindowBytes       = 64 * 1024 * 1024
 	externalPageMmapMaxBytes          = 2 * 1024 * 1024 * 1024
 	externalPagePrefetchAheadBytes    = 1024 * 1024 * 1024
-	externalPageFDPrefetchAheadBytes  = 2 * externalPageMmapWindowBytes
 	externalPagePrefetchMaxConcurrent = 8
 	externalPagePrefetchMaxQueued     = 8
 	externalPagePrefetchMaxWait       = 250 * time.Millisecond
@@ -615,9 +614,9 @@ func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize 
 	aheadBytes := uint64(externalPagePrefetchAheadBytes)
 	if fdMode {
 		// FD reads rely on the kernel page cache, whose readahead is most useful
-		// as a short sequential lookahead. Keep two aligned windows in flight
-		// instead of flooding the device with the generic 1 GiB fan-out.
-		aheadBytes = externalPageFDPrefetchAheadBytes
+		// as a short sequential lookahead. Keep only the next aligned window in
+		// flight instead of flooding the device with the generic 1 GiB fan-out.
+		aheadBytes = externalPageMmapWindowBytes
 	}
 	cache.mu.Lock()
 	if cache.maxBytes > 0 && uint64(cache.maxBytes) < aheadBytes {
