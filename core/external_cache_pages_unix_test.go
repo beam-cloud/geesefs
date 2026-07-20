@@ -285,16 +285,20 @@ func TestExternalCacheReadIntoUnavailableIsCacheMiss(t *testing.T) {
 	}
 }
 
-func TestExternalCachePrefetchFallsBackToReadInto(t *testing.T) {
+func TestExternalCachePrefetchPrefersReadInto(t *testing.T) {
 	flags := cfg.DefaultFlags()
-	payload := bytes.Repeat([]byte("a"), int(externalPageMmapWindowBytes))
+	payload := []byte("read-into wins")
+	var pageCalls atomic.Int64
+	var readIntoCalls atomic.Int64
 	flags.ExternalCacheClient = &fakeContentCache{
 		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			pageCalls.Add(1)
 			return nil, errContentNotFound
 		},
 		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			readIntoCalls.Add(1)
 			if hash != "hash" || opts.RoutingKey != "hash" || offset != 0 || len(dst) != len(payload) {
-				t.Fatalf("unexpected read-into prefetch: hash=%q routing=%q offset=%d len=%d", hash, opts.RoutingKey, offset, len(dst))
+				return 0, errors.New("unexpected read-into prefetch request")
 			}
 			copy(dst, payload)
 			return int64(len(payload)), nil
@@ -317,12 +321,75 @@ func TestExternalCachePrefetchFallsBackToReadInto(t *testing.T) {
 			if got := bytes.Join(data, nil); !bytes.Equal(got, payload) {
 				t.Fatalf("unexpected prefetched data")
 			}
+			if got := readIntoCalls.Load(); got != 1 {
+				t.Fatalf("unexpected read-into calls: %d", got)
+			}
+			if got := pageCalls.Load(); got != 0 {
+				t.Fatalf("page-file lookup ran despite successful read-into: calls=%d", got)
+			}
 			return
 		}
 
 		select {
 		case <-deadline:
 			t.Fatal("timed out waiting for read-into prefetch")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestExternalCachePrefetchFallsBackToPageFilesWhenReadIntoFails(t *testing.T) {
+	payload := []byte("page-file fallback")
+	pagePath := filepath.Join(t.TempDir(), "page")
+	if err := os.WriteFile(pagePath, payload, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	flags := cfg.DefaultFlags()
+	var pageCalls atomic.Int64
+	var readIntoCalls atomic.Int64
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			pageCalls.Add(1)
+			if hash != "hash" || opts.RoutingKey != "hash" || offset != 0 || length != int64(len(payload)) {
+				return nil, errors.New("unexpected page-file prefetch request")
+			}
+			return []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: 0, Length: len(payload)}}, nil
+		},
+		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			readIntoCalls.Add(1)
+			return 0, errContentNotFound
+		},
+	}
+	fs := newUnitFS(flags)
+	defer fs.closeExternalPageMmapCache()
+	inode := NewInode(fs, nil, "file")
+	fh := NewFileHandle(inode)
+
+	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto))
+
+	deadline := time.After(2 * time.Second)
+	for {
+		data, cleanup, ok := fs.externalPageCache().lookup("hash", 0, uint64(len(payload)))
+		if ok {
+			if cleanup != nil {
+				defer cleanup()
+			}
+			if got := bytes.Join(data, nil); !bytes.Equal(got, payload) {
+				t.Fatalf("unexpected prefetched data: %q", got)
+			}
+			if got := readIntoCalls.Load(); got != 1 {
+				t.Fatalf("unexpected read-into calls: %d", got)
+			}
+			if got := pageCalls.Load(); got != 1 {
+				t.Fatalf("unexpected page-file calls: %d", got)
+			}
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for page-file fallback prefetch")
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
@@ -891,7 +958,7 @@ func TestExternalCacheForegroundJoinsInflightPrefetch(t *testing.T) {
 	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
 	fh := NewFileHandle(inode)
 	cache := fs.externalPageCache()
-	cache.prefetchWindow(fs, "hash", 0, fileSize, fileSize, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto))
+	cache.prefetchWindow(fs, "hash", 0, fileSize, fileSize, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), nil)
 
 	select {
 	case <-prefetchStarted:
@@ -988,7 +1055,7 @@ func TestExternalCacheForegroundPrefetchJoinTimesOut(t *testing.T) {
 	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
 	fh := NewFileHandle(inode)
 	cache := fs.externalPageCache()
-	cache.prefetchWindow(fs, "hash", 0, fileSize, fileSize, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto))
+	cache.prefetchWindow(fs, "hash", 0, fileSize, fileSize, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), nil)
 
 	select {
 	case <-prefetchStarted:

@@ -775,16 +775,16 @@ func (c *externalPageMmapCache) runPrefetch(job externalPagePrefetchJob) bool {
 	}
 
 	size := job.key.end - job.key.offset
-	if job.pageCache != nil {
-		views, err := job.fs.externalCacheClientLocalPageFileViews(job.pageCache, job.key.cacheKey, int64(job.key.offset), int64(size))
-		if err == nil && len(views) > 0 {
-			if err := c.insertWindow(job.key.cacheKey, job.key.offset, views); err != nil {
-				return false
-			}
-			c.prefault(job.key.cacheKey, job.key.offset, size)
-			return true
-		}
+	// ReadContentInto lets the external cache fill one contiguous window without
+	// mapping and prefaulting every backing page file. Keep page-file views as a
+	// fallback for clients that do not support read-into or miss that fast path.
+	if c.prefetchReadInto(job, size) {
+		return true
 	}
+	return c.prefetchPageFiles(job, size)
+}
+
+func (c *externalPageMmapCache) prefetchReadInto(job externalPagePrefetchJob, size uint64) bool {
 	if job.readIntoCache == nil || size > uint64(int(^uint(0)>>1)) {
 		return false
 	}
@@ -806,6 +806,20 @@ func (c *externalPageMmapCache) runPrefetch(job externalPagePrefetchJob) bool {
 		return false
 	}
 	reserved = false
+	return true
+}
+
+func (c *externalPageMmapCache) prefetchPageFiles(job externalPagePrefetchJob, size uint64) bool {
+	if job.pageCache == nil {
+		return false
+	}
+	views, err := job.fs.externalCacheClientLocalPageFileViews(job.pageCache, job.key.cacheKey, int64(job.key.offset), int64(size))
+	if err != nil || len(views) == 0 {
+		return false
+	}
+	if err := c.insertWindow(job.key.cacheKey, job.key.offset, views); err != nil {
+		return false
+	}
 	c.prefault(job.key.cacheKey, job.key.offset, size)
 	return true
 }
