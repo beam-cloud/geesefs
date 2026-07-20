@@ -45,6 +45,8 @@ type FileHandle struct {
 	externalPrefetchMu      sync.Mutex
 	externalPrefetchHash    string
 	externalPrefetchNext    uint64
+	externalReadHash        string
+	externalReadHighWater   uint64
 	lazyReadMu              sync.Mutex
 	lazyReadStage           *lazyReadStage
 	lazyReadDisabled        bool

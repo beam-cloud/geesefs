@@ -421,6 +421,80 @@ func TestExternalCacheClientLocalPageFileViewWindowSeparatesHashes(t *testing.T)
 	}
 }
 
+func TestExternalPageReadSequenceToleratesReorderedFuseRequests(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	fs := newUnitFS(flags)
+	fh := NewFileHandle(NewInode(fs, nil, "file"))
+
+	const mib = uint64(1024 * 1024)
+	for i, offset := range []uint64{0, 2 * mib, mib, 3 * mib} {
+		if !fh.observeExternalPageRead("hash", offset, mib) {
+			t.Fatalf("read %d at offset %d was not treated as sequential", i, offset)
+		}
+	}
+
+	if got, want := fh.externalReadHighWater, 4*mib; got != want {
+		t.Fatalf("reordered reads advanced high-water to %d, want %d", got, want)
+	}
+	if fh.observeExternalPageRead("hash", 16*mib, mib) {
+		t.Fatal("distant forward read was incorrectly treated as sequential")
+	}
+	if got, want := fh.externalReadHighWater, 17*mib; got != want {
+		t.Fatalf("distant read advanced high-water to %d, want %d", got, want)
+	}
+	if fh.observeExternalPageRead("hash", 4*mib, mib) {
+		t.Fatal("stale backward read was incorrectly treated as sequential")
+	}
+	if !fh.observeExternalPageRead("replacement-hash", 0, mib) {
+		t.Fatal("new immutable content did not reset the read frontier")
+	}
+	if got, want := fh.externalReadHighWater, mib; got != want {
+		t.Fatalf("replacement hash reset high-water to %d, want %d", got, want)
+	}
+}
+
+func TestExternalPageReorderedReadsExtendPrefetchToEOF(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = &fakeContentCache{}
+	fs := newUnitFS(flags)
+	defer fs.closeExternalPageMmapCache()
+	fh := NewFileHandle(NewInode(fs, nil, "file"))
+	cache := fs.externalPageCache()
+
+	const hash = "hash"
+	fileSize := uint64(externalPagePrefetchAheadBytes + 2*externalPageMmapWindowBytes)
+	cache.mu.Lock()
+	cache.regions = append(cache.regions, externalPageCachedRegion{
+		cacheKey:  hash,
+		fileStart: 0,
+		fileEnd:   fileSize,
+	})
+	cache.mu.Unlock()
+
+	pageCache := flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
+	const mib = uint64(1024 * 1024)
+	for base := uint64(0); base <= externalPageMmapWindowBytes; base += 4 * mib {
+		for _, delta := range []uint64{0, 2 * mib, mib, 3 * mib} {
+			offset := base + delta
+			if !fh.observeExternalPageRead(hash, offset, mib) {
+				t.Fatalf("reordered read at offset %d broke the sequential run", offset)
+			}
+			fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+mib), fileSize, pageCache, nil)
+		}
+	}
+
+	fh.externalPrefetchMu.Lock()
+	next := fh.externalPrefetchNext
+	highWater := fh.externalReadHighWater
+	fh.externalPrefetchMu.Unlock()
+	if next != fileSize {
+		t.Fatalf("prefetch stopped at %d, want EOF %d", next, fileSize)
+	}
+	if want := externalPageMmapWindowBytes + 4*mib; highWater != want {
+		t.Fatalf("read high-water stopped at %d, want %d", highWater, want)
+	}
+}
+
 func TestExternalPageMmapCacheEvictsUnreferencedEntries(t *testing.T) {
 	dir := t.TempDir()
 	pageA := filepath.Join(dir, "page-a")

@@ -39,6 +39,7 @@ const (
 	externalPagePrefetchMaxConcurrent = 8
 	externalPagePrefetchMaxQueued     = 8
 	externalPagePrefetchMaxWait       = 250 * time.Millisecond
+	externalPageReadReorderBytes      = 1024 * 1024
 )
 
 type externalPageMmapEntry struct {
@@ -227,7 +228,7 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 		fh.recordExternalPageMiss(path, "", offset, size, "missing_hash", started, nil)
 		return nil, 0, nil, false, nil
 	}
-	sequential := offset == fh.lastReadEnd
+	sequential := fh.observeExternalPageRead(hash, offset, size)
 	fh.trackRead(offset, size)
 	fh.inode.mu.Unlock()
 
@@ -376,6 +377,48 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	}
 	fh.logExternalPageHit(path, hash, offset, size, len(views), "client_local_page_file", started, mmapStarted, hitCount)
 	return data, int(size), callback, true, nil
+}
+
+// observeExternalPageRead tracks the monotonic read frontier used by external
+// cache prefetching. Linux may dispatch adjacent FUSE reads concurrently, and
+// the goroutines serving them are not guaranteed to acquire the inode lock in
+// offset order. Tolerate one maximum-sized FUSE read of forward or backward
+// reordering without letting a stale read move the frontier backwards.
+func (fh *FileHandle) observeExternalPageRead(hash string, offset, size uint64) bool {
+	if hash == "" || size == 0 {
+		return false
+	}
+
+	end := offset + size
+	if end < offset {
+		end = ^uint64(0)
+	}
+
+	fh.externalPrefetchMu.Lock()
+	defer fh.externalPrefetchMu.Unlock()
+
+	if fh.externalReadHash != hash {
+		fh.externalReadHash = hash
+		fh.externalReadHighWater = 0
+	}
+
+	highWater := fh.externalReadHighWater
+	if offset > highWater {
+		if offset-highWater > externalPageReadReorderBytes {
+			fh.externalReadHighWater = end
+			return false
+		}
+		fh.externalReadHighWater = end
+		return true
+	}
+
+	if end < highWater && highWater-end > externalPageReadReorderBytes {
+		return false
+	}
+	if end > highWater {
+		fh.externalReadHighWater = end
+	}
+	return true
 }
 
 func (fh *FileHandle) prefetchExternalCachePagesOnOpen() {
