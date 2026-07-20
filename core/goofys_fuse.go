@@ -1157,7 +1157,11 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 		fuseMaxBackground       = 128
 		fuseCongestionThreshold = 96
 	)
-	fs.externalCacheFDReads = supportsExternalCacheFDReads(fs.flags.ExternalCacheClient)
+	spliceReadRequested := supportsExternalCacheFDReads(fs.flags.ExternalCacheClient)
+	// The local-page interface makes FD responses eligible, but only the FUSE
+	// transport can confirm that the host can negotiate a pipe-backed response.
+	// Keep the fast path disabled until that synchronous probe succeeds.
+	fs.externalCacheFDReads = false
 	mountCfg := &fuse.MountConfig{
 		FSName:                  fs.bucket,
 		Subtype:                 "geesefs",
@@ -1170,7 +1174,17 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 		EnableAsyncReads:        true,
 		MaxBackground:           fuseMaxBackground,
 		CongestionThreshold:     fuseCongestionThreshold,
-		EnableSpliceRead:        fs.externalCacheFDReads,
+		EnableSpliceRead:        spliceReadRequested,
+		SpliceReadStatus: func(enabled bool, maxPages uint16, unavailable error) {
+			fs.externalCacheFDReads = enabled
+			log.Infof(
+				"geesefs fuse splice-read status: requested=%t enabled=%t max_pages=%d unavailable=%v",
+				spliceReadRequested,
+				enabled,
+				maxPages,
+				unavailable,
+			)
+		},
 	}
 	log.Debugf("geesefs fuse mount config: async_reads=%t vectored_read=%t splice_read=%t max_background=%d congestion_threshold=%d keep_page_cache=external-cache-readonly-clean", mountCfg.EnableAsyncReads, mountCfg.UseVectoredRead, mountCfg.EnableSpliceRead, mountCfg.MaxBackground, mountCfg.CongestionThreshold)
 
