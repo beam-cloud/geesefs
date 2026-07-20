@@ -85,15 +85,20 @@ type externalPagePrefetchJob struct {
 
 type externalPageMmapCache struct {
 	mu             sync.Mutex
+	refsChanged    *sync.Cond
 	entries        map[string]*externalPageMmapEntry
 	regions        []externalPageCachedRegion
 	lru            *list.List
 	prefetching    map[externalPagePrefetchKey]*externalPagePrefetchState
 	prefetchQueue  []externalPagePrefetchJob
 	prefetchActive int
+	prefetchWG     sync.WaitGroup
 	mappedBytes    int64
+	inflightBytes  int64
 	maxBytes       int64
+	memoryPool     *BufferPool
 	closed         bool
+	closeOnce      sync.Once
 }
 
 func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]byte, bytesRead int, callback func(), err error) {
@@ -404,7 +409,14 @@ func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize 
 	}
 
 	start = externalPageWindowStart(start)
-	target := start + externalPagePrefetchAheadBytes
+	cache := fh.inode.fs.externalPageCache()
+	aheadBytes := uint64(externalPagePrefetchAheadBytes)
+	cache.mu.Lock()
+	if cache.maxBytes > 0 && uint64(cache.maxBytes) < aheadBytes {
+		aheadBytes = uint64(cache.maxBytes)
+	}
+	cache.mu.Unlock()
+	target := start + aheadBytes
 	if target > fileSize {
 		target = fileSize
 	}
@@ -417,7 +429,6 @@ func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize 
 	next := fh.externalPrefetchNext
 	fh.externalPrefetchMu.Unlock()
 
-	cache := fh.inode.fs.externalPageCache()
 	for next < target {
 		windowSize := uint64(externalPageMmapWindowBytes)
 		if next+windowSize > fileSize {
@@ -534,7 +545,11 @@ func (fs *Goofys) externalPageCache() *externalPageMmapCache {
 	fs.externalPageMmapCacheMu.Lock()
 	defer fs.externalPageMmapCacheMu.Unlock()
 	if fs.externalPageMmapCache == nil {
-		fs.externalPageMmapCache = newExternalPageMmapCache(externalPageMmapMaxBytes)
+		maxBytes := int64(externalPageMmapMaxBytes)
+		if fs.bufferPool != nil && fs.bufferPool.max > 0 && fs.bufferPool.max < maxBytes {
+			maxBytes = fs.bufferPool.max
+		}
+		fs.externalPageMmapCache = newExternalPageMmapCacheWithPool(maxBytes, fs.bufferPool)
 	}
 	return fs.externalPageMmapCache
 }
@@ -550,17 +565,24 @@ func (fs *Goofys) closeExternalPageMmapCache() {
 }
 
 func newExternalPageMmapCache(maxBytes int64) *externalPageMmapCache {
+	return newExternalPageMmapCacheWithPool(maxBytes, nil)
+}
+
+func newExternalPageMmapCacheWithPool(maxBytes int64, memoryPool *BufferPool) *externalPageMmapCache {
 	if maxBytes <= 0 {
 		maxBytes = externalPageMmapMaxBytes
 	}
-	return &externalPageMmapCache{
+	cache := &externalPageMmapCache{
 		entries:       make(map[string]*externalPageMmapEntry),
 		regions:       make([]externalPageCachedRegion, 0, 128),
 		lru:           list.New(),
 		prefetching:   make(map[externalPagePrefetchKey]*externalPagePrefetchState),
 		prefetchQueue: make([]externalPagePrefetchJob, 0, externalPagePrefetchMaxQueued),
 		maxBytes:      maxBytes,
+		memoryPool:    memoryPool,
 	}
+	cache.refsChanged = sync.NewCond(&cache.mu)
+	return cache
 }
 
 func externalPageWindowStart(offset uint64) uint64 {
@@ -679,6 +701,7 @@ func (c *externalPageMmapCache) prefetchWindow(fs *Goofys, cacheKey string, offs
 	startNow := c.prefetchActive < externalPagePrefetchMaxConcurrent
 	if startNow {
 		c.prefetchActive++
+		c.prefetchWG.Add(1)
 	} else {
 		c.prefetchQueue = append(c.prefetchQueue, job)
 	}
@@ -694,6 +717,7 @@ func (c *externalPageMmapCache) prefetchWindow(fs *Goofys, cacheKey string, offs
 func (c *externalPageMmapCache) startPrefetch(job externalPagePrefetchJob) {
 	atomic.AddInt64(&job.fs.stats.externalPrefetch.started, 1)
 	go func() {
+		defer c.prefetchWG.Done()
 		success := c.runPrefetch(job)
 		c.finishPrefetch(job, success)
 	}()
@@ -721,14 +745,24 @@ func (c *externalPageMmapCache) runPrefetch(job externalPagePrefetchJob) bool {
 	if job.readIntoCache == nil || size > uint64(int(^uint(0)>>1)) {
 		return false
 	}
+	if !c.reserveBytes(int64(size)) {
+		return false
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			c.releaseReservedBytes(int64(size), true)
+		}
+	}()
 	buf := make([]byte, int(size))
 	n, err := job.fs.externalCacheReadContentInto(job.readIntoCache, job.key.cacheKey, int64(job.key.offset), buf)
 	if err != nil || n != int64(size) {
 		return false
 	}
-	if err := c.insertBytesWindow(job.key.cacheKey, job.key.offset, buf[:n]); err != nil {
+	if err := c.insertReservedBytesWindow(job.key.cacheKey, job.key.offset, buf[:n], int64(size)); err != nil {
 		return false
 	}
+	reserved = false
 	c.prefault(job.key.cacheKey, job.key.offset, size)
 	return true
 }
@@ -765,6 +799,7 @@ func (c *externalPageMmapCache) finishPrefetch(job externalPagePrefetchJob, succ
 		c.prefetchQueue[0] = externalPagePrefetchJob{}
 		c.prefetchQueue = c.prefetchQueue[1:]
 		c.prefetchActive++
+		c.prefetchWG.Add(1)
 		next = &queued
 	}
 	c.mu.Unlock()
@@ -809,6 +844,64 @@ func (c *externalPageMmapCache) hasRangeLocked(cacheKey string, start, end uint6
 	return true
 }
 
+func (c *externalPageMmapCache) reserveBytes(size int64) bool {
+	if size <= 0 {
+		return false
+	}
+
+	c.mu.Lock()
+	if c.closed || (c.maxBytes > 0 && size > c.maxBytes) {
+		c.mu.Unlock()
+		return false
+	}
+	for c.maxBytes > 0 && c.mappedBytes+c.inflightBytes+size > c.maxBytes {
+		if !c.evictOneLocked() {
+			c.mu.Unlock()
+			return false
+		}
+	}
+	c.inflightBytes += size
+	memoryPool := c.memoryPool
+	c.mu.Unlock()
+
+	if memoryPool != nil {
+		if err := memoryPool.Use(size, false); err != nil {
+			c.releaseReservedBytes(size, false)
+			return false
+		}
+	}
+
+	// close() waits for reservations to drain, so a close racing the pool
+	// charge cannot let the caller allocate untracked memory.
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		c.releaseReservedBytes(size, true)
+		return false
+	}
+	return true
+}
+
+func (c *externalPageMmapCache) releaseReservedBytes(size int64, charged bool) {
+	if size <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.inflightBytes -= size
+	c.refsChanged.Broadcast()
+	memoryPool := c.memoryPool
+	c.mu.Unlock()
+	if charged && memoryPool != nil {
+		memoryPool.Use(-size, false)
+	}
+}
+
+func (c *externalPageMmapCache) transferReservedBytesLocked(size int64) {
+	c.inflightBytes -= size
+	c.refsChanged.Broadcast()
+}
+
 func (c *externalPageMmapCache) insertWindow(cacheKey string, offset uint64, views []cfg.ClientLocalPageFileView) error {
 	if len(views) == 0 {
 		return syscall.ENOENT
@@ -820,7 +913,6 @@ func (c *externalPageMmapCache) insertWindow(cacheKey string, offset uint64, vie
 	mapped := make([]externalPageMappedRegion, 0, len(views))
 	current := offset
 	for _, view := range views {
-		warmContentCacheRegion(view.Path, view.Offset, view.Length)
 		entry, err := c.getOrMap(view.Path)
 		if err != nil {
 			for _, r := range mapped {
@@ -835,6 +927,7 @@ func (c *externalPageMmapCache) insertWindow(cacheKey string, offset uint64, vie
 			}
 			return syscall.EINVAL
 		}
+		warmContentCacheRegion(view.Path, view.Offset, view.Length)
 		mapped = append(mapped, externalPageMappedRegion{
 			cacheKey:  cacheKey,
 			fileStart: current,
@@ -866,8 +959,8 @@ func (c *externalPageMmapCache) insertWindow(cacheKey string, offset uint64, vie
 	return nil
 }
 
-func (c *externalPageMmapCache) insertBytesWindow(cacheKey string, offset uint64, data []byte) error {
-	if cacheKey == "" || len(data) == 0 {
+func (c *externalPageMmapCache) insertReservedBytesWindow(cacheKey string, offset uint64, data []byte, reservedBytes int64) error {
+	if cacheKey == "" || len(data) == 0 || reservedBytes != int64(len(data)) {
 		return syscall.EINVAL
 	}
 	end := offset + uint64(len(data))
@@ -886,6 +979,7 @@ func (c *externalPageMmapCache) insertBytesWindow(cacheKey string, offset uint64
 	entry.elem = c.lru.PushBack(entry)
 	c.entries[entryKey] = entry
 	c.mappedBytes += int64(len(data))
+	c.transferReservedBytesLocked(reservedBytes)
 	c.removeRegionsLocked(cacheKey, offset, end)
 	c.regions = append(c.regions, externalPageCachedRegion{
 		cacheKey:  cacheKey,
@@ -944,23 +1038,31 @@ func (c *externalPageMmapCache) getOrMap(path string) (*externalPageMmapEntry, e
 		_ = file.Close()
 		return nil, syscall.EINVAL
 	}
+	if info.Size() > int64(int(^uint(0)>>1)) || !c.reserveBytes(info.Size()) {
+		_ = file.Close()
+		return nil, syscall.ENOMEM
+	}
 	mapped, err := unix.Mmap(int(file.Fd()), 0, int(info.Size()), unix.PROT_READ, unix.MAP_SHARED)
 	_ = file.Close()
 	if err != nil {
+		c.releaseReservedBytes(info.Size(), true)
 		return nil, err
 	}
 	adviseMappedContentCache(mapped)
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
+		c.mu.Unlock()
 		_ = unix.Munmap(mapped)
+		c.releaseReservedBytes(info.Size(), true)
 		return nil, syscall.EBADF
 	}
 	if entry := c.entries[path]; entry != nil {
 		entry.refs++
 		c.lru.MoveToBack(entry.elem)
+		c.mu.Unlock()
 		_ = unix.Munmap(mapped)
+		c.releaseReservedBytes(info.Size(), true)
 		return entry, nil
 	}
 
@@ -968,6 +1070,8 @@ func (c *externalPageMmapCache) getOrMap(path string) (*externalPageMmapEntry, e
 	entry.elem = c.lru.PushBack(entry)
 	c.entries[path] = entry
 	c.mappedBytes += int64(len(mapped))
+	c.transferReservedBytesLocked(info.Size())
+	c.mu.Unlock()
 	return entry, nil
 }
 
@@ -982,13 +1086,18 @@ func (c *externalPageMmapCache) release(entries []*externalPageMmapEntry) {
 }
 
 func (c *externalPageMmapCache) releaseLocked(entries []*externalPageMmapEntry) {
+	changed := false
 	for _, entry := range entries {
 		if entry == nil {
 			continue
 		}
 		if entry.refs > 0 {
 			entry.refs--
+			changed = true
 		}
+	}
+	if changed {
+		c.refsChanged.Broadcast()
 	}
 }
 
@@ -1010,35 +1119,31 @@ func (c *externalPageMmapCache) evictLocked() {
 	if c.maxBytes <= 0 {
 		return
 	}
-	for c.mappedBytes > c.maxBytes {
-		elem := c.lru.Front()
-		if elem == nil {
+	for c.mappedBytes+c.inflightBytes > c.maxBytes {
+		if !c.evictOneLocked() {
 			return
 		}
-		entry := elem.Value.(*externalPageMmapEntry)
-		if entry.refs > 0 {
-			c.lru.MoveToBack(elem)
-			if c.allEntriesReferencedLocked() {
-				return
-			}
-			continue
-		}
-		c.removeEntryLocked(entry)
 	}
 }
 
-func (c *externalPageMmapCache) allEntriesReferencedLocked() bool {
+func (c *externalPageMmapCache) evictOneLocked() bool {
 	for elem := c.lru.Front(); elem != nil; elem = elem.Next() {
-		if elem.Value.(*externalPageMmapEntry).refs == 0 {
-			return false
+		entry := elem.Value.(*externalPageMmapEntry)
+		if entry.refs == 0 {
+			c.removeEntryLocked(entry)
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 func (c *externalPageMmapCache) removeEntryLocked(entry *externalPageMmapEntry) {
 	delete(c.entries, entry.key)
-	c.mappedBytes -= int64(len(entry.data))
+	entryBytes := int64(len(entry.data))
+	c.mappedBytes -= entryBytes
+	if c.memoryPool != nil {
+		c.memoryPool.Use(-entryBytes, false)
+	}
 	if entry.elem != nil {
 		c.lru.Remove(entry.elem)
 		entry.elem = nil
@@ -1057,34 +1162,55 @@ func (c *externalPageMmapCache) removeEntryLocked(entry *externalPageMmapEntry) 
 }
 
 func (c *externalPageMmapCache) close() {
-	c.mu.Lock()
-	if c.closed {
+	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		for _, job := range c.prefetchQueue {
+			if state := c.prefetching[job.key]; state == job.state {
+				delete(c.prefetching, job.key)
+			}
+			close(job.state.done)
+		}
+		c.prefetchQueue = nil
 		c.mu.Unlock()
-		return
-	}
-	c.closed = true
-	entries := make([]*externalPageMmapEntry, 0, len(c.entries))
-	for _, entry := range c.entries {
-		entries = append(entries, entry)
-	}
-	c.entries = make(map[string]*externalPageMmapEntry)
-	c.regions = nil
-	for _, job := range c.prefetchQueue {
-		if state := c.prefetching[job.key]; state == job.state {
-			delete(c.prefetching, job.key)
-		}
-		close(job.state.done)
-	}
-	c.prefetchQueue = nil
-	c.lru.Init()
-	c.mappedBytes = 0
-	c.mu.Unlock()
 
-	for _, entry := range entries {
-		if entry.mmap && entry.data != nil {
-			_ = unix.Munmap(entry.data)
+		// Active prefetches may be prefaulting borrowed mmap slices.
+		c.prefetchWG.Wait()
+
+		c.mu.Lock()
+		for c.inflightBytes != 0 || !c.allEntriesUnreferencedLocked() {
+			c.refsChanged.Wait()
+		}
+		entries := make([]*externalPageMmapEntry, 0, len(c.entries))
+		for _, entry := range c.entries {
+			entries = append(entries, entry)
+		}
+		mappedBytes := c.mappedBytes
+		memoryPool := c.memoryPool
+		c.entries = make(map[string]*externalPageMmapEntry)
+		c.regions = nil
+		c.lru.Init()
+		c.mappedBytes = 0
+		c.mu.Unlock()
+
+		for _, entry := range entries {
+			if entry.mmap && entry.data != nil {
+				_ = unix.Munmap(entry.data)
+			}
+		}
+		if memoryPool != nil && mappedBytes > 0 {
+			memoryPool.Use(-mappedBytes, false)
+		}
+	})
+}
+
+func (c *externalPageMmapCache) allEntriesUnreferencedLocked() bool {
+	for elem := c.lru.Front(); elem != nil; elem = elem.Next() {
+		if elem.Value.(*externalPageMmapEntry).refs != 0 {
+			return false
 		}
 	}
+	return true
 }
 
 func (fh *FileHandle) recordExternalPageMiss(path, hash string, offset, size uint64, reason string, started time.Time, err error) {

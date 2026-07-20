@@ -542,6 +542,118 @@ func TestExternalCachePrefetchQueueSustainsConcurrency(t *testing.T) {
 	}
 }
 
+func TestExternalCachePrefetchMemoryBudgetIncludesInflightBytes(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer closeRelease()
+
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = &fakeContentCache{
+		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			started <- hash
+			<-release
+			for i := range dst {
+				dst[i] = hash[0]
+			}
+			return int64(len(dst)), nil
+		},
+	}
+	fs := newUnitFS(flags)
+	cache := fs.externalPageCache()
+	cache.mu.Lock()
+	cache.maxBytes = 8
+	cache.mu.Unlock()
+	readInto := flags.ExternalCacheClient.(cfg.ContentCacheReadInto)
+
+	for _, hash := range []string{"a", "b"} {
+		if !cache.prefetchWindow(fs, hash, 0, 8, 8, nil, readInto) {
+			t.Fatalf("prefetch %q was unexpectedly rejected", hash)
+		}
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for budgeted prefetch")
+	}
+	waitForExternalPageCondition(t, time.Second, func() bool {
+		return atomic.LoadInt64(&fs.stats.externalPrefetch.misses) == 1
+	}, "over-budget prefetch to be rejected")
+	select {
+	case hash := <-started:
+		t.Fatalf("second read-into bypassed the byte budget: hash=%q", hash)
+	default:
+	}
+	cache.mu.Lock()
+	inflightBytes := cache.inflightBytes
+	mappedBytes := cache.mappedBytes
+	cache.mu.Unlock()
+	if inflightBytes != 8 || mappedBytes != 0 {
+		t.Fatalf("unexpected active byte accounting: inflight=%d mapped=%d", inflightBytes, mappedBytes)
+	}
+	if got := atomic.LoadInt64(&fs.bufferPool.cur); got != 8 {
+		t.Fatalf("in-flight cache bytes were not charged to the mount memory pool: %d", got)
+	}
+
+	closeRelease()
+	waitForExternalPageCondition(t, time.Second, func() bool {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		return cache.prefetchActive == 0
+	}, "budgeted prefetches to finish")
+	cache.mu.Lock()
+	inflightBytes = cache.inflightBytes
+	mappedBytes = cache.mappedBytes
+	cache.mu.Unlock()
+	if inflightBytes != 0 || mappedBytes != 8 {
+		t.Fatalf("reservation did not transfer to resident accounting: inflight=%d mapped=%d", inflightBytes, mappedBytes)
+	}
+	if got := atomic.LoadInt64(&fs.bufferPool.cur); got != 8 {
+		t.Fatalf("resident cache bytes were not retained in the mount memory pool: %d", got)
+	}
+
+	fs.closeExternalPageMmapCache()
+	if got := atomic.LoadInt64(&fs.bufferPool.cur); got != 0 {
+		t.Fatalf("cache close leaked mount memory accounting: %d", got)
+	}
+}
+
+func TestExternalPageCacheUsesEffectiveMountMemoryLimit(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.MemoryLimit = 128 * 1024 * 1024
+	flags.ExternalCacheClient = &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			return nil, errContentNotFound
+		},
+	}
+	fs := newUnitFS(flags)
+	cache := fs.externalPageCache()
+	defer fs.closeExternalPageMmapCache()
+
+	if cache.memoryPool != fs.bufferPool {
+		t.Fatal("external page cache is not attached to the mount memory pool")
+	}
+	if cache.maxBytes != fs.bufferPool.max {
+		t.Fatalf("external page cache limit=%d, effective mount limit=%d", cache.maxBytes, fs.bufferPool.max)
+	}
+
+	inode := NewInode(fs, nil, "file")
+	fh := NewFileHandle(inode)
+	pageCache := flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
+	fh.scheduleExternalPagePrefetch("hash", 0, externalPagePrefetchAheadBytes, pageCache, nil)
+	waitForExternalPageCondition(t, time.Second, func() bool {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		return cache.prefetchActive == 0
+	}, "memory-limited prefetch to finish")
+	expected := (cache.maxBytes + externalPageMmapWindowBytes - 1) / externalPageMmapWindowBytes
+	if got := atomic.LoadInt64(&fs.stats.externalPrefetch.started); got != expected {
+		t.Fatalf("prefetch ahead ignored the effective mount limit: started=%d want=%d", got, expected)
+	}
+}
+
 func TestExternalCacheCloseCancelsQueuedPrefetch(t *testing.T) {
 	started := make(chan struct{}, externalPagePrefetchMaxConcurrent)
 	release := make(chan struct{})
@@ -580,13 +692,27 @@ func TestExternalCacheCloseCancelsQueuedPrefetch(t *testing.T) {
 		t.Fatal("queued prefetch was not tracked")
 	}
 
-	fs.closeExternalPageMmapCache()
+	closeDone := make(chan struct{})
+	go func() {
+		fs.closeExternalPageMmapCache()
+		close(closeDone)
+	}()
 	select {
 	case <-queuedDone:
 	case <-time.After(time.Second):
 		t.Fatal("close did not release queued prefetch waiter")
 	}
+	select {
+	case <-closeDone:
+		t.Fatal("close returned while active prefetches still held cache state")
+	default:
+	}
 	closeRelease()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("close did not wait for active prefetches to finish")
+	}
 	waitForExternalPageCondition(t, 2*time.Second, func() bool {
 		cache.mu.Lock()
 		defer cache.mu.Unlock()
@@ -597,6 +723,53 @@ func TestExternalCacheCloseCancelsQueuedPrefetch(t *testing.T) {
 		t.Fatal("queued prefetch started after cache close")
 	default:
 	}
+}
+
+func TestExternalCacheCloseWaitsForMappedSliceReferences(t *testing.T) {
+	pagePath := filepath.Join(t.TempDir(), "page")
+	if err := os.WriteFile(pagePath, []byte("mapped"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := newExternalPageMmapCache(4096)
+	if err := cache.insertWindow("hash", 0, []cfg.ClientLocalPageFileView{{Path: pagePath, Offset: 0, Length: 6}}); err != nil {
+		t.Fatal(err)
+	}
+	data, cleanup, ok := cache.lookup("hash", 0, 6)
+	if !ok || cleanup == nil {
+		t.Fatal("expected mapped lookup with cleanup callback")
+	}
+
+	closeDone := make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			cache.close()
+			closeDone <- struct{}{}
+		}()
+	}
+	waitForExternalPageCondition(t, time.Second, func() bool {
+		cache.mu.Lock()
+		defer cache.mu.Unlock()
+		return cache.closed
+	}, "cache close to begin")
+	select {
+	case <-closeDone:
+		t.Fatal("close returned before mapped slice cleanup")
+	default:
+	}
+	if got := string(bytes.Join(data, nil)); got != "mapped" {
+		t.Fatalf("mapped slice changed while close was waiting: %q", got)
+	}
+
+	cleanup()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-closeDone:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent close did not finish after mapped slice cleanup")
+		}
+	}
+	cache.close()
 }
 
 func TestExternalCacheForegroundJoinsInflightPrefetch(t *testing.T) {
