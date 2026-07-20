@@ -16,6 +16,7 @@
 package core
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"math/rand"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -67,6 +69,7 @@ type cacheEvent struct {
 const externalCacheStoreAttempts = 5
 const externalCacheStoreChunkSize = 4 * 1024 * 1024
 const externalCacheStoreBufferWait = 2 * time.Minute
+const stagedUploadMemorySnapshotLimit = 8 * 1024 * 1024
 
 var externalCacheStoreRetryDelay = func(attempt int) time.Duration {
 	delay := time.Duration(250*(1<<(attempt-1))) * time.Millisecond
@@ -1778,6 +1781,22 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	}
 	localFile := stagedFile.FD
 	localPath := localFile.Name()
+	totalSize := inode.Attributes.Size
+	var uploadSource io.ReaderAt = localFile
+	cleanupUploadSource := func() {}
+	if totalSize <= fs.flags.SinglePartMB*1024*1024 {
+		// PutObject retries derive Content-Length from the section size. Snapshot
+		// small generations while writes are excluded so a later SQLite truncate
+		// cannot make the seekable body shorter than the advertised length.
+		var snapshotErr error
+		uploadSource, cleanupUploadSource, snapshotErr = snapshotStagedUpload(localFile, totalSize)
+		if snapshotErr != nil {
+			stagedFile.mu.Unlock()
+			inode.mu.Unlock()
+			return snapshotErr
+		}
+	}
+	defer cleanupUploadSource()
 	flushGeneration := stagedFile.generation
 	stagedFile.flushing = true
 	stagedFile.shouldFlush = true
@@ -1788,7 +1807,6 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	inode.IsFlushing += flushWeight
 	stagedFile.mu.Unlock()
 
-	totalSize := inode.Attributes.Size
 	cloud, key := inode.cloud()
 	if inode.oldParent != nil {
 		_, key = inode.oldParent.cloud()
@@ -1810,7 +1828,7 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 
 	var hash []byte
 	if fs.flags.HashAttr != "" && totalSize >= fs.flags.MinFileSizeForHashKB*1024 {
-		hashString, hashErr := hashLocalFile(localFile, totalSize)
+		hashString, hashErr := hashLocalFile(uploadSource, totalSize)
 		if hashErr != nil {
 			return hashErr
 		}
@@ -1828,7 +1846,7 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	inode.mu.Unlock()
 
 	log.Debugf("Directly flushing staged file: inode=%s size=%d path=%s", inode.FullName(), totalSize, localPath)
-	resp, err := fs.uploadStagedFileDirect(cloud, key, localFile, totalSize, contentType, metadata)
+	resp, err := fs.uploadStagedFileDirect(cloud, key, uploadSource, totalSize, contentType, metadata)
 	if err != nil {
 		log.Warnf("Failed direct staged file flush for %s: %v", inode.FullName(), err)
 		inode.mu.Lock()
@@ -1941,7 +1959,7 @@ func (fs *Goofys) queueLocalFileForExternalCache(inode *Inode, localPath, hash s
 	}
 }
 
-func hashLocalFile(file *os.File, size uint64) (string, error) {
+func hashLocalFile(file io.ReaderAt, size uint64) (string, error) {
 	hasher := sha256.New()
 	buf := make([]byte, 4*1024*1024)
 	reader := io.NewSectionReader(file, 0, int64(size))
@@ -1951,7 +1969,40 @@ func hashLocalFile(file *os.File, size uint64) (string, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key string, file *os.File, size uint64, contentType *string, metadata map[string]*string) (*MultipartBlobCommitOutput, error) {
+func snapshotStagedUpload(file *os.File, size uint64) (io.ReaderAt, func(), error) {
+	if size <= stagedUploadMemorySnapshotLimit {
+		snapshot := make([]byte, int(size))
+		n, err := file.ReadAt(snapshot, 0)
+		if err != nil && err != io.EOF {
+			return nil, nil, err
+		}
+		if uint64(n) != size {
+			return nil, nil, io.ErrUnexpectedEOF
+		}
+		return bytes.NewReader(snapshot), func() {}, nil
+	}
+
+	snapshot, err := os.CreateTemp(filepath.Dir(file.Name()), ".geesefs-upload-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() {
+		_ = snapshot.Close()
+		_ = os.Remove(snapshot.Name())
+	}
+	n, err := io.Copy(snapshot, io.NewSectionReader(file, 0, int64(size)))
+	if err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	if uint64(n) != size {
+		cleanup()
+		return nil, nil, io.ErrUnexpectedEOF
+	}
+	return snapshot, cleanup, nil
+}
+
+func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key string, file io.ReaderAt, size uint64, contentType *string, metadata map[string]*string) (*MultipartBlobCommitOutput, error) {
 	if size <= fs.flags.SinglePartMB*1024*1024 {
 		resp, err := cloud.PutBlob(&PutBlobInput{
 			Key:         key,

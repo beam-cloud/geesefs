@@ -189,6 +189,9 @@ func (inode *Inode) ResizeUnlocked(newSize uint64, finalizeFlushed bool) {
 	}
 	inode.fs.bufferPool.Use(allocated, true)
 	inode.Attributes.Size = newSize
+	if newSize == 0 {
+		inode.stagedBypassed = false
+	}
 }
 
 func (inode *Inode) checkPauseWriters() {
@@ -211,7 +214,11 @@ func (inode *Inode) checkPauseWritersInterruptible() bool {
 func (fh *FileHandle) getOrCreateStagedFile() (err error) {
 	fh.inode.mu.Lock()
 	defer fh.inode.mu.Unlock()
+	return fh.getOrCreateStagedFileLocked()
+}
 
+// LOCKS_REQUIRED(fh.inode.mu)
+func (fh *FileHandle) getOrCreateStagedFileLocked() (err error) {
 	if fh.inode.StagedFile != nil {
 		return nil
 	}
@@ -243,6 +250,42 @@ func (fh *FileHandle) getOrCreateStagedFile() (err error) {
 
 	fh.inode.fs.stagedFiles.Store(fh.inode.Id, fh.inode)
 	return nil
+}
+
+func (fh *FileHandle) prepareStagedWrite(offset int64, size int) (bool, error) {
+	if offset < 0 {
+		return false, syscall.EINVAL
+	}
+	end := uint64(offset) + uint64(size)
+	if end > fh.inode.fs.getMaxFileSize() {
+		return false, syscall.EFBIG
+	}
+
+	fh.inode.mu.Lock()
+	defer fh.inode.mu.Unlock()
+	if fh.inode.CacheState == ST_DELETED || fh.inode.CacheState == ST_DEAD {
+		return false, syscall.ENOENT
+	}
+	if fh.inode.StagedFile != nil {
+		return true, nil
+	}
+	if fh.inode.stagedBypassed || fh.inode.buffers.AnyUnclean() {
+		fh.inode.stagedBypassed = true
+		return false, nil
+	}
+
+	fullReplacement := offset == 0 && end >= fh.inode.Attributes.Size
+	if fh.inode.CacheState != ST_CREATED && fh.inode.Attributes.Size != 0 && !fullReplacement {
+		// A fresh staged file has no copy of an existing object's untouched
+		// ranges. Keep partial updates on the buffered path, which can preserve
+		// those ranges with multipart copy/patch operations.
+		fh.inode.stagedBypassed = true
+		return false, nil
+	}
+	if err := fh.getOrCreateStagedFileLocked(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (fh *FileHandle) WriteFileStaged(offset int64, data []byte) (err error) {
@@ -2943,6 +2986,24 @@ func (inode *Inode) SetAttributes(size *uint64, mode *os.FileMode,
 			)
 			inode.mu.Unlock()
 			return syscall.EFBIG
+		}
+		if stagedFile := inode.StagedFile; stagedFile != nil {
+			stagedFile.mu.Lock()
+			if stagedFile.FD == nil || stagedFile.cleanupPending {
+				stagedFile.mu.Unlock()
+				inode.mu.Unlock()
+				return syscall.EAGAIN
+			}
+			if err := stagedFile.FD.Truncate(int64(*size)); err != nil {
+				stagedFile.mu.Unlock()
+				inode.mu.Unlock()
+				return err
+			}
+			stagedFile.generation++
+			stagedFile.awaitingRemoteRename = false
+			stagedFile.shouldFlush = true
+			stagedFile.lastWriteAt = time.Now()
+			stagedFile.mu.Unlock()
 		}
 		inode.ResizeUnlocked(*size, true)
 		modified = true

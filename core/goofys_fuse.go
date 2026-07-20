@@ -452,6 +452,17 @@ func (fs *GoofysFuse) OpenFile(
 		// Stale inode
 		return syscall.ESTALE
 	}
+	if op.OpenFlags&syscall.O_TRUNC != 0 {
+		// Kernels that don't negotiate atomic truncation may send a separate
+		// SetAttr first; applying the explicit open flag here is idempotent and
+		// also covers clients that only send O_TRUNC with OpenFile.
+		if err = in.SetAttributes(PUInt64(0), nil, nil, nil, nil); err != nil {
+			return mapAwsError(err)
+		}
+		in.mu.Lock()
+		in.stagedBypassed = false
+		in.mu.Unlock()
+	}
 
 	fh, err := in.OpenFile()
 	if err != nil {
@@ -911,8 +922,15 @@ func (fs *GoofysFuse) WriteFile(
 
 	// Write through to staging directory if "staged write mode" is enabled
 	if fs.flags.StagedWriteModeEnabled {
-		err = fh.WriteFileStaged(op.Offset, op.Data)
-		return
+		var staged bool
+		staged, err = fh.prepareStagedWrite(op.Offset, len(op.Data))
+		if err != nil {
+			return
+		}
+		if staged {
+			err = fh.WriteFileStaged(op.Offset, op.Data)
+			return
+		}
 	}
 
 	// fuse binding leaves extra room for header, so we

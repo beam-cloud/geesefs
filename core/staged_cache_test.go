@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -1157,6 +1158,311 @@ func TestStagedWriteDuringFlushRetainsGenerationForRetry(t *testing.T) {
 	}
 	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
 		t.Fatalf("staged path was not cleaned after stable upload: %v", err)
+	}
+}
+
+func TestDirectStagedPutUsesImmutableGeneration(t *testing.T) {
+	initial := bytes.Repeat([]byte("a"), 512)
+	replacement := []byte("new journal\n")
+	var inode *Inode
+	var mu sync.Mutex
+	var uploads [][]byte
+	backend := &stagedRenameBackend{}
+	backend.PutBlobFunc = func(param *PutBlobInput) (*PutBlobOutput, error) {
+		mu.Lock()
+		call := len(uploads)
+		mu.Unlock()
+		if call == 0 {
+			if err := inode.SetAttributes(PUInt64(0), nil, nil, nil, nil); err != nil {
+				return nil, err
+			}
+			if err := inode.StagedFile.FH.WriteFileStaged(0, replacement); err != nil {
+				return nil, err
+			}
+		}
+
+		got, err := io.ReadAll(param.Body)
+		if err != nil {
+			return nil, err
+		}
+		if param.Size == nil {
+			return nil, errors.New("missing ContentLength")
+		}
+		if uint64(len(got)) != *param.Size {
+			return nil, fmt.Errorf("ContentLength=%d with Body length %d", *param.Size, len(got))
+		}
+		mu.Lock()
+		uploads = append(uploads, got)
+		mu.Unlock()
+		now := time.Now()
+		return &PutBlobOutput{ETag: PString("etag"), LastModified: &now}, nil
+	}
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, backend)
+	inode, _ = newStagedRenameInode(t, fs, root, "comfyui.db-journal", initial)
+
+	if err := fs.flushStagedFile(inode); err != nil {
+		t.Fatal(err)
+	}
+	inode.mu.Lock()
+	stagedFile := inode.StagedFile
+	inode.mu.Unlock()
+	if stagedFile == nil {
+		t.Fatal("replacement generation was discarded after the first upload")
+	}
+	if err := fs.flushStagedFile(inode); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	gotUploads := append([][]byte(nil), uploads...)
+	mu.Unlock()
+	if len(gotUploads) != 2 {
+		t.Fatalf("uploads = %d, want 2", len(gotUploads))
+	}
+	if !bytes.Equal(gotUploads[0], initial) {
+		t.Fatalf("first upload length = %d, want immutable %d-byte generation", len(gotUploads[0]), len(initial))
+	}
+	if !bytes.Equal(gotUploads[1], replacement) {
+		t.Fatalf("second upload = %q, want %q", gotUploads[1], replacement)
+	}
+}
+
+func TestStagedPartialOverwritePreservesLogicalSize(t *testing.T) {
+	origin := bytes.Repeat([]byte("o"), 512)
+	replacement := []byte("new journal\n")
+	backend := &TestBackend{}
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		end := param.Start + param.Count
+		if end > uint64(len(origin)) {
+			return nil, fmt.Errorf("origin read %d:%d exceeds %d", param.Start, end, len(origin))
+		}
+		return &GetBlobOutput{
+			Body: io.NopCloser(bytes.NewReader(origin[param.Start:end])),
+		}, nil
+	}
+	flags := cfg.DefaultFlags()
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "comfyui.db-journal")
+	inode.Id = 2
+	inode.SetCacheState(ST_CACHED)
+	inode.Attributes.Size = 512
+	inode.knownSize = 512
+	fh := NewFileHandle(inode)
+
+	staged, err := fh.prepareStagedWrite(0, len(replacement))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staged {
+		t.Fatal("partial overwrite of an existing object selected direct staging")
+	}
+	if err := fh.WriteFile(0, replacement, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := inode.Attributes.Size; got != 512 {
+		t.Fatalf("staged inode size = %d after partial overwrite, want 512", got)
+	}
+	if inode.StagedFile != nil {
+		t.Fatal("partial overwrite created a staged file")
+	}
+	if !inode.buffers.AnyUnclean() {
+		t.Fatal("partial overwrite did not use dirty buffers")
+	}
+	data, bytesRead, err := fh.ReadFile(0, int64(len(origin)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]byte(nil), origin...)
+	copy(want, replacement)
+	if got := bytes.Join(data, nil); bytesRead != len(want) || !bytes.Equal(got, want) {
+		t.Fatalf("partial overwrite read = %q (%d bytes), want preserved %d-byte object", got, bytesRead, len(want))
+	}
+	staged, err = fh.prepareStagedWrite(0, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staged {
+		t.Fatal("subsequent write switched a dirty buffered generation to staging")
+	}
+}
+
+func TestFullExistingObjectReplacementUsesStaging(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, &TestBackend{})
+	inode := NewInode(fs, root, "model.bin")
+	inode.Id = 2
+	inode.SetCacheState(ST_CACHED)
+	inode.Attributes.Size = 512
+	inode.knownSize = 512
+	fh := NewFileHandle(inode)
+
+	staged, err := fh.prepareStagedWrite(0, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !staged || inode.StagedFile == nil {
+		t.Fatal("full existing-object replacement did not select direct staging")
+	}
+	inode.mu.Lock()
+	stagedFile := inode.StagedFile
+	inode.StagedFile = nil
+	inode.mu.Unlock()
+	stagedFile.Cleanup()
+}
+
+func TestDirectStagedPutEmptyGeneration(t *testing.T) {
+	backend := &stagedRenameBackend{}
+	backend.PutBlobFunc = func(param *PutBlobInput) (*PutBlobOutput, error) {
+		if param.Size == nil || *param.Size != 0 {
+			return nil, fmt.Errorf("ContentLength=%v, want 0", param.Size)
+		}
+		got, err := io.ReadAll(param.Body)
+		if err != nil {
+			return nil, err
+		}
+		if len(got) != 0 {
+			return nil, fmt.Errorf("empty staged body length = %d", len(got))
+		}
+		now := time.Now()
+		return &PutBlobOutput{ETag: PString("etag"), LastModified: &now}, nil
+	}
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, backend)
+	inode, _ := newStagedInodeForFlush(t, fs, root, nil)
+	if err := fs.flushStagedFile(inode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLargeStagedPutSnapshotIsFileBackedAndImmutable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "staged")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	size := uint64(stagedUploadMemorySnapshotLimit + 1)
+	if err := file.Truncate(int64(size)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte("start"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte("end"), int64(size)-3); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, cleanup, err := snapshotStagedUpload(file, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotFile, ok := snapshot.(*os.File)
+	if !ok {
+		cleanup()
+		t.Fatalf("large snapshot type = %T, want *os.File", snapshot)
+	}
+	snapshotPath := snapshotFile.Name()
+	if err := file.Truncate(12); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	start := make([]byte, 5)
+	if _, err := snapshot.ReadAt(start, 0); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	end := make([]byte, 3)
+	if _, err := snapshot.ReadAt(end, int64(size)-3); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if string(start) != "start" || string(end) != "end" {
+		cleanup()
+		t.Fatalf("snapshot changed after source truncate: start=%q end=%q", start, end)
+	}
+	cleanup()
+	if _, err := os.Stat(snapshotPath); !os.IsNotExist(err) {
+		t.Fatalf("file-backed snapshot was not removed: %v", err)
+	}
+}
+
+func TestOpenFileHonorsExplicitTruncate(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	fs.inodes = make(map[fuseops.InodeID]*Inode)
+	fs.fileHandles = make(map[fuseops.HandleID]*FileHandle)
+	fs.nextHandleID = 1
+	root := newRootWithBackend(fs, &TestBackend{})
+	fs.inodes[root.Id] = root
+
+	newExistingFile := func(id fuseops.InodeID, name string) *Inode {
+		inode := NewInode(fs, root, name)
+		inode.Id = id
+		inode.SetCacheState(ST_CACHED)
+		inode.Attributes.Size = 512
+		inode.knownSize = 512
+		root.insertChild(inode)
+		fs.inodes[id] = inode
+		return inode
+	}
+	truncated := newExistingFile(2, "truncate.db-journal")
+	untouched := newExistingFile(3, "ordinary.db-journal")
+	fuseFS := NewGoofysFuse(fs)
+
+	truncateOp := &fuseops.OpenFileOp{
+		Inode:     truncated.Id,
+		OpenFlags: syscall.O_WRONLY | syscall.O_TRUNC,
+	}
+	if err := fuseFS.OpenFile(context.Background(), truncateOp); err != nil {
+		t.Fatal(err)
+	}
+	if got := truncated.Attributes.Size; got != 0 {
+		t.Fatalf("O_TRUNC inode size = %d, want 0", got)
+	}
+	if truncated.CacheState != ST_MODIFIED {
+		t.Fatalf("O_TRUNC cache state = %d, want modified", truncated.CacheState)
+	}
+	truncateWrite := &fuseops.WriteFileOp{
+		Handle: truncateOp.Handle,
+		Offset: 0,
+		Data:   []byte("new journal\n"),
+	}
+	if err := fuseFS.WriteFile(context.Background(), truncateWrite); err != nil {
+		t.Fatal(err)
+	}
+	if truncated.StagedFile == nil {
+		t.Fatal("write after O_TRUNC did not select direct staging")
+	}
+	if got := truncated.Attributes.Size; got != uint64(len(truncateWrite.Data)) {
+		t.Fatalf("write after O_TRUNC size = %d, want %d", got, len(truncateWrite.Data))
+	}
+
+	ordinaryOp := &fuseops.OpenFileOp{
+		Inode:     untouched.Id,
+		OpenFlags: syscall.O_WRONLY,
+	}
+	if err := fuseFS.OpenFile(context.Background(), ordinaryOp); err != nil {
+		t.Fatal(err)
+	}
+	if got := untouched.Attributes.Size; got != 512 {
+		t.Fatalf("ordinary open inode size = %d, want 512", got)
 	}
 }
 

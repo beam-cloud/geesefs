@@ -273,6 +273,7 @@ type Inode struct {
 	DiskFDQueueID  uint64
 	DiskCacheFD    *os.File
 	StagedFile     *StagedFile
+	stagedBypassed bool
 	OnDisk         bool
 	forceFlush     bool
 	IsFlushing     int

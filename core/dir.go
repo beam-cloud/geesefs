@@ -1532,6 +1532,9 @@ func (parent *Inode) RmDir(name string) (err error) {
 func (inode *Inode) SetCacheState(state int32) {
 	wasModified := inode.CacheState == ST_CREATED || inode.CacheState == ST_DELETED || inode.CacheState == ST_MODIFIED
 	willBeModified := state == ST_CREATED || state == ST_DELETED || state == ST_MODIFIED
+	if state == ST_CACHED {
+		inode.stagedBypassed = false
+	}
 	atomic.StoreInt32(&inode.CacheState, state)
 	if wasModified != willBeModified {
 		inc := int64(1)
