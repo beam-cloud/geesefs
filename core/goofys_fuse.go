@@ -1174,6 +1174,9 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 	// transport can confirm that the host can negotiate a pipe-backed response.
 	// Keep the fast path disabled until that synchronous probe succeeds.
 	fs.externalCacheFDReads = false
+	if !spliceReadRequested {
+		log.Infof("geesefs fuse splice-read status: requested=false enabled=false max_pages=0 unavailable=local-page-file-views-unsupported")
+	}
 	mountCfg := &fuse.MountConfig{
 		FSName:                  fs.bucket,
 		Subtype:                 "geesefs",
