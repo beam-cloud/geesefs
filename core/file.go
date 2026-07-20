@@ -1077,13 +1077,29 @@ func (fh *FileHandle) shouldRetrieveHash() bool {
 func (fh *FileHandle) retrieveHashMetadata() {
 	fh.inode.mu.Lock()
 	cloud, path := fh.inode.cloud()
+	knownETag := fh.inode.knownETag
+	knownSize := fh.inode.knownSize
+	hashMetadataChecked := fh.inode.hashMetadataChecked
 	fh.inode.mu.Unlock()
 	head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
 	if err == nil {
-		// Refresh the object identity along with its metadata. Lazy read-through
-		// population must be tied to the exact ETag and size that were read.
-		fh.inode.SetFromBlobItem(&head.BlobItemOutput)
 		fh.inode.mu.Lock()
+		currentCloud, currentPath := fh.inode.cloud()
+		cleanIdentity := currentCloud == cloud && currentPath == path &&
+			fh.inode.knownETag == knownETag && fh.inode.knownSize == knownSize &&
+			fh.inode.hashMetadataChecked == hashMetadataChecked &&
+			fh.inode.CacheState == ST_CACHED && fh.inode.StagedFile == nil &&
+			!fh.inode.buffers.AnyUnclean() && fh.inode.userMetadataDirty == 0 &&
+			fh.inode.oldParent == nil && !fh.inode.renamingTo &&
+			!fh.inode.hashMetadataDirty && !fh.inode.hashMetadataSync
+		if !cleanIdentity {
+			fh.inode.mu.Unlock()
+			log.Debugf("Discarding stale hash metadata HEAD for %v", path)
+			return
+		}
+		// Apply the identity and metadata atomically after proving that the inode
+		// is still the same clean object for which the HEAD was issued.
+		fh.inode.setFromBlobItemLocked(&head.BlobItemOutput)
 		fh.inode.setMetadata(head.Metadata)
 		fh.inode.hashMetadataChecked = true
 		fh.inode.mu.Unlock()

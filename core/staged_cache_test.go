@@ -127,6 +127,7 @@ func newUnitFS(flags *cfg.FlagStorage) *Goofys {
 		shutdownCh:       make(chan struct{}),
 		bufferPool:       NewBufferPool(int64(flags.MemoryLimit), uint64(flags.GCInterval)<<20),
 		cacheEventChan:   make(chan cacheEvent, 8),
+		cacheEventDone:   make(chan struct{}, 1),
 		cachingStatus:    make(map[string]bool),
 		flushPriorities:  make([]int64, MAX_FLUSH_PRIORITY+1),
 		inflightChanges:  make(map[string]int),

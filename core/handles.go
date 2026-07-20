@@ -396,6 +396,11 @@ func (inode *Inode) UnqueueCleanBuffer(buf *FileBuffer) {
 func (inode *Inode) SetFromBlobItem(item *BlobItemOutput) {
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
+	inode.setFromBlobItemLocked(item)
+}
+
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) setFromBlobItemLocked(item *BlobItemOutput) {
 
 	// We always just drop our local cache when inode size or etag changes remotely
 	// It's the simplest method of conflict resolution

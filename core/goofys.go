@@ -64,6 +64,7 @@ type cacheEvent struct {
 	fromBuffers      bool
 	lazyReadIdentity *lazyReadIdentity
 	skipCacheStatus  bool
+	activeCounted    bool
 }
 
 const externalCacheStoreAttempts = 5
@@ -153,6 +154,7 @@ type Goofys struct {
 	NotifyCallback func(notifications []interface{})
 
 	cacheEventChan    chan cacheEvent
+	cacheEventDone    chan struct{}
 	cachingStatus     map[string]bool
 	cachingStatusMu   sync.Mutex
 	activeCacheEvents int64
@@ -161,6 +163,9 @@ type Goofys struct {
 	externalPageMmapCacheMu sync.Mutex
 	lazyReadClaims          map[lazyReadIdentity]struct{}
 	lazyReadClaimsMu        sync.Mutex
+	lazyReadStagedBytes     uint64
+	lazyReadStageLimitBytes uint64
+	lazyReadStageLimitCount int
 
 	stagedFiles sync.Map
 }
@@ -411,6 +416,7 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 		},
 		flushPriorities: make([]int64, MAX_FLUSH_PRIORITY+1),
 		cacheEventChan:  make(chan cacheEvent, 10000),
+		cacheEventDone:  make(chan struct{}, 1),
 		cachingStatus:   make(map[string]bool),
 		cachingStatusMu: sync.Mutex{},
 	}
@@ -502,29 +508,60 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 }
 
 func (fs *Goofys) processCacheEvents() {
+	shuttingDown := false
 	for {
+		if shuttingDown {
+			select {
+			case cacheEvent := <-fs.cacheEventChan:
+				fs.processCacheEvent(cacheEvent)
+			default:
+				// A completed lazy read owns an active-cache token before it
+				// starts revalidation. Keep the consumer alive until that token
+				// is either abandoned or handed to a queued cache event.
+				if atomic.LoadInt64(&fs.activeCacheEvents) > 0 {
+					select {
+					case cacheEvent := <-fs.cacheEventChan:
+						fs.processCacheEvent(cacheEvent)
+					case <-fs.cacheEventDone:
+					}
+					continue
+				}
+				return
+			}
+			continue
+		}
 		select {
 		case <-fs.shutdownCh:
-			for {
-				select {
-				case cacheEvent := <-fs.cacheEventChan:
-					fs.processCacheEvent(cacheEvent)
-				default:
-					return
-				}
-			}
+			shuttingDown = true
 		case cacheEvent := <-fs.cacheEventChan:
 			fs.processCacheEvent(cacheEvent)
 		}
 	}
 }
 
+func (fs *Goofys) completeActiveCacheEvent() {
+	atomic.AddInt64(&fs.activeCacheEvents, -1)
+	select {
+	case fs.cacheEventDone <- struct{}{}:
+	default:
+	}
+}
+
 func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 	started := time.Now()
-	atomic.AddInt64(&fs.activeCacheEvents, 1)
-	defer atomic.AddInt64(&fs.activeCacheEvents, -1)
+	if !cacheEvent.activeCounted {
+		atomic.AddInt64(&fs.activeCacheEvents, 1)
+	}
+	defer fs.completeActiveCacheEvent()
 	if cacheEvent.lazyReadIdentity != nil {
 		defer fs.releaseLazyReadClaim(*cacheEvent.lazyReadIdentity)
+	}
+	if cacheEvent.removeLocalAfter {
+		defer func() {
+			if err := os.RemoveAll(cacheEvent.localSourcePath); err != nil {
+				log.Warnf("Failed to remove staged cache source %v: %v", cacheEvent.localSourcePath, err)
+			}
+		}()
 	}
 	atomic.AddInt64(&fs.stats.cacheEventsStarted, 1)
 	atomic.AddInt64(&fs.stats.cacheEventsBytes, int64(cacheEvent.size))
@@ -586,12 +623,6 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 		fs.clearCacheEventStatus(cacheEvent)
 	}
 
-	if cacheEvent.removeLocalAfter {
-		err := os.RemoveAll(cacheEvent.localSourcePath)
-		if err != nil {
-			log.Warnf("Failed to remove staged cache source %v: %v", cacheEvent.localSourcePath, err)
-		}
-	}
 }
 
 func (fs *Goofys) clearCacheEventStatus(cacheEvent cacheEvent) {
@@ -1045,9 +1076,20 @@ func (fs *Goofys) clearCachingStatus(hash string) {
 }
 
 func (fs *Goofys) Shutdown() {
+	fs.lazyReadClaimsMu.Lock()
 	atomic.StoreInt32(&fs.shutdown, 1)
-	fs.closeExternalPageMmapCache()
 	close(fs.shutdownCh)
+	fs.lazyReadClaimsMu.Unlock()
+	fs.mu.RLock()
+	fileHandles := make([]*FileHandle, 0, len(fs.fileHandles))
+	for _, fh := range fs.fileHandles {
+		fileHandles = append(fileHandles, fh)
+	}
+	fs.mu.RUnlock()
+	for _, fh := range fileHandles {
+		fh.abandonLazyRead("filesystem is shutting down", nil)
+	}
+	fs.closeExternalPageMmapCache()
 	fs.WakeupFlusher()
 	if fs.diskFdQueue != nil {
 		fs.diskFdQueue.cond.Broadcast()

@@ -201,7 +201,7 @@ func TestLazyReadSequentiallyStoresLocalContentBeforePublishingHash(t *testing.T
 	}
 }
 
-func TestLazyReadPartialAndOutOfOrderReadsAreAbandoned(t *testing.T) {
+func TestLazyReadIncompleteReadsAreAbandoned(t *testing.T) {
 	payload := []byte("0123456789abcdef")
 	for _, test := range []struct {
 		name string
@@ -223,17 +223,6 @@ func TestLazyReadPartialAndOutOfOrderReadsAreAbandoned(t *testing.T) {
 					t.Fatal(err)
 				}
 				if _, _, _, err := fh.ReadFileWithCallback(6, 4); err != nil {
-					t.Fatal(err)
-				}
-			},
-		},
-		{
-			name: "nonzero first read",
-			read: func(t *testing.T, fh *FileHandle) {
-				if _, _, _, err := fh.ReadFileWithCallback(4, 4); err != nil {
-					t.Fatal(err)
-				}
-				if _, _, _, err := fh.ReadFileWithCallback(0, int64(len(payload))); err != nil {
 					t.Fatal(err)
 				}
 			},
@@ -268,6 +257,223 @@ func TestLazyReadPartialAndOutOfOrderReadsAreAbandoned(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLazyReadOutOfOrderOverlappingCompletionsPromote(t *testing.T) {
+	payload := []byte("0123456789abcdef")
+	sum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(sum[:])
+	stageDir := t.TempDir()
+	storedContent := make(chan []byte, 1)
+	copyDone := make(chan struct{}, 1)
+	cache := &fakeContentCache{storeLocalPath: func(source struct {
+		Path      string
+		CachePath string
+	}, opts struct {
+		RoutingKey string
+		Lock       bool
+	}) (string, error) {
+		content, err := os.ReadFile(source.Path)
+		if err != nil {
+			return "", err
+		}
+		storedContent <- content
+		return expectedHash, nil
+	}}
+	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+		copyDone <- struct{}{}
+		return &CopyBlobOutput{}, nil
+	})
+	fs, _, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	defer close(fs.shutdownCh)
+	defer fh.Release()
+	go fs.processCacheEvents()
+
+	fh.retrieveHashMetadata()
+	// Async FUSE reads can complete in a different order than they were issued.
+	// The overlap is intentional and must not duplicate bytes in the snapshot.
+	fh.recordLazyRead(4, 8, [][]byte{payload[4:12]}, 8, nil)
+	fh.recordLazyRead(0, 8, [][]byte{payload[:8]}, 8, nil)
+	fh.recordLazyRead(12, 4, [][]byte{payload[12:]}, 4, nil)
+
+	select {
+	case got := <-storedContent:
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("stored content = %q, want %q", got, payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for out-of-order lazy cache store")
+	}
+	select {
+	case <-copyDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for out-of-order hash publish")
+	}
+	assertLazyReadStageDirEmpty(t, stageDir)
+}
+
+func TestRetrieveHashMetadataDiscardsHeadAfterRename(t *testing.T) {
+	payload := []byte("original-object")
+	stageDir := t.TempDir()
+	headStarted := make(chan struct{})
+	releaseHead := make(chan struct{})
+	wrongHash := "hash-for-replacement-object"
+	backend := stableLazyReadBackend(payload, nil)
+	backend.HeadBlobFunc = func(param *HeadBlobInput) (*HeadBlobOutput, error) {
+		close(headStarted)
+		<-releaseHead
+		etag := "etag-replacement"
+		return &HeadBlobOutput{BlobItemOutput: BlobItemOutput{
+			Key:      &param.Key,
+			ETag:     &etag,
+			Size:     uint64(len(payload)),
+			Metadata: map[string]*string{"sha256": &wrongHash},
+		}}, nil
+	}
+	cache := &fakeContentCache{}
+	fs, inode, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	defer close(fs.shutdownCh)
+	defer fh.Release()
+
+	done := make(chan struct{})
+	go func() {
+		fh.retrieveHashMetadata()
+		close(done)
+	}()
+	<-headStarted
+	inode.mu.Lock()
+	inode.Name = "renamed-model.bin"
+	inode.mu.Unlock()
+	close(releaseHead)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stale HEAD rejection")
+	}
+
+	inode.mu.Lock()
+	gotETag := inode.knownETag
+	gotHash := string(inode.userMetadata[fs.flags.HashAttr])
+	checked := inode.hashMetadataChecked
+	inode.mu.Unlock()
+	if gotETag != "etag-v1" || gotHash != "" || checked {
+		t.Fatalf("stale HEAD mutated renamed inode: etag=%q hash=%q checked=%t", gotETag, gotHash, checked)
+	}
+}
+
+func TestLazyReadStagedByteAdmissionReleasesOnAbandon(t *testing.T) {
+	payload := []byte("0123456789abcdef")
+	stageDir := t.TempDir()
+	cache := &fakeContentCache{}
+	backend := stableLazyReadBackend(payload, nil)
+	fs, firstInode, first := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	fs.lazyReadStageLimitBytes = uint64(len(payload))
+	firstInode.hashMetadataChecked = true
+
+	secondInode := NewInode(fs, firstInode.Parent, "other-model.bin")
+	secondInode.Id = 3
+	secondInode.Attributes.Size = uint64(len(payload))
+	secondInode.knownSize = uint64(len(payload))
+	secondInode.knownETag = "etag-v1"
+	secondInode.SetCacheState(ST_CACHED)
+	secondInode.userMetadata = map[string][]byte{}
+	secondInode.hashMetadataChecked = true
+	second, err := secondInode.OpenFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first.recordLazyRead(0, 4, [][]byte{payload[:4]}, 4, nil)
+	second.recordLazyRead(0, 4, [][]byte{payload[:4]}, 4, nil)
+	if first.lazyReadStage == nil || second.lazyReadStage != nil || !second.lazyReadDisabled {
+		t.Fatalf("unexpected admission state: first_stage=%t second_stage=%t second_disabled=%t", first.lazyReadStage != nil, second.lazyReadStage != nil, second.lazyReadDisabled)
+	}
+	fs.lazyReadClaimsMu.Lock()
+	reserved := fs.lazyReadStagedBytes
+	fs.lazyReadClaimsMu.Unlock()
+	if reserved != uint64(len(payload)) {
+		t.Fatalf("reserved staged bytes = %d, want %d", reserved, len(payload))
+	}
+
+	first.Release()
+	fs.lazyReadClaimsMu.Lock()
+	reserved = fs.lazyReadStagedBytes
+	fs.lazyReadClaimsMu.Unlock()
+	if reserved != 0 {
+		t.Fatalf("reserved staged bytes after abandon = %d, want 0", reserved)
+	}
+	third, err := secondInode.OpenFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	third.recordLazyRead(0, 4, [][]byte{payload[:4]}, 4, nil)
+	if third.lazyReadStage == nil {
+		t.Fatal("released byte admission was not reusable")
+	}
+	second.Release()
+	third.Release()
+	close(fs.shutdownCh)
+	assertLazyReadStageDirEmpty(t, stageDir)
+}
+
+func TestLazyReadStageCountAdmissionReleasesClaim(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	fs.lazyReadStageLimitBytes = 1024
+	fs.lazyReadStageLimitCount = 1
+	first := lazyReadIdentity{path: "one", objectPath: "one", etag: "etag-one", size: 10}
+	second := lazyReadIdentity{path: "two", objectPath: "two", etag: "etag-two", size: 10}
+	if !fs.claimLazyRead(first) {
+		t.Fatal("first lazy claim was unexpectedly rejected")
+	}
+	if fs.claimLazyRead(second) {
+		t.Fatal("second lazy claim exceeded the count limit")
+	}
+	fs.releaseLazyReadClaim(first)
+	if !fs.claimLazyRead(second) {
+		t.Fatal("released lazy claim count was not reusable")
+	}
+	fs.releaseLazyReadClaim(second)
+	fs.lazyReadClaimsMu.Lock()
+	claimCount := len(fs.lazyReadClaims)
+	reserved := fs.lazyReadStagedBytes
+	fs.lazyReadClaimsMu.Unlock()
+	if claimCount != 0 || reserved != 0 {
+		t.Fatalf("lazy admission leaked after release: claims=%d bytes=%d", claimCount, reserved)
+	}
+	close(fs.shutdownCh)
+}
+
+func TestLazyReadCompletionAfterShutdownIsAbandoned(t *testing.T) {
+	payload := []byte("complete-after-shutdown")
+	stageDir := t.TempDir()
+	cache := &fakeContentCache{}
+	backend := stableLazyReadBackend(payload, nil)
+	fs, inode, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	inode.hashMetadataChecked = true
+	split := len(payload) / 2
+	fh.recordLazyRead(0, uint64(split), [][]byte{payload[:split]}, split, nil)
+	if fh.lazyReadStage == nil {
+		t.Fatal("partial lazy stage was not created")
+	}
+	fs.Shutdown()
+	fh.recordLazyRead(uint64(split), uint64(len(payload)-split), [][]byte{payload[split:]}, len(payload)-split, nil)
+	if fh.lazyReadStage != nil || !fh.lazyReadDisabled {
+		t.Fatalf("late completion was not abandoned: stage=%t disabled=%t", fh.lazyReadStage != nil, fh.lazyReadDisabled)
+	}
+	if active := atomic.LoadInt64(&fs.activeCacheEvents); active != 0 {
+		t.Fatalf("active cache events after late completion = %d, want 0", active)
+	}
+	fs.lazyReadClaimsMu.Lock()
+	claimCount := len(fs.lazyReadClaims)
+	reserved := fs.lazyReadStagedBytes
+	fs.lazyReadClaimsMu.Unlock()
+	if claimCount != 0 || reserved != 0 {
+		t.Fatalf("late completion leaked admission: claims=%d bytes=%d", claimCount, reserved)
+	}
+	fh.Release()
+	assertLazyReadStageDirEmpty(t, stageDir)
 }
 
 func TestLazyReadConcurrentHandlesShareObjectIdentityClaim(t *testing.T) {
@@ -373,6 +579,214 @@ func TestLazyReadFinalBytesWithEOFStillPromote(t *testing.T) {
 	case <-copyDone:
 	case <-time.After(time.Second):
 		t.Fatal("EOF final bytes did not publish hash metadata")
+	}
+	assertLazyReadStageDirEmpty(t, stageDir)
+}
+
+func TestLazyReadFinishIsCountedUntilCacheEventCompletes(t *testing.T) {
+	payload := []byte("count-finish-before-queue")
+	sum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(sum[:])
+	stageDir := t.TempDir()
+	revalidationStarted := make(chan struct{})
+	releaseRevalidation := make(chan struct{})
+	copyDone := make(chan struct{}, 1)
+	var headCalls atomic.Int32
+	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+		copyDone <- struct{}{}
+		return &CopyBlobOutput{}, nil
+	})
+	backend.HeadBlobFunc = func(param *HeadBlobInput) (*HeadBlobOutput, error) {
+		if headCalls.Add(1) == 2 {
+			close(revalidationStarted)
+			<-releaseRevalidation
+		}
+		etag := "etag-v1"
+		return &HeadBlobOutput{BlobItemOutput: BlobItemOutput{
+			Key: &param.Key, ETag: &etag, Size: uint64(len(payload)), Metadata: map[string]*string{},
+		}}, nil
+	}
+	cache := &fakeContentCache{storeLocalPath: func(source struct {
+		Path      string
+		CachePath string
+	}, opts struct {
+		RoutingKey string
+		Lock       bool
+	}) (string, error) {
+		return expectedHash, nil
+	}}
+	fs, _, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	fs.flags.StagedWriteFlushTimeout = 3 * time.Second
+	defer close(fs.shutdownCh)
+	defer fh.Release()
+	go fs.processCacheEvents()
+
+	if _, _, cleanup, err := fh.ReadFileWithCallback(0, int64(len(payload))); err != nil {
+		t.Fatal(err)
+	} else if cleanup != nil {
+		cleanup()
+	}
+	select {
+	case <-revalidationStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for lazy revalidation")
+	}
+
+	flushDone := make(chan struct{})
+	go func() {
+		fs.WaitForFlush()
+		close(flushDone)
+	}()
+	select {
+	case <-flushDone:
+		t.Fatal("WaitForFlush returned while lazy finish was not yet queued")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseRevalidation)
+	select {
+	case <-flushDone:
+	case <-time.After(4 * time.Second):
+		t.Fatal("WaitForFlush did not observe lazy cache completion")
+	}
+	select {
+	case <-copyDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for counted metadata publish")
+	}
+	if active := atomic.LoadInt64(&fs.activeCacheEvents); active != 0 {
+		t.Fatalf("active cache events = %d, want 0", active)
+	}
+	fs.lazyReadClaimsMu.Lock()
+	reserved := fs.lazyReadStagedBytes
+	fs.lazyReadClaimsMu.Unlock()
+	if reserved != 0 {
+		t.Fatalf("reserved staged bytes = %d, want 0", reserved)
+	}
+	assertLazyReadStageDirEmpty(t, stageDir)
+}
+
+func TestLazyReadShutdownDrainsPrecountedCacheEvent(t *testing.T) {
+	payload := []byte("queued-after-shutdown")
+	sum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(sum[:])
+	stageDir := t.TempDir()
+	stagePath := filepath.Join(stageDir, "completed-lazy-read")
+	if err := os.WriteFile(stagePath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cache := &fakeContentCache{storeLocalPath: func(source struct {
+		Path      string
+		CachePath string
+	}, opts struct {
+		RoutingKey string
+		Lock       bool
+	}) (string, error) {
+		return expectedHash, nil
+	}}
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = cache
+	flags.StagedWritePath = stageDir
+	fs := newUnitFS(flags)
+	identity := lazyReadIdentity{path: "model.bin", objectPath: "model.bin", etag: "etag-v1", size: uint64(len(payload))}
+	if !fs.claimLazyRead(identity) {
+		t.Fatal("failed to reserve lazy read claim")
+	}
+	atomic.AddInt64(&fs.activeCacheEvents, 1)
+
+	processorDone := make(chan struct{})
+	go func() {
+		fs.processCacheEvents()
+		close(processorDone)
+	}()
+	close(fs.shutdownCh)
+	select {
+	case <-processorDone:
+		t.Fatal("cache processor exited before the precounted lazy event handoff")
+	case <-time.After(25 * time.Millisecond):
+	}
+	fs.cacheEventChan <- cacheEvent{
+		path:             identity.path,
+		size:             identity.size,
+		hash:             expectedHash,
+		localSourcePath:  stagePath,
+		removeLocalAfter: true,
+		lazyReadIdentity: &identity,
+		skipCacheStatus:  true,
+		activeCounted:    true,
+	}
+	select {
+	case <-processorDone:
+	case <-time.After(time.Second):
+		t.Fatal("cache processor did not drain the precounted lazy event")
+	}
+	if active := atomic.LoadInt64(&fs.activeCacheEvents); active != 0 {
+		t.Fatalf("active cache events = %d, want 0", active)
+	}
+	fs.lazyReadClaimsMu.Lock()
+	reserved := fs.lazyReadStagedBytes
+	fs.lazyReadClaimsMu.Unlock()
+	if reserved != 0 {
+		t.Fatalf("reserved staged bytes = %d, want 0", reserved)
+	}
+	if _, err := os.Stat(stagePath); !os.IsNotExist(err) {
+		t.Fatalf("completed lazy stage was not removed: %v", err)
+	}
+}
+
+func TestLazyReadRevalidationMetadataIsPreserved(t *testing.T) {
+	payload := []byte("metadata-must-follow-revalidation")
+	sum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(sum[:])
+	stageDir := t.TempDir()
+	copyCalls := make(chan *CopyBlobInput, 1)
+	var headCalls atomic.Int32
+	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+		copyCalls <- param
+		return &CopyBlobOutput{}, nil
+	})
+	backend.HeadBlobFunc = func(param *HeadBlobInput) (*HeadBlobOutput, error) {
+		metadataValue := "before-read"
+		if headCalls.Add(1) > 1 {
+			metadataValue = "at-revalidation"
+		}
+		etag := "etag-v1"
+		return &HeadBlobOutput{BlobItemOutput: BlobItemOutput{
+			Key:      &param.Key,
+			ETag:     &etag,
+			Size:     uint64(len(payload)),
+			Metadata: map[string]*string{"user-note": &metadataValue},
+		}}, nil
+	}
+	cache := &fakeContentCache{storeLocalPath: func(source struct {
+		Path      string
+		CachePath string
+	}, opts struct {
+		RoutingKey string
+		Lock       bool
+	}) (string, error) {
+		return expectedHash, nil
+	}}
+	fs, _, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	defer close(fs.shutdownCh)
+	defer fh.Release()
+	go fs.processCacheEvents()
+
+	if _, _, cleanup, err := fh.ReadFileWithCallback(0, int64(len(payload))); err != nil {
+		t.Fatal(err)
+	} else if cleanup != nil {
+		cleanup()
+	}
+	var copied *CopyBlobInput
+	select {
+	case copied = <-copyCalls:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for revalidated metadata publish")
+	}
+	if copied.Metadata == nil || copied.Metadata["user-note"] == nil || *copied.Metadata["user-note"] != "at-revalidation" {
+		t.Fatalf("metadata publish restored a stale snapshot: %+v", copied.Metadata)
+	}
+	if copied.Metadata[fs.flags.HashAttr] == nil || *copied.Metadata[fs.flags.HashAttr] != expectedHash {
+		t.Fatalf("metadata publish omitted hash: %+v", copied.Metadata)
 	}
 	assertLazyReadStageDirEmpty(t, stageDir)
 }
