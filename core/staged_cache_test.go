@@ -1501,12 +1501,16 @@ func TestExternalCacheShortStreamFallsBackWithoutZeroPadding(t *testing.T) {
 	fs := newUnitFS(flags)
 	inode := NewInode(fs, nil, "file")
 	inode.Attributes.Size = uint64(len(want))
+	inode.knownETag = "etag-v1"
 	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
 	inode.readCond = sync.NewCond(&inode.mu)
 	backend := &TestBackend{}
 	var getBlobCalls int32
 	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
 		atomic.AddInt32(&getBlobCalls, 1)
+		if param.IfMatch == nil || *param.IfMatch != "etag-v1" {
+			t.Fatalf("fallback origin read If-Match = %v, want etag-v1", param.IfMatch)
+		}
 		return &GetBlobOutput{
 			Body: io.NopCloser(bytes.NewReader(want[param.Start : param.Start+param.Count])),
 			HeadBlobOutput: HeadBlobOutput{
@@ -2747,6 +2751,68 @@ func TestWaitForFlushWaitsForExternalCachePublish(t *testing.T) {
 	case <-waitDone:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for WaitForFlush")
+	}
+}
+
+func TestOrdinaryCacheProducerCallbackCanShutdown(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = "sha256"
+	flags.ExternalCacheClient = &fakeContentCache{}
+	var fs *Goofys
+	callbackDone := make(chan struct{})
+	flags.EventCallback = func(event cfg.EventType, data map[string]interface{}) {
+		fs.Shutdown()
+		close(callbackDone)
+	}
+	fs = newUnitFS(flags)
+	inode := NewInode(fs, nil, "model.bin")
+	inode.Attributes.Size = 4
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+
+	if fs.CacheFileInExternalCacheFromSource(inode, "", false) {
+		t.Fatal("cache event was accepted after callback initiated shutdown")
+	}
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("cache-trigger callback deadlocked during shutdown")
+	}
+	if queued := len(fs.cacheEventChan); queued != 0 {
+		t.Fatalf("cache events queued after shutdown = %d, want 0", queued)
+	}
+	fs.cachingStatusMu.Lock()
+	statusCount := len(fs.cachingStatus)
+	fs.cachingStatusMu.Unlock()
+	if statusCount != 0 {
+		t.Fatalf("cache reservations retained after rejected submission = %d", statusCount)
+	}
+}
+
+func TestOrdinaryCacheProducerRejectedAfterConsumerShutdown(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = "sha256"
+	flags.ExternalCacheClient = &fakeContentCache{}
+	fs := newUnitFS(flags)
+	processorDone := make(chan struct{})
+	go func() {
+		fs.processCacheEvents()
+		close(processorDone)
+	}()
+	fs.Shutdown()
+	select {
+	case <-processorDone:
+	case <-time.After(time.Second):
+		t.Fatal("cache event consumer did not exit")
+	}
+
+	inode := NewInode(fs, nil, "model.bin")
+	inode.Attributes.Size = 4
+	inode.userMetadata = map[string][]byte{flags.HashAttr: []byte("hash")}
+	if fs.CacheFileInExternalCacheFromSource(inode, "", false) {
+		t.Fatal("ordinary producer queued after cache event consumer exited")
+	}
+	if queued := len(fs.cacheEventChan); queued != 0 {
+		t.Fatalf("cache events stranded after consumer exit = %d, want 0", queued)
 	}
 }
 

@@ -153,11 +153,12 @@ type Goofys struct {
 
 	NotifyCallback func(notifications []interface{})
 
-	cacheEventChan    chan cacheEvent
-	cacheEventDone    chan struct{}
-	cachingStatus     map[string]bool
-	cachingStatusMu   sync.Mutex
-	activeCacheEvents int64
+	cacheEventChan     chan cacheEvent
+	cacheEventDone     chan struct{}
+	cacheEventSubmitMu sync.Mutex
+	cachingStatus      map[string]bool
+	cachingStatusMu    sync.Mutex
+	activeCacheEvents  int64
 
 	externalPageMmapCache   *externalPageMmapCache
 	externalPageMmapCacheMu sync.Mutex
@@ -547,6 +548,23 @@ func (fs *Goofys) completeActiveCacheEvent() {
 	}
 }
 
+// submitCacheEvent serializes producers with Shutdown. An event is either
+// visible to the consumer before shutdown begins or rejected after shutdown;
+// no producer can enqueue after the consumer has observed shutdown and exited.
+func (fs *Goofys) submitCacheEvent(event cacheEvent) bool {
+	fs.cacheEventSubmitMu.Lock()
+	defer fs.cacheEventSubmitMu.Unlock()
+	if atomic.LoadInt32(&fs.shutdown) != 0 {
+		return false
+	}
+	select {
+	case fs.cacheEventChan <- event:
+		return true
+	default:
+		return false
+	}
+}
+
 func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 	started := time.Now()
 	if !cacheEvent.activeCounted {
@@ -741,16 +759,14 @@ func (fs *Goofys) CacheFileInExternalCacheFromObjectLocked(inode *Inode) bool {
 	}
 
 	log.Debugf("Submitting cache event for file: %v", inode.FullName())
-	select {
-	case fs.cacheEventChan <- event:
+	if fs.submitCacheEvent(event) {
 		atomic.AddInt64(&fs.stats.cacheEventsQueued, 1)
 		return true
-	default:
-		log.Warnf("External cache event queue is full, skipping cache for %v", inode.FullName())
-		atomic.AddInt64(&fs.stats.cacheEventsDropped, 1)
-		fs.clearCachingStatus(hashString)
-		return false
 	}
+	log.Warnf("External cache event queue is unavailable, skipping cache for %v", inode.FullName())
+	atomic.AddInt64(&fs.stats.cacheEventsDropped, 1)
+	fs.clearCachingStatus(hashString)
+	return false
 }
 
 func (fs *Goofys) cacheFileInExternalCache(inode *Inode, localSourcePath string, removeLocalAfter bool, fromBuffers bool) bool {
@@ -782,16 +798,14 @@ func (fs *Goofys) cacheFileInExternalCache(inode *Inode, localSourcePath string,
 
 	// Submit cache event
 	log.Debugf("Submitting cache event for file: %v", inode.FullName())
-	select {
-	case fs.cacheEventChan <- event:
+	if fs.submitCacheEvent(event) {
 		atomic.AddInt64(&fs.stats.cacheEventsQueued, 1)
 		return true
-	default:
-		log.Warnf("External cache event queue is full, skipping cache for %v", inode.FullName())
-		atomic.AddInt64(&fs.stats.cacheEventsDropped, 1)
-		fs.clearCachingStatus(hashString)
-		return false
 	}
+	log.Warnf("External cache event queue is unavailable, skipping cache for %v", inode.FullName())
+	atomic.AddInt64(&fs.stats.cacheEventsDropped, 1)
+	fs.clearCachingStatus(hashString)
+	return false
 }
 
 // LOCKS_REQUIRED(inode.mu)
@@ -1076,10 +1090,10 @@ func (fs *Goofys) clearCachingStatus(hash string) {
 }
 
 func (fs *Goofys) Shutdown() {
-	fs.lazyReadClaimsMu.Lock()
+	fs.cacheEventSubmitMu.Lock()
 	atomic.StoreInt32(&fs.shutdown, 1)
 	close(fs.shutdownCh)
-	fs.lazyReadClaimsMu.Unlock()
+	fs.cacheEventSubmitMu.Unlock()
 	fs.mu.RLock()
 	fileHandles := make([]*FileHandle, 0, len(fs.fileHandles))
 	for _, fh := range fs.fileHandles {
@@ -1989,16 +2003,14 @@ func (fs *Goofys) queueLocalFileForExternalCache(inode *Inode, localPath, hash s
 		localSourcePath:  localPath,
 		removeLocalAfter: true,
 	}
-	select {
-	case fs.cacheEventChan <- event:
+	if fs.submitCacheEvent(event) {
 		atomic.AddInt64(&fs.stats.cacheEventsQueued, 1)
 		return true
-	default:
-		log.Warnf("External cache event queue is full, skipping cache for %v", inode.FullName())
-		atomic.AddInt64(&fs.stats.cacheEventsDropped, 1)
-		fs.clearCachingStatus(hash)
-		return false
 	}
+	log.Warnf("External cache event queue is unavailable, skipping cache for %v", inode.FullName())
+	atomic.AddInt64(&fs.stats.cacheEventsDropped, 1)
+	fs.clearCachingStatus(hash)
+	return false
 }
 
 func hashLocalFile(file io.ReaderAt, size uint64) (string, error) {

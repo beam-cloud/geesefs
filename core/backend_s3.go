@@ -1102,7 +1102,7 @@ func (s *S3Backend) GetBlob(param *GetBlobInput) (*GetBlobOutput, error) {
 		}
 		get.Range = &bytes
 	}
-	// TODO handle IfMatch
+	get.IfMatch = param.IfMatch
 
 	req, resp := s.GetObjectRequest(&get)
 	err := req.Send()

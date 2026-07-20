@@ -3,6 +3,7 @@ package core
 import (
 	"crypto/md5"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -14,6 +15,42 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/yandex-cloud/geesefs/core/cfg"
 )
+
+func TestGetBlobSendsIfMatch(t *testing.T) {
+	wantETag := `"etag-v1"`
+	requestIfMatch := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestIfMatch <- r.Header.Get("If-Match")
+		w.Header().Set("ETag", wantETag)
+		_, _ = io.WriteString(w, "data")
+	}))
+	defer server.Close()
+
+	client := s3.New(session.Must(session.NewSession(aws.NewConfig().
+		WithCredentials(credentials.NewStaticCredentials("key", "secret", "")).
+		WithEndpoint(server.URL).
+		WithRegion("us-east-1").
+		WithS3ForcePathStyle(true).
+		WithMaxRetries(0))))
+	backend := &S3Backend{
+		S3:     client,
+		bucket: "bucket",
+		flags:  cfg.DefaultFlags(),
+		config: &cfg.S3Config{},
+	}
+
+	resp, err := backend.GetBlob(&GetBlobInput{Key: "model.bin", Count: 4, IfMatch: &wantETag})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-requestIfMatch; got != wantETag {
+		t.Fatalf("If-Match = %q, want %q", got, wantETag)
+	}
+}
 
 func TestShouldUseMultipartCopyAvoidsMetadataSelfCopy(t *testing.T) {
 	threshold := uint64(128 * 1024 * 1024)

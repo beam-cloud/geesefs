@@ -34,11 +34,13 @@ const lazyReadFallbackStageLimitBytes = 8 * 1024 * 1024 * 1024
 const lazyReadMaxFileBytes = uint64(1<<63 - 1)
 
 func (fs *Goofys) claimLazyRead(identity lazyReadIdentity) bool {
-	fs.lazyReadClaimsMu.Lock()
-	defer fs.lazyReadClaimsMu.Unlock()
+	fs.cacheEventSubmitMu.Lock()
+	defer fs.cacheEventSubmitMu.Unlock()
 	if atomic.LoadInt32(&fs.shutdown) != 0 {
 		return false
 	}
+	fs.lazyReadClaimsMu.Lock()
+	defer fs.lazyReadClaimsMu.Unlock()
 	if fs.lazyReadClaims == nil {
 		fs.lazyReadClaims = make(map[lazyReadIdentity]struct{})
 	}
@@ -275,12 +277,12 @@ func (fh *FileHandle) recordLazyRead(offset, requested uint64, data [][]byte, by
 	}
 	stage.file = nil
 	fs := fh.inode.fs
-	fs.lazyReadClaimsMu.Lock()
+	fs.cacheEventSubmitMu.Lock()
 	shuttingDown := atomic.LoadInt32(&fs.shutdown) != 0
 	if !shuttingDown {
 		atomic.AddInt64(&fs.activeCacheEvents, 1)
 	}
-	fs.lazyReadClaimsMu.Unlock()
+	fs.cacheEventSubmitMu.Unlock()
 	if shuttingDown {
 		fh.abandonLazyReadLocked("filesystem is shutting down", nil)
 		return
@@ -433,19 +435,7 @@ func (fs *Goofys) finishLazyReadStage(inode *Inode, stage *lazyReadStage) {
 		skipCacheStatus:  !reservedCacheStatus,
 		activeCounted:    true,
 	}
-	fs.lazyReadClaimsMu.Lock()
-	if atomic.LoadInt32(&fs.shutdown) != 0 {
-		fs.lazyReadClaimsMu.Unlock()
-		fs.clearCacheEventStatus(event)
-		return
-	}
-	queued := false
-	select {
-	case fs.cacheEventChan <- event:
-		queued = true
-	default:
-	}
-	fs.lazyReadClaimsMu.Unlock()
+	queued := fs.submitCacheEvent(event)
 	if queued {
 		removeLocal = false
 		releaseClaim = false
@@ -455,7 +445,7 @@ func (fs *Goofys) finishLazyReadStage(inode *Inode, stage *lazyReadStage) {
 	} else {
 		atomic.AddInt64(&fs.stats.cacheEventsDropped, 1)
 		fs.clearCacheEventStatus(event)
-		log.Warnf("geesefs lazy read cache event queue is full: path=%q hash=%q", event.path, event.hash)
+		log.Warnf("geesefs lazy read cache event queue is unavailable: path=%q hash=%q", event.path, event.hash)
 	}
 }
 

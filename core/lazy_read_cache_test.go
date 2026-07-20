@@ -822,6 +822,98 @@ func TestLazyReadRevalidationMetadataIsPreserved(t *testing.T) {
 	assertLazyReadStageDirEmpty(t, stageDir)
 }
 
+func TestLazyReadMutationFailsConditionalOriginReadWithoutPublishing(t *testing.T) {
+	firstVersion := []byte("version-one-model")
+	secondVersion := []byte("version-two-model")
+	stageDir := t.TempDir()
+	var version atomic.Int32
+	version.Store(1)
+	ifMatches := make(chan string, 2)
+	var stores atomic.Int32
+	var copies atomic.Int32
+	backend := &TestBackend{
+		HeadBlobFunc: func(param *HeadBlobInput) (*HeadBlobOutput, error) {
+			etag := "etag-v1"
+			if version.Load() == 2 {
+				etag = "etag-v2"
+			}
+			return &HeadBlobOutput{BlobItemOutput: BlobItemOutput{
+				Key: &param.Key, ETag: &etag, Size: uint64(len(firstVersion)), Metadata: map[string]*string{},
+			}}, nil
+		},
+		GetBlobFunc: func(param *GetBlobInput) (*GetBlobOutput, error) {
+			if param.IfMatch == nil {
+				ifMatches <- ""
+				return nil, errors.New("origin read omitted If-Match")
+			}
+			ifMatches <- *param.IfMatch
+			currentETag := "etag-v1"
+			payload := firstVersion
+			if version.Load() == 2 {
+				currentETag = "etag-v2"
+				payload = secondVersion
+			}
+			if *param.IfMatch != currentETag {
+				return nil, syscall.EBUSY
+			}
+			end := param.Start + param.Count
+			return &GetBlobOutput{
+				Body: io.NopCloser(bytes.NewReader(payload[param.Start:end])),
+				HeadBlobOutput: HeadBlobOutput{BlobItemOutput: BlobItemOutput{
+					Key: &param.Key, ETag: &currentETag, Size: param.Count, Metadata: map[string]*string{},
+				}},
+			}, nil
+		},
+		CopyBlobFunc: func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+			copies.Add(1)
+			return &CopyBlobOutput{}, nil
+		},
+	}
+	cache := &fakeContentCache{storeLocalPath: func(source struct {
+		Path      string
+		CachePath string
+	}, opts struct {
+		RoutingKey string
+		Lock       bool
+	}) (string, error) {
+		stores.Add(1)
+		return opts.RoutingKey, nil
+	}}
+	fs, _, fh := newLazyReadTestFile(t, firstVersion, stageDir, cache, backend)
+	defer close(fs.shutdownCh)
+	defer fh.Release()
+
+	split := len(firstVersion) / 2
+	if _, _, cleanup, err := fh.ReadFileWithCallback(0, int64(split)); err != nil {
+		t.Fatal(err)
+	} else if cleanup != nil {
+		cleanup()
+	}
+	version.Store(2)
+	if _, _, cleanup, err := fh.ReadFileWithCallback(int64(split), int64(len(firstVersion)-split)); !errors.Is(err, syscall.EBUSY) {
+		if cleanup != nil {
+			cleanup()
+		}
+		t.Fatalf("mutated origin read error = %v, want EBUSY", err)
+	} else if cleanup != nil {
+		cleanup()
+	}
+
+	if first, second := <-ifMatches, <-ifMatches; first != "etag-v1" || second != "etag-v1" {
+		t.Fatalf("conditional reads used %q and %q, want etag-v1", first, second)
+	}
+	if stores.Load() != 0 || copies.Load() != 0 {
+		t.Fatalf("mixed-version bytes reached publication: stores=%d copies=%d", stores.Load(), copies.Load())
+	}
+	fs.lazyReadClaimsMu.Lock()
+	reserved := fs.lazyReadStagedBytes
+	fs.lazyReadClaimsMu.Unlock()
+	if reserved != 0 {
+		t.Fatalf("reserved staged bytes = %d, want 0", reserved)
+	}
+	assertLazyReadStageDirEmpty(t, stageDir)
+}
+
 func TestLazyReadIdentityChangePreventsCacheAndMetadataPublish(t *testing.T) {
 	payload := []byte("stable-user-visible-bytes")
 	stageDir := t.TempDir()

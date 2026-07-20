@@ -831,12 +831,17 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	var (
 		hash      string
 		hashFound bool
+		ifMatch   *string
 	)
 	if inode.userMetadata != nil {
 		if hashValue, ok := inode.userMetadata[inode.fs.flags.HashAttr]; ok {
 			hash = string(hashValue)
 			hashFound = true
 		}
+	}
+	if inode.knownETag != "" {
+		knownETag := inode.knownETag
+		ifMatch = &knownETag
 	}
 	inode.mu.Unlock()
 
@@ -855,7 +860,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 			if err != nil {
 				var fallbackAlloc int64
 				var fallbackDone uint64
-				fallbackAlloc, fallbackDone, err = inode.sendRead(cloud, key, curOffset, curSize)
+				fallbackAlloc, fallbackDone, err = inode.sendRead(cloud, key, curOffset, curSize, ifMatch)
 				alloc += fallbackAlloc
 				done = fallbackDone
 				if fallbackDone > 0 {
@@ -867,7 +872,7 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 				}
 			}
 		} else {
-			alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize)
+			alloc, done, err = inode.sendRead(cloud, key, curOffset, curSize, ifMatch)
 		}
 
 		if err != nil && shouldRetry(err) {
@@ -896,16 +901,18 @@ func (inode *Inode) retryRead(cloud StorageBackend, key string, offset, size uin
 	}
 }
 
-func (inode *Inode) sendRead(cloud StorageBackend, key string, offset, size uint64) (allocated int64, totalDone uint64, err error) {
+func (inode *Inode) sendRead(cloud StorageBackend, key string, offset, size uint64, ifMatch *string) (allocated int64, totalDone uint64, err error) {
 	atomic.AddInt64(&inode.fs.stats.cloudReadRequests, 1)
 	resp, err := cloud.GetBlob(&GetBlobInput{
-		Key:   key,
-		Start: offset,
-		Count: size,
+		Key:     key,
+		Start:   offset,
+		Count:   size,
+		IfMatch: ifMatch,
 	})
 	if err != nil {
 		return 0, 0, err
 	}
+	defer resp.Body.Close()
 
 	for size > 0 {
 		// Read the result in smaller parts so parallelism can be utilized better
