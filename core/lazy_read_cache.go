@@ -421,11 +421,6 @@ func (fs *Goofys) finishLazyReadStage(inode *Inode, stage *lazyReadStage) {
 		return
 	}
 
-	fs.lazyReadClaimsMu.Lock()
-	if atomic.LoadInt32(&fs.shutdown) != 0 {
-		fs.lazyReadClaimsMu.Unlock()
-		return
-	}
 	reservedCacheStatus := fs.reserveExternalCacheStore(inode, hashString)
 	event := cacheEvent{
 		path:             stage.identity.path,
@@ -437,6 +432,12 @@ func (fs *Goofys) finishLazyReadStage(inode *Inode, stage *lazyReadStage) {
 		lazyReadIdentity: &stage.identity,
 		skipCacheStatus:  !reservedCacheStatus,
 		activeCounted:    true,
+	}
+	fs.lazyReadClaimsMu.Lock()
+	if atomic.LoadInt32(&fs.shutdown) != 0 {
+		fs.lazyReadClaimsMu.Unlock()
+		fs.clearCacheEventStatus(event)
+		return
 	}
 	queued := false
 	select {

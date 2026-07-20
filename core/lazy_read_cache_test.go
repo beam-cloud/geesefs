@@ -733,6 +733,37 @@ func TestLazyReadShutdownDrainsPrecountedCacheEvent(t *testing.T) {
 	}
 }
 
+func TestLazyReadCacheTriggerCallbackCanShutdown(t *testing.T) {
+	payload := []byte("callback-shutdown")
+	stageDir := t.TempDir()
+	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+		return &CopyBlobOutput{}, nil
+	})
+	cache := &fakeContentCache{}
+	fs, _, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	defer fh.Release()
+	callbackDone := make(chan struct{})
+	fs.flags.EventCallback = func(event cfg.EventType, data map[string]interface{}) {
+		fs.Shutdown()
+		close(callbackDone)
+	}
+
+	if _, _, cleanup, err := fh.ReadFileWithCallback(0, int64(len(payload))); err != nil {
+		t.Fatal(err)
+	} else if cleanup != nil {
+		cleanup()
+	}
+	select {
+	case <-callbackDone:
+	case <-time.After(time.Second):
+		t.Fatal("cache-trigger callback deadlocked during shutdown")
+	}
+	waitForLazyReadCondition(t, time.Second, func() bool {
+		return atomic.LoadInt64(&fs.activeCacheEvents) == 0
+	}, "lazy cache finish remained active after callback shutdown")
+	assertLazyReadStageDirEmpty(t, stageDir)
+}
+
 func TestLazyReadRevalidationMetadataIsPreserved(t *testing.T) {
 	payload := []byte("metadata-must-follow-revalidation")
 	sum := sha256.Sum256(payload)
