@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/jacobsa/fuse/fuseops"
+	"github.com/sirupsen/logrus"
 	"github.com/yandex-cloud/geesefs/core/cfg"
 )
 
@@ -163,6 +165,21 @@ func newRootWithBackend(fs *Goofys, backend StorageBackend) *Inode {
 	return root
 }
 
+func captureMainLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+
+	output := &bytes.Buffer{}
+	originalOutput := log.Out
+	originalLevel := log.Level
+	log.SetOutput(output)
+	log.SetLevel(logrus.DebugLevel)
+	t.Cleanup(func() {
+		log.SetOutput(originalOutput)
+		log.SetLevel(originalLevel)
+	})
+	return output
+}
+
 func newNoSuchUploadError() error {
 	return awserr.NewRequestFailure(
 		awserr.New("NoSuchUpload", "The specified upload does not exist", nil),
@@ -234,6 +251,210 @@ func TestProcessCacheEventRetriesTransientExternalCacheStoreError(t *testing.T) 
 	}
 	if got := atomic.LoadInt64(&fs.stats.cacheEventsErrors); got != 0 {
 		t.Fatalf("expected no final cache event errors, got %d", got)
+	}
+}
+
+func TestProcessCacheEventDoesNotRetrySupersededObjectSource(t *testing.T) {
+	const path = "volumes/volume/ComfyUI/user/comfyui.db-journal"
+	expectedHash := strings.Repeat("a", 64)
+	actualHash := strings.Repeat("b", 64)
+	var attempts int32
+	var published int32
+
+	flags := cfg.DefaultFlags()
+	flags.Backend = (&cfg.S3Config{}).Init()
+	flags.EventCallback = func(event cfg.EventType, data map[string]interface{}) {
+		if event == cfg.EventCacheTriggered {
+			atomic.AddInt32(&published, 1)
+		}
+	}
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeFromS3: func(source struct {
+			Path        string
+			BucketName  string
+			Region      string
+			EndpointURL string
+			AccessKey   string
+			SecretKey   string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			atomic.AddInt32(&attempts, 1)
+			return actualHash, nil
+		},
+	}
+	fs := newUnitFS(flags)
+	fs.cachingStatus[expectedHash] = true
+	logOutput := captureMainLog(t)
+
+	fs.processCacheEvent(cacheEvent{path: path, hash: expectedHash, size: 1778176})
+
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("superseded object source attempts = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsMismatch); got != 1 {
+		t.Fatalf("cache mismatch count = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsSuccess); got != 0 {
+		t.Fatalf("cache success count = %d, want 0", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsErrors); got != 0 {
+		t.Fatalf("cache error count = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&published); got != 0 {
+		t.Fatalf("published cache events = %d, want 0", got)
+	}
+	fs.cachingStatusMu.Lock()
+	stillReserved := fs.cachingStatus[expectedHash]
+	fs.cachingStatusMu.Unlock()
+	if stillReserved {
+		t.Fatal("superseded cache event retained its reservation")
+	}
+	if got := logOutput.String(); !strings.Contains(got, "status=superseded") || strings.Contains(got, "status=hash_mismatch") {
+		t.Fatalf("unexpected superseded object-source log: %q", got)
+	}
+}
+
+func TestProcessCacheEventDoesNotRetryEmptyObjectSourceHash(t *testing.T) {
+	expectedHash := strings.Repeat("f", 64)
+	var attempts int32
+	flags := cfg.DefaultFlags()
+	flags.Backend = (&cfg.S3Config{}).Init()
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeFromS3: func(source struct {
+			Path        string
+			BucketName  string
+			Region      string
+			EndpointURL string
+			AccessKey   string
+			SecretKey   string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			atomic.AddInt32(&attempts, 1)
+			return "", nil
+		},
+	}
+	fs := newUnitFS(flags)
+	logOutput := captureMainLog(t)
+	originalDelay := externalCacheStoreRetryDelay
+	externalCacheStoreRetryDelay = func(int) time.Duration { return 0 }
+	defer func() { externalCacheStoreRetryDelay = originalDelay }()
+
+	fs.processCacheEvent(cacheEvent{
+		path: "volumes/volume/ComfyUI/user/comfyui.db-journal",
+		hash: expectedHash,
+		size: 1778176,
+	})
+
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("empty object-source hash attempts = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsMismatch); got != 1 {
+		t.Fatalf("cache mismatch count = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsSuccess); got != 0 {
+		t.Fatalf("cache success count = %d, want 0", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsErrors); got != 0 {
+		t.Fatalf("cache error count = %d, want 0", got)
+	}
+	if got := logOutput.String(); !strings.Contains(got, "status=superseded") || !strings.Contains(got, `actual=""`) {
+		t.Fatalf("unexpected empty object-source hash log: %q", got)
+	}
+}
+
+func TestProcessCacheEventRetriesObjectSourceTransportError(t *testing.T) {
+	expectedHash := strings.Repeat("c", 64)
+	var attempts int32
+	flags := cfg.DefaultFlags()
+	flags.Backend = (&cfg.S3Config{}).Init()
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeFromS3: func(source struct {
+			Path        string
+			BucketName  string
+			Region      string
+			EndpointURL string
+			AccessKey   string
+			SecretKey   string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			attempt := atomic.AddInt32(&attempts, 1)
+			if attempt < 3 {
+				return "", errors.New("transient cache transport error")
+			}
+			return expectedHash, nil
+		},
+	}
+	fs := newUnitFS(flags)
+	originalDelay := externalCacheStoreRetryDelay
+	externalCacheStoreRetryDelay = func(int) time.Duration { return 0 }
+	defer func() { externalCacheStoreRetryDelay = originalDelay }()
+
+	fs.processCacheEvent(cacheEvent{path: "volumes/volume/model.bin", hash: expectedHash, size: 1})
+
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("object-source transport attempts = %d, want 3", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsSuccess); got != 1 {
+		t.Fatalf("cache success count = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsErrors); got != 0 {
+		t.Fatalf("cache error count = %d, want 0", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsMismatch); got != 0 {
+		t.Fatalf("cache mismatch count = %d, want 0", got)
+	}
+}
+
+func TestProcessCacheEventKeepsImmutableLocalMismatchLoud(t *testing.T) {
+	expectedHash := strings.Repeat("d", 64)
+	actualHash := strings.Repeat("e", 64)
+	var attempts int32
+	flags := cfg.DefaultFlags()
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeLocalPath: func(source struct {
+			Path      string
+			CachePath string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			atomic.AddInt32(&attempts, 1)
+			return actualHash, nil
+		},
+	}
+	fs := newUnitFS(flags)
+	logOutput := captureMainLog(t)
+	originalDelay := externalCacheStoreRetryDelay
+	externalCacheStoreRetryDelay = func(int) time.Duration { return 0 }
+	defer func() { externalCacheStoreRetryDelay = originalDelay }()
+
+	fs.processCacheEvent(cacheEvent{
+		path:            "volumes/volume/model.bin",
+		hash:            expectedHash,
+		size:            1,
+		localSourcePath: "/immutable/staged/model.bin",
+	})
+
+	if got := atomic.LoadInt32(&attempts); got != externalCacheStoreAttempts {
+		t.Fatalf("immutable local mismatch attempts = %d, want %d", got, externalCacheStoreAttempts)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsMismatch); got != 1 {
+		t.Fatalf("cache mismatch count = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsSuccess); got != 0 {
+		t.Fatalf("cache success count = %d, want 0", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsErrors); got != 0 {
+		t.Fatalf("cache error count = %d, want 0", got)
+	}
+	if got := logOutput.String(); !strings.Contains(got, "status=hash_mismatch") || strings.Contains(got, "status=superseded") {
+		t.Fatalf("unexpected immutable local-source log: %q", got)
 	}
 }
 

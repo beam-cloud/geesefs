@@ -619,12 +619,23 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 
 	if cacheEvent.size > 0 {
 		var (
-			hash string
-			err  error
+			hash       string
+			err        error
+			superseded bool
 		)
 		for attempt := 1; attempt <= externalCacheStoreAttempts; attempt++ {
 			hash, err = fs.storeCacheEventContent(cacheEvent)
 			if err == nil && hash == cacheEvent.hash {
+				break
+			}
+			// Object-source fills race mutable keys by design: a different or
+			// missing returned content hash means this queued generation has been
+			// superseded. Re-reading the same key cannot safely populate the
+			// expected hash, so leave retries to transport errors. Local and
+			// read-buffer sources are immutable for the lifetime of an event;
+			// keep retrying and report their mismatches as invariant failures.
+			if err == nil && hash != cacheEvent.hash && source == "s3" {
+				superseded = true
 				break
 			}
 			if attempt == externalCacheStoreAttempts {
@@ -643,7 +654,11 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 			log.Warnf("geesefs external cache store result: status=error path=%q hash=%q source=%s size=%d elapsed=%s err=%v", cacheEvent.path, cacheEvent.hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond), err)
 		} else if hash != cacheEvent.hash {
 			atomic.AddInt64(&fs.stats.cacheEventsMismatch, 1)
-			log.Warnf("geesefs external cache store result: status=hash_mismatch path=%q expected=%q actual=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
+			if superseded {
+				log.Debugf("geesefs external cache store result: status=superseded path=%q expected=%q actual=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
+			} else {
+				log.Warnf("geesefs external cache store result: status=hash_mismatch path=%q expected=%q actual=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
+			}
 		} else if hash == cacheEvent.hash {
 			atomic.AddInt64(&fs.stats.cacheEventsSuccess, 1)
 			log.Debugf("geesefs external cache store result: status=ok path=%q hash=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
