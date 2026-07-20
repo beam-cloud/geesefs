@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -406,9 +407,9 @@ func TestExternalCacheFDPrefetchFailedHintIsNotCountedAsSuccess(t *testing.T) {
 	}
 }
 
-func TestExternalCacheFDPrefetchKeepsOneAlignedWindowAhead(t *testing.T) {
+func TestExternalCacheFDPrefetchKeepsTwoAlignedWindowsAhead(t *testing.T) {
 	const window = int64(externalPageMmapWindowBytes)
-	fileSize := uint64(3 * window)
+	fileSize := uint64(4 * window)
 	pagePath := filepath.Join(t.TempDir(), "page")
 	if err := os.WriteFile(pagePath, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -421,8 +422,11 @@ func TestExternalCacheFDPrefetchKeepsOneAlignedWindowAhead(t *testing.T) {
 		offset int64
 		length int64
 	}
-	started := make(chan request, 2)
+	started := make(chan request, 4)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	defer closeRelease()
 	cache := &fakeContentCache{
 		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
 			started <- request{offset: offset, length: length}
@@ -436,13 +440,21 @@ func TestExternalCacheFDPrefetchKeepsOneAlignedWindowAhead(t *testing.T) {
 	pageCache := cfg.ContentCacheClientLocalPageFileViews(cache)
 
 	fh.scheduleExternalPagePrefetch("hash", 0, fileSize, pageCache, nil)
-	select {
-	case got := <-started:
-		if got.offset != 0 || got.length != window {
-			t.Fatalf("initial FD lookahead=%+v, want offset=0 length=%d", got, window)
+	wantInitial := map[int64]int64{0: window, window: window}
+	for len(wantInitial) > 0 {
+		select {
+		case got := <-started:
+			wantLength, ok := wantInitial[got.offset]
+			if !ok || got.length != wantLength {
+				t.Fatalf("unexpected initial FD lookahead: %+v", got)
+			}
+			delete(wantInitial, got.offset)
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for %d initial FD lookahead windows", len(wantInitial))
 		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for initial FD lookahead")
+	}
+	for i := 0; i < 32; i++ {
+		fh.scheduleExternalPagePrefetch("hash", 0, fileSize, pageCache, nil)
 	}
 	cacheState := fs.externalPageCache()
 	cacheState.mu.Lock()
@@ -450,16 +462,21 @@ func TestExternalCacheFDPrefetchKeepsOneAlignedWindowAhead(t *testing.T) {
 	queued := len(cacheState.prefetchQueue)
 	inflight := len(cacheState.prefetching)
 	cacheState.mu.Unlock()
-	if active != 1 || queued != 0 || inflight != 1 {
+	if active != 2 || queued != 0 || inflight != 2 {
 		t.Fatalf("FD lookahead flooded scheduler: active=%d queued=%d inflight=%d", active, queued, inflight)
+	}
+	select {
+	case got := <-started:
+		t.Fatalf("repeated FD lookahead scheduled an extra window: %+v", got)
+	default:
 	}
 	fh.externalPrefetchMu.Lock()
 	next := fh.externalPrefetchNext
 	fh.externalPrefetchMu.Unlock()
-	if next != uint64(window) {
-		t.Fatalf("initial FD lookahead frontier=%d, want %d", next, window)
+	if next != uint64(2*window) {
+		t.Fatalf("initial FD lookahead frontier=%d, want %d", next, 2*window)
 	}
-	release <- struct{}{}
+	closeRelease()
 	waitForExternalPageCondition(t, 2*time.Second, func() bool {
 		cacheState.mu.Lock()
 		defer cacheState.mu.Unlock()
@@ -469,8 +486,8 @@ func TestExternalCacheFDPrefetchKeepsOneAlignedWindowAhead(t *testing.T) {
 	fh.scheduleExternalPagePrefetch("hash", uint64(window), fileSize, pageCache, nil)
 	select {
 	case got := <-started:
-		if got.offset != window || got.length != window {
-			t.Fatalf("advanced FD lookahead=%+v, want offset=%d length=%d", got, window, window)
+		if got.offset != 2*window || got.length != window {
+			t.Fatalf("advanced FD lookahead=%+v, want offset=%d length=%d", got, 2*window, window)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for advanced FD lookahead")
@@ -478,13 +495,17 @@ func TestExternalCacheFDPrefetchKeepsOneAlignedWindowAhead(t *testing.T) {
 	fh.externalPrefetchMu.Lock()
 	next = fh.externalPrefetchNext
 	fh.externalPrefetchMu.Unlock()
-	if next != uint64(2*window) {
-		t.Fatalf("advanced FD lookahead frontier=%d, want %d", next, 2*window)
+	if next != uint64(3*window) {
+		t.Fatalf("advanced FD lookahead frontier=%d, want %d", next, 3*window)
 	}
-	release <- struct{}{}
 	waitForExternalPageCondition(t, 2*time.Second, func() bool {
 		cacheState.mu.Lock()
 		defer cacheState.mu.Unlock()
 		return cacheState.prefetchActive == 0
 	}, "advanced FD lookahead to finish")
+	select {
+	case got := <-started:
+		t.Fatalf("advanced FD lookahead scheduled beyond its two-window horizon: %+v", got)
+	default:
+	}
 }
