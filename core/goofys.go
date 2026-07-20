@@ -626,13 +626,16 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 		} else if hash == cacheEvent.hash {
 			atomic.AddInt64(&fs.stats.cacheEventsSuccess, 1)
 			log.Debugf("geesefs external cache store result: status=ok path=%q hash=%q source=%s size=%d elapsed=%s", cacheEvent.path, cacheEvent.hash, source, cacheEvent.size, time.Since(started).Truncate(time.Millisecond))
-			fs.emitExternalCacheStoredEvent(cacheEvent, source)
 			if cacheEvent.inode != nil {
 				if cacheEvent.lazyReadIdentity != nil {
 					cacheEvent.inode.publishLazyReadHash(*cacheEvent.lazyReadIdentity, cacheEvent.hash)
 				}
 				cacheEvent.inode.dropCleanBuffersAfterExternalCacheStore(cacheEvent.hash)
 			}
+			// For lazy read-through, publish the identity mapping before reporting
+			// the content as ready. The cache event remains active while a durable
+			// registry store is blocked, so WaitForFlush cannot race this handoff.
+			fs.emitExternalCacheStoredEvent(cacheEvent, source)
 		}
 
 		fs.clearCacheEventStatus(cacheEvent)

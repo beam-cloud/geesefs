@@ -1097,6 +1097,13 @@ func (fh *FileHandle) retrieveHashMetadata() {
 	fh.inode.mu.Unlock()
 	head, err := cloud.HeadBlob(&HeadBlobInput{Key: path})
 	if err == nil {
+		registryHash := ""
+		remoteMetadata := unescapeMetadata(head.Metadata)
+		if len(remoteMetadata[fh.inode.fs.flags.HashAttr]) == 0 && head.ETag != nil {
+			if hash, found := fh.inode.fs.lookupObjectContentHash(path, *head.ETag, head.Size); found {
+				registryHash = hash
+			}
+		}
 		fh.inode.mu.Lock()
 		currentCloud, currentPath := fh.inode.cloud()
 		cleanIdentity := currentCloud == cloud && currentPath == path &&
@@ -1115,6 +1122,13 @@ func (fh *FileHandle) retrieveHashMetadata() {
 		// is still the same clean object for which the HEAD was issued.
 		fh.inode.setFromBlobItemLocked(&head.BlobItemOutput)
 		fh.inode.setMetadata(head.Metadata)
+		if registryHash != "" {
+			if fh.inode.userMetadata == nil {
+				fh.inode.userMetadata = make(map[string][]byte)
+			}
+			fh.inode.userMetadata[fh.inode.fs.flags.HashAttr] = []byte(registryHash)
+			log.Debugf("geesefs object hash registry hit: path=%q etag=%q size=%d hash=%q", path, NilStr(head.ETag), head.Size, registryHash)
+		}
 		fh.inode.hashMetadataChecked = true
 		fh.inode.mu.Unlock()
 	} else {

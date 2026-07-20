@@ -4,6 +4,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -25,6 +26,11 @@ type lazyReadStoreCall struct {
 	routingKey string
 	lock       bool
 	content    []byte
+}
+
+type lazyReadRegistryCall struct {
+	identity cfg.ContentCacheObjectIdentity
+	hash     string
 }
 
 func newLazyReadTestFile(t *testing.T, payload []byte, stagedWritePath string, cache cfg.ContentCache, backend *TestBackend) (*Goofys, *Inode, *FileHandle) {
@@ -113,7 +119,7 @@ func TestLazyReadSequentiallyStoresLocalContentBeforePublishingHash(t *testing.T
 	expectedHash := hex.EncodeToString(sum[:])
 	stageDir := t.TempDir()
 	storeCalls := make(chan lazyReadStoreCall, 1)
-	copyCalls := make(chan *CopyBlobInput, 1)
+	registryCalls := make(chan lazyReadRegistryCall, 1)
 
 	cache := &fakeContentCache{storeLocalPath: func(source struct {
 		Path      string
@@ -134,11 +140,11 @@ func TestLazyReadSequentiallyStoresLocalContentBeforePublishingHash(t *testing.T
 			content:    content,
 		}
 		return expectedHash, nil
+	}, storeObjectContentHash: func(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error {
+		registryCalls <- lazyReadRegistryCall{identity: identity, hash: hash}
+		return nil
 	}}
-	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
-		copyCalls <- param
-		return &CopyBlobOutput{}, nil
-	})
+	backend := stableLazyReadBackend(payload, nil)
 	fs, inode, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
 	defer close(fs.shutdownCh)
 	defer fh.Release()
@@ -177,17 +183,18 @@ func TestLazyReadSequentiallyStoresLocalContentBeforePublishingHash(t *testing.T
 		t.Fatal("local cache store did not receive the foreground bytes")
 	}
 
-	var copied *CopyBlobInput
+	var published lazyReadRegistryCall
 	select {
-	case copied = <-copyCalls:
+	case published = <-registryCalls:
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for guarded hash metadata publish")
+		t.Fatal("timed out waiting for durable object hash publish")
 	}
-	if copied.ETag == nil || *copied.ETag != "etag-v1" || copied.Size == nil || *copied.Size != uint64(len(payload)) {
-		t.Fatalf("metadata publish was not guarded by the read identity: %+v", copied)
+	if published.identity.Bucket != "bucket" || published.identity.Path != "model.bin" ||
+		published.identity.ETag != "etag-v1" || published.identity.Size != uint64(len(payload)) {
+		t.Fatalf("registry publish was not pinned to the read identity: %+v", published)
 	}
-	if copied.Metadata == nil || copied.Metadata[fs.flags.HashAttr] == nil || *copied.Metadata[fs.flags.HashAttr] != expectedHash {
-		t.Fatalf("metadata publish did not contain the computed hash: %+v", copied.Metadata)
+	if published.hash != expectedHash {
+		t.Fatalf("registry publish hash = %q, want %q", published.hash, expectedHash)
 	}
 	waitForLazyReadCondition(t, time.Second, func() bool {
 		_, err := os.Stat(stored.path)
@@ -265,7 +272,7 @@ func TestLazyReadOutOfOrderOverlappingCompletionsPromote(t *testing.T) {
 	expectedHash := hex.EncodeToString(sum[:])
 	stageDir := t.TempDir()
 	storedContent := make(chan []byte, 1)
-	copyDone := make(chan struct{}, 1)
+	registryDone := make(chan struct{}, 1)
 	cache := &fakeContentCache{storeLocalPath: func(source struct {
 		Path      string
 		CachePath string
@@ -279,11 +286,11 @@ func TestLazyReadOutOfOrderOverlappingCompletionsPromote(t *testing.T) {
 		}
 		storedContent <- content
 		return expectedHash, nil
+	}, storeObjectContentHash: func(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error {
+		registryDone <- struct{}{}
+		return nil
 	}}
-	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
-		copyDone <- struct{}{}
-		return &CopyBlobOutput{}, nil
-	})
+	backend := stableLazyReadBackend(payload, nil)
 	fs, _, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
 	defer close(fs.shutdownCh)
 	defer fh.Release()
@@ -305,7 +312,7 @@ func TestLazyReadOutOfOrderOverlappingCompletionsPromote(t *testing.T) {
 		t.Fatal("timed out waiting for out-of-order lazy cache store")
 	}
 	select {
-	case <-copyDone:
+	case <-registryDone:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for out-of-order hash publish")
 	}
@@ -359,6 +366,178 @@ func TestRetrieveHashMetadataDiscardsHeadAfterRename(t *testing.T) {
 	if gotETag != "etag-v1" || gotHash != "" || checked {
 		t.Fatalf("stale HEAD mutated renamed inode: etag=%q hash=%q checked=%t", gotETag, gotHash, checked)
 	}
+}
+
+func TestRetrieveHashMetadataUsesDurableObjectHashRegistry(t *testing.T) {
+	payload := []byte("registry-hash-survives-a-remount")
+	sum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(sum[:])
+	stageDir := t.TempDir()
+	var lookups atomic.Int32
+	cache := &fakeContentCache{lookupObjectContentHash: func(ctx context.Context, identity cfg.ContentCacheObjectIdentity) (string, bool, error) {
+		lookups.Add(1)
+		if identity.Bucket != "bucket" || identity.Path != "model.bin" || identity.ETag != "etag-v1" || identity.Size != uint64(len(payload)) {
+			t.Fatalf("unexpected registry identity: %+v", identity)
+		}
+		return expectedHash, true, nil
+	}}
+	backend := stableLazyReadBackend(payload, nil)
+	fs, inode, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	defer close(fs.shutdownCh)
+	defer fh.Release()
+
+	fh.retrieveHashMetadata()
+
+	inode.mu.Lock()
+	gotHash := string(inode.userMetadata[fs.flags.HashAttr])
+	checked := inode.hashMetadataChecked
+	inode.mu.Unlock()
+	if gotHash != expectedHash || !checked {
+		t.Fatalf("registry hash was not installed: hash=%q checked=%t", gotHash, checked)
+	}
+	if lookups.Load() != 1 {
+		t.Fatalf("registry lookup count = %d, want 1", lookups.Load())
+	}
+}
+
+func TestLazyReadRegistryFailureNeverCopiesSourceObject(t *testing.T) {
+	payload := []byte("registry-failure-keeps-safe-local-fast-path")
+	sum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(sum[:])
+	stageDir := t.TempDir()
+	var copies atomic.Int32
+	cache := &fakeContentCache{
+		storeLocalPath: func(source struct {
+			Path      string
+			CachePath string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			return expectedHash, nil
+		},
+		storeObjectContentHash: func(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error {
+			return errors.New("registry unavailable")
+		},
+	}
+	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+		copies.Add(1)
+		return &CopyBlobOutput{}, nil
+	})
+	fs, inode, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	defer close(fs.shutdownCh)
+	defer fh.Release()
+	go fs.processCacheEvents()
+
+	if _, _, cleanup, err := fh.ReadFileWithCallback(0, int64(len(payload))); err != nil {
+		t.Fatal(err)
+	} else if cleanup != nil {
+		cleanup()
+	}
+	waitForLazyReadCondition(t, time.Second, func() bool {
+		inode.mu.Lock()
+		defer inode.mu.Unlock()
+		return string(inode.userMetadata[fs.flags.HashAttr]) == expectedHash
+	}, "lazy hash was not retained locally after registry failure")
+	if copies.Load() != 0 {
+		t.Fatalf("lazy registry fallback copied the source object %d times", copies.Load())
+	}
+	assertLazyReadStageDirEmpty(t, stageDir)
+}
+
+func TestLazyReadRegistryPublishDoesNotHideObjectAndBlocksReadiness(t *testing.T) {
+	payload := []byte("blocked-registry-publication")
+	sum := sha256.Sum256(payload)
+	expectedHash := hex.EncodeToString(sum[:])
+	stageDir := t.TempDir()
+	registryStarted := make(chan struct{})
+	releaseRegistry := make(chan struct{})
+	readyEvent := make(chan struct{}, 1)
+	var copies atomic.Int32
+	cache := &fakeContentCache{
+		storeLocalPath: func(source struct {
+			Path      string
+			CachePath string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			return expectedHash, nil
+		},
+		storeObjectContentHash: func(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error {
+			close(registryStarted)
+			<-releaseRegistry
+			return nil
+		},
+	}
+	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+		copies.Add(1)
+		return &CopyBlobOutput{}, nil
+	})
+	fs, inode, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	fs.flags.StagedWriteFlushTimeout = 2 * time.Second
+	fs.flags.EventCallback = func(event cfg.EventType, data map[string]interface{}) {
+		if _, stored := data["source"]; stored {
+			readyEvent <- struct{}{}
+		}
+	}
+	defer close(fs.shutdownCh)
+	defer fh.Release()
+	go fs.processCacheEvents()
+
+	if _, _, cleanup, err := fh.ReadFileWithCallback(0, int64(len(payload))); err != nil {
+		t.Fatal(err)
+	} else if cleanup != nil {
+		cleanup()
+	}
+	select {
+	case <-registryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blocked registry publication")
+	}
+	fs.mu.Lock()
+	inflightChanges := fs.inflightChanges["model.bin"]
+	fs.mu.Unlock()
+	if inflightChanges != 0 {
+		t.Fatalf("registry publication marked the source object as an in-flight change: %d", inflightChanges)
+	}
+	inode.mu.Lock()
+	gotHash := string(inode.userMetadata[fs.flags.HashAttr])
+	inode.mu.Unlock()
+	if gotHash != "" {
+		t.Fatalf("hash became visible before registry commit: %q", gotHash)
+	}
+	if copies.Load() != 0 {
+		t.Fatalf("blocked registry path invoked CopyBlob %d times", copies.Load())
+	}
+	select {
+	case <-readyEvent:
+		t.Fatal("cache readiness event fired before registry commit")
+	default:
+	}
+
+	flushDone := make(chan struct{})
+	go func() {
+		fs.WaitForFlush()
+		close(flushDone)
+	}()
+	select {
+	case <-flushDone:
+		t.Fatal("WaitForFlush returned before registry commit")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseRegistry)
+	select {
+	case <-readyEvent:
+	case <-time.After(time.Second):
+		t.Fatal("cache readiness event did not fire after registry commit")
+	}
+	select {
+	case <-flushDone:
+	case <-time.After(time.Second):
+		t.Fatal("WaitForFlush did not finish after registry commit")
+	}
+	assertLazyReadStageDirEmpty(t, stageDir)
 }
 
 func TestLazyReadStagedByteAdmissionReleasesOnAbandon(t *testing.T) {
@@ -482,7 +661,7 @@ func TestLazyReadConcurrentHandlesShareObjectIdentityClaim(t *testing.T) {
 	expectedHash := hex.EncodeToString(sum[:])
 	stageDir := t.TempDir()
 	var stores atomic.Int32
-	copyDone := make(chan struct{}, 1)
+	registryDone := make(chan struct{}, 1)
 	cache := &fakeContentCache{storeLocalPath: func(source struct {
 		Path      string
 		CachePath string
@@ -492,11 +671,11 @@ func TestLazyReadConcurrentHandlesShareObjectIdentityClaim(t *testing.T) {
 	}) (string, error) {
 		stores.Add(1)
 		return expectedHash, nil
+	}, storeObjectContentHash: func(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error {
+		registryDone <- struct{}{}
+		return nil
 	}}
-	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
-		copyDone <- struct{}{}
-		return &CopyBlobOutput{}, nil
-	})
+	backend := stableLazyReadBackend(payload, nil)
 	fs, inode, first := newLazyReadTestFile(t, payload, stageDir, cache, backend)
 	defer close(fs.shutdownCh)
 	defer first.Release()
@@ -532,7 +711,7 @@ func TestLazyReadConcurrentHandlesShareObjectIdentityClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-copyDone:
+	case <-registryDone:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for lazy metadata publish")
 	}
@@ -548,7 +727,7 @@ func TestLazyReadFinalBytesWithEOFStillPromote(t *testing.T) {
 	expectedHash := hex.EncodeToString(sum[:])
 	stageDir := t.TempDir()
 	storeDone := make(chan struct{}, 1)
-	copyDone := make(chan struct{}, 1)
+	registryDone := make(chan struct{}, 1)
 	cache := &fakeContentCache{storeLocalPath: func(source struct {
 		Path      string
 		CachePath string
@@ -558,11 +737,11 @@ func TestLazyReadFinalBytesWithEOFStillPromote(t *testing.T) {
 	}) (string, error) {
 		storeDone <- struct{}{}
 		return expectedHash, nil
+	}, storeObjectContentHash: func(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error {
+		registryDone <- struct{}{}
+		return nil
 	}}
-	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
-		copyDone <- struct{}{}
-		return &CopyBlobOutput{}, nil
-	})
+	backend := stableLazyReadBackend(payload, nil)
 	fs, _, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
 	defer close(fs.shutdownCh)
 	defer fh.Release()
@@ -576,7 +755,7 @@ func TestLazyReadFinalBytesWithEOFStillPromote(t *testing.T) {
 		t.Fatal("EOF final bytes did not populate the cache")
 	}
 	select {
-	case <-copyDone:
+	case <-registryDone:
 	case <-time.After(time.Second):
 		t.Fatal("EOF final bytes did not publish hash metadata")
 	}
@@ -590,12 +769,9 @@ func TestLazyReadFinishIsCountedUntilCacheEventCompletes(t *testing.T) {
 	stageDir := t.TempDir()
 	revalidationStarted := make(chan struct{})
 	releaseRevalidation := make(chan struct{})
-	copyDone := make(chan struct{}, 1)
+	registryDone := make(chan struct{}, 1)
 	var headCalls atomic.Int32
-	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
-		copyDone <- struct{}{}
-		return &CopyBlobOutput{}, nil
-	})
+	backend := stableLazyReadBackend(payload, nil)
 	backend.HeadBlobFunc = func(param *HeadBlobInput) (*HeadBlobOutput, error) {
 		if headCalls.Add(1) == 2 {
 			close(revalidationStarted)
@@ -614,6 +790,9 @@ func TestLazyReadFinishIsCountedUntilCacheEventCompletes(t *testing.T) {
 		Lock       bool
 	}) (string, error) {
 		return expectedHash, nil
+	}, storeObjectContentHash: func(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error {
+		registryDone <- struct{}{}
+		return nil
 	}}
 	fs, _, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
 	fs.flags.StagedWriteFlushTimeout = 3 * time.Second
@@ -649,7 +828,7 @@ func TestLazyReadFinishIsCountedUntilCacheEventCompletes(t *testing.T) {
 		t.Fatal("WaitForFlush did not observe lazy cache completion")
 	}
 	select {
-	case <-copyDone:
+	case <-registryDone:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for counted metadata publish")
 	}
@@ -769,12 +948,9 @@ func TestLazyReadRevalidationMetadataIsPreserved(t *testing.T) {
 	sum := sha256.Sum256(payload)
 	expectedHash := hex.EncodeToString(sum[:])
 	stageDir := t.TempDir()
-	copyCalls := make(chan *CopyBlobInput, 1)
+	registryDone := make(chan struct{}, 1)
 	var headCalls atomic.Int32
-	backend := stableLazyReadBackend(payload, func(param *CopyBlobInput) (*CopyBlobOutput, error) {
-		copyCalls <- param
-		return &CopyBlobOutput{}, nil
-	})
+	backend := stableLazyReadBackend(payload, nil)
 	backend.HeadBlobFunc = func(param *HeadBlobInput) (*HeadBlobOutput, error) {
 		metadataValue := "before-read"
 		if headCalls.Add(1) > 1 {
@@ -796,8 +972,11 @@ func TestLazyReadRevalidationMetadataIsPreserved(t *testing.T) {
 		Lock       bool
 	}) (string, error) {
 		return expectedHash, nil
+	}, storeObjectContentHash: func(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error {
+		registryDone <- struct{}{}
+		return nil
 	}}
-	fs, _, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
+	fs, inode, fh := newLazyReadTestFile(t, payload, stageDir, cache, backend)
 	defer close(fs.shutdownCh)
 	defer fh.Release()
 	go fs.processCacheEvents()
@@ -807,17 +986,25 @@ func TestLazyReadRevalidationMetadataIsPreserved(t *testing.T) {
 	} else if cleanup != nil {
 		cleanup()
 	}
-	var copied *CopyBlobInput
 	select {
-	case copied = <-copyCalls:
+	case <-registryDone:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for revalidated metadata publish")
 	}
-	if copied.Metadata == nil || copied.Metadata["user-note"] == nil || *copied.Metadata["user-note"] != "at-revalidation" {
-		t.Fatalf("metadata publish restored a stale snapshot: %+v", copied.Metadata)
+	waitForLazyReadCondition(t, time.Second, func() bool {
+		inode.mu.Lock()
+		defer inode.mu.Unlock()
+		return string(inode.userMetadata[fs.flags.HashAttr]) == expectedHash
+	}, "timed out waiting for local hash promotion")
+	inode.mu.Lock()
+	gotNote := string(inode.userMetadata["user-note"])
+	gotHash := string(inode.userMetadata[fs.flags.HashAttr])
+	inode.mu.Unlock()
+	if gotNote != "at-revalidation" {
+		t.Fatalf("local metadata restored a stale snapshot: note=%q", gotNote)
 	}
-	if copied.Metadata[fs.flags.HashAttr] == nil || *copied.Metadata[fs.flags.HashAttr] != expectedHash {
-		t.Fatalf("metadata publish omitted hash: %+v", copied.Metadata)
+	if gotHash != expectedHash {
+		t.Fatalf("local metadata hash = %q, want %q", gotHash, expectedHash)
 	}
 	assertLazyReadStageDirEmpty(t, stageDir)
 }

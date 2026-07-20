@@ -45,6 +45,8 @@ type fakeContentCache struct {
 		RoutingKey string
 		Lock       bool
 	}) (string, error)
+	lookupObjectContentHash  func(ctx context.Context, identity cfg.ContentCacheObjectIdentity) (string, bool, error)
+	storeObjectContentHash   func(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error
 	clientLocalPageFileViews func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error)
 	readContentInto          func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error)
 }
@@ -104,6 +106,20 @@ func (c *fakeContentCache) StoreContentFromLocalPath(source struct {
 	chunks := make(chan []byte)
 	close(chunks)
 	return c.StoreContent(chunks, opts.RoutingKey, struct{ RoutingKey string }{RoutingKey: opts.RoutingKey})
+}
+
+func (c *fakeContentCache) LookupObjectContentHash(ctx context.Context, identity cfg.ContentCacheObjectIdentity) (string, bool, error) {
+	if c.lookupObjectContentHash != nil {
+		return c.lookupObjectContentHash(ctx, identity)
+	}
+	return "", false, nil
+}
+
+func (c *fakeContentCache) StoreObjectContentHash(ctx context.Context, identity cfg.ContentCacheObjectIdentity, hash string) error {
+	if c.storeObjectContentHash != nil {
+		return c.storeObjectContentHash(ctx, identity, hash)
+	}
+	return nil
 }
 
 func (c *fakeContentCache) ClientLocalPageFileViews(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {

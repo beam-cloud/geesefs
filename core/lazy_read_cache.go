@@ -1,13 +1,16 @@
 package core
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/yandex-cloud/geesefs/core/cfg"
 )
@@ -32,6 +35,73 @@ type lazyReadStage struct {
 const lazyReadDefaultStageLimitBytes = 64 * 1024 * 1024 * 1024
 const lazyReadFallbackStageLimitBytes = 8 * 1024 * 1024 * 1024
 const lazyReadMaxFileBytes = uint64(1<<63 - 1)
+const lazyReadObjectHashRegistryTimeout = 3 * time.Second
+
+func validLazyReadContentHash(hash string) bool {
+	if len(hash) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(hash)
+	return err == nil
+}
+
+func (fs *Goofys) objectHashRegistry() (cfg.ContentCacheObjectHashRegistry, bool) {
+	if fs == nil || fs.flags == nil || fs.flags.ExternalCacheClient == nil {
+		return nil, false
+	}
+	registry, ok := fs.flags.ExternalCacheClient.(cfg.ContentCacheObjectHashRegistry)
+	return registry, ok
+}
+
+func (fs *Goofys) objectHashIdentity(path, etag string, size uint64) cfg.ContentCacheObjectIdentity {
+	canonicalETag := strings.TrimSpace(etag)
+	if len(canonicalETag) >= 2 && canonicalETag[0] == '"' && canonicalETag[len(canonicalETag)-1] == '"' {
+		canonicalETag = canonicalETag[1 : len(canonicalETag)-1]
+	}
+	return cfg.ContentCacheObjectIdentity{
+		Endpoint: fs.flags.Endpoint,
+		Bucket:   fs.bucket,
+		Path:     path,
+		ETag:     canonicalETag,
+		Size:     size,
+	}
+}
+
+func (fs *Goofys) lookupObjectContentHash(path, etag string, size uint64) (string, bool) {
+	registry, ok := fs.objectHashRegistry()
+	if !ok || path == "" || etag == "" || size == 0 {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), lazyReadObjectHashRegistryTimeout)
+	defer cancel()
+	hash, found, err := registry.LookupObjectContentHash(ctx, fs.objectHashIdentity(path, etag, size))
+	if err != nil {
+		log.Debugf("geesefs object hash registry lookup failed: path=%q etag=%q size=%d err=%v", path, etag, size, err)
+		return "", false
+	}
+	if !found {
+		return "", false
+	}
+	if !validLazyReadContentHash(hash) {
+		log.Warnf("geesefs object hash registry returned an invalid hash: path=%q etag=%q size=%d", path, etag, size)
+		return "", false
+	}
+	return hash, true
+}
+
+func (fs *Goofys) storeObjectContentHash(identity lazyReadIdentity, hash string) (bool, error) {
+	registry, ok := fs.objectHashRegistry()
+	if !ok {
+		return false, nil
+	}
+	if !validLazyReadContentHash(hash) {
+		return true, fmt.Errorf("invalid content hash %q", hash)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), lazyReadObjectHashRegistryTimeout)
+	defer cancel()
+	err := registry.StoreObjectContentHash(ctx, fs.objectHashIdentity(identity.objectPath, identity.etag, identity.size), hash)
+	return true, err
+}
 
 func (fs *Goofys) claimLazyRead(identity lazyReadIdentity) bool {
 	fs.cacheEventSubmitMu.Lock()
@@ -451,22 +521,46 @@ func (fs *Goofys) finishLazyReadStage(inode *Inode, stage *lazyReadStage) {
 
 func (inode *Inode) publishLazyReadHash(identity lazyReadIdentity, hashString string) bool {
 	inode.mu.Lock()
-	defer inode.mu.Unlock()
-
 	if !inode.matchesLazyReadIdentityLocked(identity) {
+		inode.mu.Unlock()
 		log.Debugf("geesefs lazy read metadata publish skipped after identity change: path=%q hash=%q", identity.path, hashString)
 		return false
 	}
-	if inode.userMetadata == nil {
-		inode.userMetadata = make(map[string][]byte)
+	if existing := string(inode.userMetadata[inode.fs.flags.HashAttr]); existing != "" {
+		inode.mu.Unlock()
+		return existing == hashString
 	}
+	fs := inode.fs
+	inode.mu.Unlock()
+
+	registryAvailable, registryErr := fs.storeObjectContentHash(identity, hashString)
+
+	inode.mu.Lock()
+	defer inode.mu.Unlock()
 	if existing := string(inode.userMetadata[inode.fs.flags.HashAttr]); existing != "" {
 		return existing == hashString
 	}
+	if !inode.matchesLazyReadIdentityLocked(identity) {
+		log.Debugf("geesefs lazy read metadata publish skipped after registry update because identity changed: path=%q hash=%q", identity.path, hashString)
+		return false
+	}
 
+	if inode.userMetadata == nil {
+		inode.userMetadata = make(map[string][]byte)
+	}
 	inode.userMetadata[inode.fs.flags.HashAttr] = []byte(hashString)
 	inode.hashMetadataChecked = true
-	inode.hashMetadataDirty = true
-	inode.sendHashUpdateMeta()
+	// The local inode is safe to promote even when the optional durable registry
+	// is unavailable: the hash was computed from bytes read under this exact
+	// object identity. Never use a metadata self-copy here; compatible backends
+	// may implement it as a multi-gigabyte transfer and temporarily hide the
+	// source object.
+	if registryErr != nil {
+		log.Warnf("geesefs lazy read object hash registry publish failed; keeping mount-local hash: path=%q etag=%q size=%d hash=%q err=%v", identity.path, identity.etag, identity.size, hashString, registryErr)
+	} else if registryAvailable {
+		log.Debugf("geesefs lazy read object hash registry publish complete: path=%q etag=%q size=%d hash=%q", identity.path, identity.etag, identity.size, hashString)
+	} else {
+		log.Debugf("geesefs lazy read object hash registry unavailable; keeping mount-local hash: path=%q etag=%q size=%d hash=%q", identity.path, identity.etag, identity.size, hashString)
+	}
 	return true
 }
