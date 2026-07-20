@@ -2,7 +2,9 @@
 
 package core
 
-func warmContentCacheRegion(path string, offset int64, length int) {}
+import "syscall"
+
+func warmContentCacheRegion(path string, offset int64, length int) error { return syscall.ENOTSUP }
 
 func adviseMappedContentCache(data []byte) {}
 

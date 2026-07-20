@@ -42,6 +42,7 @@ type FileHandle struct {
 	lastReadSizes           []uint64
 	lastReadIdx             int
 	externalPageHitLogCount uint64
+	externalFDLogCount      uint64
 	externalPrefetchMu      sync.Mutex
 	externalPrefetchHash    string
 	externalPrefetchNext    uint64

@@ -591,7 +591,12 @@ func (fs *GoofysFuse) ReadFile(
 		}
 	}()
 
-	op.Data, op.BytesRead, op.Callback, err = fh.ReadFileWithCallback(op.Offset, op.Size)
+	var fdRead *externalCacheFDRead
+	op.Data, op.BytesRead, fdRead, op.Callback, err = fh.readFileWithCallback(op.Offset, op.Size, fs.externalCacheFDReadsEnabled())
+	if err == nil && fdRead != nil {
+		op.FD = &fuseops.ReadFileFD{FD: fdRead.file.Fd(), Offset: fdRead.offset}
+	}
+	fdResponse := op.FD
 	handlerElapsed := time.Since(readStarted)
 	atomic.AddInt64(&fs.stats.readHandlerCount, 1)
 	atomic.AddInt64(&fs.stats.readHandlerNanos, handlerElapsed.Nanoseconds())
@@ -603,8 +608,28 @@ func (fs *GoofysFuse) ReadFile(
 		callback := op.Callback
 		bytesRead := op.BytesRead
 		responseStarted := time.Now()
+		var callbackFinished int32
 		op.Callback = func() {
+			if !atomic.CompareAndSwapInt32(&callbackFinished, 0, 1) {
+				return
+			}
 			responseElapsed := time.Since(responseStarted)
+			if fdResponse != nil {
+				switch fdResponse.Transfer {
+				case fuseops.ReadFileFDTransferSplice:
+					addExternalFDCounter(&fs.stats.externalFDRead.spliceTransfers, &fs.externalFDReadLifetime.spliceTransfers, 1)
+				case fuseops.ReadFileFDTransferPread:
+					addExternalFDCounter(&fs.stats.externalFDRead.preadTransfers, &fs.externalFDReadLifetime.preadTransfers, 1)
+				default:
+					addExternalFDCounter(&fs.stats.externalFDRead.unknownTransfers, &fs.externalFDReadLifetime.unknownTransfers, 1)
+				}
+				if fdResponse.BytesTransferred > 0 {
+					addExternalFDCounter(&fs.stats.externalFDRead.transferBytes, &fs.externalFDReadLifetime.transferBytes, int64(fdResponse.BytesTransferred))
+				}
+				if fdResponse.SpliceFallback != nil {
+					addExternalFDCounter(&fs.stats.externalFDRead.spliceFallbacks, &fs.externalFDReadLifetime.spliceFallbacks, 1)
+				}
+			}
 			callbackCount := atomic.AddInt64(&fs.stats.readCallbackCount, 1)
 			atomic.AddInt64(&fs.stats.readCallbackBytes, int64(bytesRead))
 			atomic.AddInt64(&fs.stats.readCallbackNanos, responseElapsed.Nanoseconds())
@@ -1132,6 +1157,7 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 		fuseMaxBackground       = 128
 		fuseCongestionThreshold = 96
 	)
+	fs.externalCacheFDReads = supportsExternalCacheFDReads(fs.flags.ExternalCacheClient)
 	mountCfg := &fuse.MountConfig{
 		FSName:                  fs.bucket,
 		Subtype:                 "geesefs",
@@ -1144,8 +1170,9 @@ func mountFuseFS(fs *Goofys) (mfs MountedFS, err error) {
 		EnableAsyncReads:        true,
 		MaxBackground:           fuseMaxBackground,
 		CongestionThreshold:     fuseCongestionThreshold,
+		EnableSpliceRead:        fs.externalCacheFDReads,
 	}
-	log.Debugf("geesefs fuse mount config: async_reads=%t vectored_read=%t max_background=%d congestion_threshold=%d keep_page_cache=external-cache-readonly-clean", mountCfg.EnableAsyncReads, mountCfg.UseVectoredRead, mountCfg.MaxBackground, mountCfg.CongestionThreshold)
+	log.Debugf("geesefs fuse mount config: async_reads=%t vectored_read=%t splice_read=%t max_background=%d congestion_threshold=%d keep_page_cache=external-cache-readonly-clean", mountCfg.EnableAsyncReads, mountCfg.UseVectoredRead, mountCfg.EnableSpliceRead, mountCfg.MaxBackground, mountCfg.CongestionThreshold)
 
 	if fs.flags.DebugFuse {
 		fuseLog := cfg.GetLogger("fuse")

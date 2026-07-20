@@ -3,26 +3,32 @@
 package core
 
 import (
+	"fmt"
 	"os"
 	"sync/atomic"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
 var externalPagePrefaultSink atomic.Uint32
 
-func warmContentCacheRegion(path string, offset int64, length int) {
+func warmContentCacheRegion(path string, offset int64, length int) error {
 	if path == "" || offset < 0 || length <= 0 {
-		return
+		return syscall.EINVAL
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return
+		return err
 	}
 	defer file.Close()
 
-	_ = unix.Fadvise(int(file.Fd()), offset, int64(length), unix.FADV_WILLNEED)
-	_, _, _ = unix.Syscall(unix.SYS_READAHEAD, file.Fd(), uintptr(offset), uintptr(length))
+	fadviseErr := unix.Fadvise(int(file.Fd()), offset, int64(length), unix.FADV_WILLNEED)
+	_, _, readaheadErr := unix.Syscall(unix.SYS_READAHEAD, file.Fd(), uintptr(offset), uintptr(length))
+	if fadviseErr == nil || readaheadErr == 0 {
+		return nil
+	}
+	return fmt.Errorf("fadvise failed: %v; readahead failed: %w", fadviseErr, readaheadErr)
 }
 
 func adviseMappedContentCache(data []byte) {

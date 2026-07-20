@@ -82,6 +82,21 @@ type externalPagePrefetchJob struct {
 	state         *externalPagePrefetchState
 	pageCache     cfg.ContentCacheClientLocalPageFileViews
 	readIntoCache cfg.ContentCacheReadInto
+	fdMode        bool
+}
+
+type externalCacheFDRead struct {
+	file   *os.File
+	offset int64
+}
+
+// externalCacheFDAfterOpenHook is nil in production. Tests use it to make
+// inode mutation between opening a page file and revalidation deterministic.
+var externalCacheFDAfterOpenHook func(*FileHandle)
+
+func addExternalFDCounter(interval, lifetime *int64, value int64) {
+	atomic.AddInt64(interval, value)
+	atomic.AddInt64(lifetime, value)
 }
 
 type externalPageMmapCache struct {
@@ -103,9 +118,14 @@ type externalPageMmapCache struct {
 }
 
 func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]byte, bytesRead int, callback func(), err error) {
+	data, bytesRead, _, callback, err = fh.readFileWithCallback(sOffset, sLen, false)
+	return
+}
+
+func (fh *FileHandle) readFileWithCallback(sOffset int64, sLen int64, allowExternalFD bool) (data [][]byte, bytesRead int, fdRead *externalCacheFDRead, callback func(), err error) {
 	if sOffset < 0 || sLen < 0 {
 		fh.abandonLazyRead("negative read offset or length", syscall.EINVAL)
-		return nil, 0, nil, syscall.EINVAL
+		return nil, 0, nil, nil, syscall.EINVAL
 	}
 	offset := uint64(sOffset)
 	size := uint64(sLen)
@@ -158,11 +178,11 @@ func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]
 	if err == nil {
 		atomic.AddInt64(&fh.inode.fs.stats.readBufferHits, 1)
 		atomic.AddInt64(&fh.inode.fs.stats.readBufferBytes, int64(size))
-		return data, int(size), nil, nil
+		return data, int(size), nil, nil, nil
 	}
 
 	externalStarted := time.Now()
-	data, bytesRead, callback, ok, err := fh.tryReadExternalCachePages(offset, size)
+	data, bytesRead, fdRead, callback, ok, err := fh.tryReadExternalCachePagesWithFD(offset, size, allowExternalFD)
 	externalElapsed = time.Since(externalStarted)
 	if ok || err != nil {
 		if callback != nil {
@@ -177,7 +197,7 @@ func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]
 				}
 			}
 		}
-		return data, bytesRead, callback, err
+		return data, bytesRead, fdRead, callback, err
 	}
 
 	fallbackStarted := time.Now()
@@ -185,18 +205,24 @@ func (fh *FileHandle) ReadFileWithCallback(sOffset int64, sLen int64) (data [][]
 	fallbackElapsed = time.Since(fallbackStarted)
 	atomic.AddInt64(&fh.inode.fs.stats.readFallbackCount, 1)
 	atomic.AddInt64(&fh.inode.fs.stats.readFallbackNanos, fallbackElapsed.Nanoseconds())
-	return data, bytesRead, nil, err
+	return data, bytesRead, nil, nil, err
 }
 
 func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]byte, bytesRead int, callback func(), ok bool, err error) {
+	data, bytesRead, _, callback, ok, err = fh.tryReadExternalCachePagesWithFD(offset, size, false)
+	return
+}
+
+func (fh *FileHandle) tryReadExternalCachePagesWithFD(offset, size uint64, allowExternalFD bool) (data [][]byte, bytesRead int, fdRead *externalCacheFDRead, callback func(), ok bool, err error) {
 	pageCache, ok := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
 	if !ok {
 		pageCache = nil
 	}
 	readIntoCache, _ := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheReadInto)
 	if pageCache == nil && readIntoCache == nil {
-		return nil, 0, nil, false, nil
+		return nil, 0, nil, nil, false, nil
 	}
+	allowExternalFD = allowExternalFD && fh.inode.fs.externalCacheFDReadsEnabled() && pageCache != nil
 	started := time.Now()
 	path := fh.inode.FullName()
 
@@ -208,25 +234,25 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	}
 	if offset >= fileSize {
 		fh.inode.mu.Unlock()
-		return nil, 0, nil, true, nil
+		return nil, 0, nil, nil, true, nil
 	}
 	if offset+size > fileSize {
 		size = fileSize - offset
 	}
 	if size == 0 {
 		fh.inode.mu.Unlock()
-		return nil, 0, nil, true, nil
+		return nil, 0, nil, nil, true, nil
 	}
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageAttempts, 1)
 	if fh.inode.StagedFile != nil || fh.inode.buffers.AnyUnclean() {
 		fh.inode.mu.Unlock()
 		fh.recordExternalPageMiss(path, "", offset, size, "not_cacheable_state", started, nil)
-		return nil, 0, nil, false, nil
+		return nil, 0, nil, nil, false, nil
 	}
 	if hash == "" {
 		fh.inode.mu.Unlock()
 		fh.recordExternalPageMiss(path, "", offset, size, "missing_hash", started, nil)
-		return nil, 0, nil, false, nil
+		return nil, 0, nil, nil, false, nil
 	}
 	sequential := fh.observeExternalPageRead(hash, offset, size)
 	fh.trackRead(offset, size)
@@ -241,7 +267,7 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 			fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
 		}
 		fh.logExternalPageHit(path, hash, offset, size, 0, "mmap_cache", started, time.Time{}, hitCount)
-		return data, int(size), callback, true, nil
+		return data, int(size), nil, callback, true, nil
 	}
 
 	windowOffset := externalPageWindowStart(offset)
@@ -251,14 +277,19 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	}
 	if windowEnd <= windowOffset {
 		fh.recordExternalPageMiss(path, hash, offset, size, "empty_window", started, nil)
-		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+		data, bytesRead, callback, ok, err = fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+		return data, bytesRead, nil, callback, ok, err
 	}
 	windowSize := windowEnd - windowOffset
 	prefetchEnd := windowOffset + externalPageMmapWindowBytes
 	if prefetchEnd > fileSize {
 		prefetchEnd = fileSize
 	}
-	if offset+size <= prefetchEnd {
+	// FD-mode prefetch only issues page-cache hints; it never publishes an mmap
+	// window for lookup below. Waiting for that job can therefore add the full
+	// foreground timeout without producing a usable result. Go straight to the
+	// exact single-view FD lookup while the hint proceeds independently.
+	if !allowExternalFD && offset+size <= prefetchEnd {
 		prefetchDone := mmapCache.prefetchDone(hash, windowOffset, prefetchEnd)
 		joined := prefetchDone != nil
 		finished := false
@@ -304,12 +335,27 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 				source = "mmap_prefetch_wait"
 			}
 			fh.logExternalPageHit(path, hash, offset, size, 0, source, started, time.Time{}, hitCount)
-			return data, int(size), callback, true, nil
+			return data, int(size), nil, callback, true, nil
+		}
+	}
+
+	if allowExternalFD {
+		fdRead, callback, ok = fh.tryReadExternalCacheFD(pageCache, path, hash, offset, size, fileSize, started)
+		if ok {
+			atomic.AddInt64(&fh.inode.fs.stats.readHits, 1)
+			hitCount := atomic.AddInt64(&fh.inode.fs.stats.externalPageHits, 1)
+			atomic.AddInt64(&fh.inode.fs.stats.externalPageBytes, int64(size))
+			if sequential {
+				fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
+			}
+			fh.logExternalPageHit(path, hash, offset, size, 1, "fd_page_file", started, time.Time{}, hitCount)
+			return nil, int(size), fdRead, callback, true, nil
 		}
 	}
 
 	if pageCache == nil {
-		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+		data, bytesRead, callback, ok, err = fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+		return data, bytesRead, nil, callback, ok, err
 	}
 
 	viewStarted := time.Now()
@@ -336,7 +382,8 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 	}
 	if err != nil || len(views) == 0 {
 		fh.recordExternalPageMiss(path, hash, offset, size, "no_client_local_page_file", started, err)
-		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+		data, bytesRead, callback, ok, err = fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+		return data, bytesRead, nil, callback, ok, err
 	}
 
 	mmapStarted := time.Now()
@@ -357,16 +404,17 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 			mmapElapsed.Truncate(time.Millisecond),
 			err,
 		)
-		return fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+		data, bytesRead, callback, ok, err = fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
+		return data, bytesRead, nil, callback, ok, err
 	}
 	data, callback, ok = mmapCache.lookup(hash, offset, size)
 	if !ok {
 		atomic.AddInt64(&fh.inode.fs.stats.externalPageMmapFailures, 1)
 		data, bytesRead, callback, fallbackOK, fallbackErr := fh.tryReadExternalCacheInto(path, hash, offset, size, fileSize, sequential, started)
 		if fallbackOK || fallbackErr != nil {
-			return data, bytesRead, callback, fallbackOK, fallbackErr
+			return data, bytesRead, nil, callback, fallbackOK, fallbackErr
 		}
-		return nil, 0, nil, false, syscall.EIO
+		return nil, 0, nil, nil, false, syscall.EIO
 	}
 
 	atomic.AddInt64(&fh.inode.fs.stats.readHits, 1)
@@ -376,7 +424,101 @@ func (fh *FileHandle) tryReadExternalCachePages(offset, size uint64) (data [][]b
 		fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
 	}
 	fh.logExternalPageHit(path, hash, offset, size, len(views), "client_local_page_file", started, mmapStarted, hitCount)
-	return data, int(size), callback, true, nil
+	return data, int(size), nil, callback, true, nil
+}
+
+func (fh *FileHandle) tryReadExternalCacheFD(pageCache cfg.ContentCacheClientLocalPageFileViews, path, hash string, offset, size, fileSize uint64, started time.Time) (fdRead *externalCacheFDRead, callback func(), ok bool) {
+	addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.attempts, &fh.inode.fs.externalFDReadLifetime.attempts, 1)
+	if pageCache == nil || hash == "" || size == 0 || size > uint64(int(^uint(0)>>1)) {
+		fh.recordExternalFDFallback(path, hash, offset, size, "invalid_request", started, nil)
+		return nil, nil, false
+	}
+
+	viewStarted := time.Now()
+	views, err := fh.inode.fs.externalCacheClientLocalPageFileViews(pageCache, hash, int64(offset), int64(size))
+	viewElapsed := time.Since(viewStarted)
+	atomic.AddInt64(&fh.inode.fs.stats.externalPageViewCount, 1)
+	atomic.AddInt64(&fh.inode.fs.stats.externalPageViewNanos, viewElapsed.Nanoseconds())
+	if err != nil || len(views) != 1 {
+		fh.recordExternalFDFallback(path, hash, offset, size, "not_one_local_view", started, err)
+		return nil, nil, false
+	}
+
+	view := views[0]
+	if view.Path == "" || view.Offset < 0 || view.Length != int(size) {
+		fh.recordExternalFDFallback(path, hash, offset, size, "incomplete_local_view", started, nil)
+		return nil, nil, false
+	}
+
+	file, err := os.Open(view.Path)
+	if err != nil {
+		addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.openFailures, &fh.inode.fs.externalFDReadLifetime.openFailures, 1)
+		fh.recordExternalFDFallback(path, hash, offset, size, "open_failed", started, err)
+		return nil, nil, false
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || int64(view.Length) > info.Size() || view.Offset > info.Size()-int64(view.Length) {
+		_ = file.Close()
+		addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.openFailures, &fh.inode.fs.externalFDReadLifetime.openFailures, 1)
+		fh.recordExternalFDFallback(path, hash, offset, size, "invalid_open_file", started, err)
+		return nil, nil, false
+	}
+
+	if hook := externalCacheFDAfterOpenHook; hook != nil {
+		hook(fh)
+	}
+
+	fh.inode.mu.Lock()
+	currentHash := ""
+	if fh.inode.userMetadata != nil {
+		currentHash = string(fh.inode.userMetadata[fh.inode.fs.flags.HashAttr])
+	}
+	valid := fh.inode.CacheState == ST_CACHED &&
+		fh.inode.Attributes.Size == fileSize &&
+		fh.inode.StagedFile == nil &&
+		!fh.inode.buffers.AnyUnclean() &&
+		fh.inode.userMetadataDirty == 0 &&
+		!fh.inode.hashMetadataDirty &&
+		!fh.inode.hashMetadataSync &&
+		currentHash == hash
+	fh.inode.mu.Unlock()
+	if !valid {
+		_ = file.Close()
+		addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.revalidationRaces, &fh.inode.fs.externalFDReadLifetime.revalidationRaces, 1)
+		fh.recordExternalFDFallback(path, hash, offset, size, "inode_changed_after_open", started, nil)
+		return nil, nil, false
+	}
+
+	addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.hits, &fh.inode.fs.externalFDReadLifetime.hits, 1)
+	addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.bytes, &fh.inode.fs.externalFDReadLifetime.bytes, int64(size))
+	var closed int32
+	callback = func() {
+		if atomic.CompareAndSwapInt32(&closed, 0, 1) {
+			_ = file.Close()
+		}
+	}
+	return &externalCacheFDRead{file: file, offset: view.Offset}, callback, true
+}
+
+func (fh *FileHandle) recordExternalFDFallback(path, hash string, offset, size uint64, reason string, started time.Time, err error) {
+	addExternalFDCounter(&fh.inode.fs.stats.externalFDRead.fallbacks, &fh.inode.fs.externalFDReadLifetime.fallbacks, 1)
+	fallbackCount := atomic.LoadInt64(&fh.inode.fs.externalFDReadLifetime.fallbacks)
+	handleCount := atomic.AddUint64(&fh.externalFDLogCount, 1)
+	if handleCount > 8 && fallbackCount%1024 != 0 && time.Since(started) <= 100*time.Millisecond {
+		return
+	}
+	log.Debugf(
+		"geesefs external fd read fallback: path=%q hash=%q offset=%d size=%d reason=%s elapsed=%s fallback_count=%d handle_count=%d err=%v",
+		path,
+		hash,
+		offset,
+		size,
+		reason,
+		time.Since(started).Truncate(time.Millisecond),
+		fallbackCount,
+		handleCount,
+		err,
+	)
 }
 
 // observeExternalPageRead tracks the monotonic read frontier used by external
@@ -447,6 +589,13 @@ func (fh *FileHandle) prefetchExternalCachePagesOnOpen() {
 }
 
 func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto) {
+	fdMode := fh.inode.fs.externalCacheFDReadsEnabled()
+	if fdMode {
+		// The kernel will move foreground bytes straight from a local page file.
+		// Prefetch only needs to ask the kernel to warm those page-file ranges;
+		// building mmap or heap windows here would duplicate the same I/O.
+		readIntoCache = nil
+	}
 	if hash == "" || (pageCache == nil && readIntoCache == nil) || start >= fileSize {
 		return
 	}
@@ -454,6 +603,12 @@ func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize 
 	start = externalPageWindowStart(start)
 	cache := fh.inode.fs.externalPageCache()
 	aheadBytes := uint64(externalPagePrefetchAheadBytes)
+	if fdMode {
+		// FD reads rely on the kernel page cache, whose readahead is most useful
+		// as a short sequential lookahead. Keep only the next aligned window in
+		// flight instead of flooding the device with the generic 1 GiB fan-out.
+		aheadBytes = externalPageMmapWindowBytes
+	}
 	cache.mu.Lock()
 	if cache.maxBytes > 0 && uint64(cache.maxBytes) < aheadBytes {
 		aheadBytes = uint64(cache.maxBytes)
@@ -477,7 +632,7 @@ func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize 
 		if next+windowSize > fileSize {
 			windowSize = fileSize - next
 		}
-		if !cache.prefetchWindow(fh.inode.fs, hash, next, windowSize, fileSize, pageCache, readIntoCache) {
+		if !cache.prefetchWindowMode(fh.inode.fs, hash, next, windowSize, fileSize, pageCache, readIntoCache, fdMode) {
 			return
 		}
 		next += windowSize
@@ -605,6 +760,33 @@ func (fs *Goofys) closeExternalPageMmapCache() {
 	if cache != nil {
 		cache.close()
 	}
+	fs.logExternalFDReadSummary()
+}
+
+func (fs *Goofys) logExternalFDReadSummary() {
+	if fs == nil || !fs.externalCacheFDReads {
+		return
+	}
+	fs.externalFDSummaryOnce.Do(func() {
+		stats := &fs.externalFDReadLifetime
+		log.Infof(
+			"geesefs external fd read mount summary: attempts=%d hits=%d fallbacks=%d bytes=%d open_failures=%d revalidation_races=%d prefetch_hints=%d prefetch_hint_bytes=%d prefetch_hint_failures=%d splice_transfers=%d pread_transfers=%d unknown_transfers=%d transfer_bytes=%d splice_fallbacks=%d",
+			atomic.LoadInt64(&stats.attempts),
+			atomic.LoadInt64(&stats.hits),
+			atomic.LoadInt64(&stats.fallbacks),
+			atomic.LoadInt64(&stats.bytes),
+			atomic.LoadInt64(&stats.openFailures),
+			atomic.LoadInt64(&stats.revalidationRaces),
+			atomic.LoadInt64(&stats.prefetchHints),
+			atomic.LoadInt64(&stats.prefetchHintBytes),
+			atomic.LoadInt64(&stats.prefetchHintFailures),
+			atomic.LoadInt64(&stats.spliceTransfers),
+			atomic.LoadInt64(&stats.preadTransfers),
+			atomic.LoadInt64(&stats.unknownTransfers),
+			atomic.LoadInt64(&stats.transferBytes),
+			atomic.LoadInt64(&stats.spliceFallbacks),
+		)
+	})
 }
 
 func newExternalPageMmapCache(maxBytes int64) *externalPageMmapCache {
@@ -708,6 +890,10 @@ func (c *externalPageMmapCache) lookup(cacheKey string, offset, size uint64) (da
 }
 
 func (c *externalPageMmapCache) prefetchWindow(fs *Goofys, cacheKey string, offset, size, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto) bool {
+	return c.prefetchWindowMode(fs, cacheKey, offset, size, fileSize, pageCache, readIntoCache, false)
+}
+
+func (c *externalPageMmapCache) prefetchWindowMode(fs *Goofys, cacheKey string, offset, size, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto, fdMode bool) bool {
 	if cacheKey == "" || (pageCache == nil && readIntoCache == nil) || size == 0 || offset >= fileSize {
 		return true
 	}
@@ -739,6 +925,7 @@ func (c *externalPageMmapCache) prefetchWindow(fs *Goofys, cacheKey string, offs
 		state:         state,
 		pageCache:     pageCache,
 		readIntoCache: readIntoCache,
+		fdMode:        fdMode,
 	}
 	c.prefetching[key] = state
 	startNow := c.prefetchActive < externalPagePrefetchMaxConcurrent
@@ -775,6 +962,9 @@ func (c *externalPageMmapCache) runPrefetch(job externalPagePrefetchJob) bool {
 	}
 
 	size := job.key.end - job.key.offset
+	if job.fdMode {
+		return c.prefetchPageFileReadahead(job, size)
+	}
 	// ReadContentInto lets the external cache fill one contiguous window without
 	// mapping and prefaulting every backing page file. Keep page-file views as a
 	// fallback for clients that do not support read-into or miss that fast path.
@@ -782,6 +972,44 @@ func (c *externalPageMmapCache) runPrefetch(job externalPagePrefetchJob) bool {
 		return true
 	}
 	return c.prefetchPageFiles(job, size)
+}
+
+func (c *externalPageMmapCache) prefetchPageFileReadahead(job externalPagePrefetchJob, size uint64) bool {
+	if job.pageCache == nil || size == 0 {
+		return false
+	}
+	views, err := job.fs.externalCacheClientLocalPageFileViews(job.pageCache, job.key.cacheKey, int64(job.key.offset), int64(size))
+	if err != nil || len(views) == 0 {
+		return false
+	}
+
+	var covered uint64
+	for _, view := range views {
+		if view.Path == "" || view.Offset < 0 || view.Length <= 0 || uint64(view.Length) > size-covered {
+			return false
+		}
+		covered += uint64(view.Length)
+	}
+	if covered != size {
+		return false
+	}
+	var hintedBytes int64
+	var hintFailures int64
+	for _, view := range views {
+		if err := warmContentCacheRegion(view.Path, view.Offset, view.Length); err == nil {
+			hintedBytes += int64(view.Length)
+		} else {
+			hintFailures++
+		}
+	}
+	if hintedBytes > 0 {
+		addExternalFDCounter(&job.fs.stats.externalFDRead.prefetchHints, &job.fs.externalFDReadLifetime.prefetchHints, 1)
+		addExternalFDCounter(&job.fs.stats.externalFDRead.prefetchHintBytes, &job.fs.externalFDReadLifetime.prefetchHintBytes, hintedBytes)
+	}
+	if hintFailures > 0 {
+		addExternalFDCounter(&job.fs.stats.externalFDRead.prefetchHintFailures, &job.fs.externalFDReadLifetime.prefetchHintFailures, hintFailures)
+	}
+	return hintedBytes == int64(size)
 }
 
 func (c *externalPageMmapCache) prefetchReadInto(job externalPagePrefetchJob, size uint64) bool {
@@ -984,7 +1212,7 @@ func (c *externalPageMmapCache) insertWindow(cacheKey string, offset uint64, vie
 			}
 			return syscall.EINVAL
 		}
-		warmContentCacheRegion(view.Path, view.Offset, view.Length)
+		_ = warmContentCacheRegion(view.Path, view.Offset, view.Length)
 		mapped = append(mapped, externalPageMappedRegion{
 			cacheKey:  cacheKey,
 			fileStart: current,
