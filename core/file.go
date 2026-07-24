@@ -63,6 +63,7 @@ var (
 	errExternalCacheUnavailable = errors.New("external cache unavailable")
 	errExternalCacheTimeout     = errors.New("external cache read timed out")
 	errReadLoadingStalled       = errors.New("read loading stalled")
+	errReadIdentityChanged      = fmt.Errorf("read identity changed: %w", syscall.EBUSY)
 )
 
 // stagedReadAfterAddLoadingHook is nil in production. Tests use it to make
@@ -1224,6 +1225,7 @@ func (fh *FileHandle) readFileAfterHash(sOffset int64, sLen int64) (data [][]byt
 			}
 			fh.inode.hashMetadataChecked = false
 			fh.inode.readError = nil
+			err = errReadIdentityChanged
 		} else if mappedErr == syscall.ENOENT || mappedErr == syscall.ERANGE {
 			// Object is deleted or resized remotely (416). Discard local version
 			log.Warnf("File %v is deleted or resized remotely, discarding local changes", fh.inode.FullName())

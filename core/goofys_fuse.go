@@ -18,6 +18,7 @@
 package core
 
 import (
+	"errors"
 	"os/exec"
 
 	"github.com/moby/sys/mountinfo"
@@ -592,7 +593,37 @@ func (fs *GoofysFuse) ReadFile(
 	}()
 
 	var fdRead *externalCacheFDRead
-	op.Data, op.BytesRead, fdRead, op.Callback, err = fh.readFileWithCallback(op.Offset, op.Size, fs.externalCacheFDReadsEnabled())
+	for attempt := 0; attempt < 2; attempt++ {
+		op.Data = nil
+		op.BytesRead = 0
+		op.FD = nil
+		op.Callback = nil
+		fdRead = nil
+		op.Data, op.BytesRead, fdRead, op.Callback, err = fh.readFileWithCallback(op.Offset, op.Size, fs.externalCacheFDReadsEnabled())
+		if !errors.Is(err, errReadIdentityChanged) {
+			break
+		}
+		if op.Callback != nil {
+			op.Callback()
+			op.Callback = nil
+		}
+		if attempt == 0 {
+			log.Debugf(
+				"geesefs retrying clean conditional read conflict: inode=%d handle=%d path=%q offset=%d size=%d",
+				op.Inode,
+				op.Handle,
+				readPath,
+				op.Offset,
+				op.Size,
+			)
+			// The normal hash-metadata refresh is size-gated. A conditional
+			// conflict must refresh the object identity even for small files
+			// such as model configs before the transparent retry.
+			fh.retrieveHashMetadata()
+			continue
+		}
+		err = syscall.EBUSY
+	}
 	if err == nil && fdRead != nil {
 		op.FD = &fuseops.ReadFileFD{FD: fdRead.file.Fd(), Offset: fdRead.offset}
 	}
