@@ -198,6 +198,25 @@ func (inode *Inode) ResizeUnlocked(newSize uint64, finalizeFlushed bool) {
 	}
 }
 
+// ResizeStagedUnlocked updates a file whose authoritative local generation is
+// already held by StagedFile. Extending that file with the regular buffered
+// resize path would add dirty zero buffers alongside the staged generation.
+// The next write would then bypass staging, while fsync-on-close would still
+// upload the preallocated (zero-filled) staged file.
+//
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) ResizeStagedUnlocked(newSize uint64) {
+	inode.checkPauseWriters()
+	if inode.Attributes.Size > newSize {
+		allocated := inode.buffers.RemoveRange(newSize, inode.Attributes.Size-newSize, nil)
+		inode.fs.bufferPool.Use(allocated, true)
+	}
+	inode.Attributes.Size = newSize
+	if newSize == 0 {
+		inode.stagedBypassed = false
+	}
+}
+
 func (inode *Inode) checkPauseWriters() {
 	for inode.pauseWriters > 0 {
 		if inode.readCond == nil {
@@ -3080,8 +3099,10 @@ func (inode *Inode) SetAttributes(size *uint64, mode *os.FileMode,
 			stagedFile.shouldFlush = true
 			stagedFile.lastWriteAt = time.Now()
 			stagedFile.mu.Unlock()
+			inode.ResizeStagedUnlocked(*size)
+		} else {
+			inode.ResizeUnlocked(*size, true)
 		}
-		inode.ResizeUnlocked(*size, true)
 		modified = true
 	}
 

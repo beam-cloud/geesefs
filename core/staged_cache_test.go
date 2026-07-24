@@ -1086,6 +1086,81 @@ func newStagedRenameInode(t *testing.T, fs *Goofys, root *Inode, name string, da
 	return inode, stagedPath
 }
 
+func TestPreallocatedStagedFileWritesReplaceZerosBeforeRename(t *testing.T) {
+	const (
+		tempName  = ".model.safetensors.tmp"
+		finalName = "model.safetensors"
+	)
+	payload := append(
+		[]byte{24, 0, 0, 0, 0, 0, 0, 0},
+		[]byte(`{"latent":{"dtype":"BF16"}}tensor-bytes`)...,
+	)
+	var uploadedKey string
+	var uploaded []byte
+	backend := &stagedRenameBackend{}
+	backend.PutBlobFunc = func(param *PutBlobInput) (*PutBlobOutput, error) {
+		var err error
+		uploaded, err = io.ReadAll(param.Body)
+		if err != nil {
+			return nil, err
+		}
+		uploadedKey = param.Key
+		now := time.Now()
+		return &PutBlobOutput{ETag: PString("etag"), LastModified: &now}, nil
+	}
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, backend)
+	inode, _ := newStagedRenameInode(t, fs, root, tempName, nil)
+	fh := inode.StagedFile.FH
+
+	// safetensors 0.8 preallocates its temporary file to the final size, writes
+	// the header and tensor bytes, then atomically renames it.
+	if err := inode.SetAttributes(PUInt64(uint64(len(payload))), nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	inode.mu.Lock()
+	unclean := inode.buffers.AnyUnclean()
+	inode.mu.Unlock()
+	if unclean {
+		t.Fatal("staged preallocation created dirty zero buffers")
+	}
+
+	for offset, chunk := range [][]byte{payload[:8], payload[8:]} {
+		writeOffset := int64(0)
+		if offset == 1 {
+			writeOffset = 8
+		}
+		staged, err := fh.prepareStagedWrite(writeOffset, len(chunk))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !staged {
+			t.Fatalf("write at offset %d bypassed the staged generation", writeOffset)
+		}
+		if err := fh.WriteFileStaged(writeOffset, chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := root.Rename(tempName, root, finalName); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.flushStagedFile(inode); err != nil {
+		t.Fatal(err)
+	}
+	if uploadedKey != finalName {
+		t.Fatalf("uploaded key = %q, want %q", uploadedKey, finalName)
+	}
+	if !bytes.Equal(uploaded, payload) {
+		t.Fatalf("uploaded data = %x, want %x", uploaded, payload)
+	}
+}
+
 func TestStagedRenameBeforeFlushUploadsFinalKey(t *testing.T) {
 	const (
 		oldName = "model.safetensors.incomplete"
