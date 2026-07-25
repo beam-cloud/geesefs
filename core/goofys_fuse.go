@@ -72,6 +72,20 @@ func NewGoofysFuse(fs *Goofys) *GoofysFuse {
 	return fsint
 }
 
+func (fs *GoofysFuse) invalidateKernelInode(inode fuseops.InodeID) {
+	if fs.NotifyCallback == nil {
+		return
+	}
+	// NotifyCallback deliberately sends notifications from a separate
+	// goroutine. Writing a reverse FUSE notification synchronously from an
+	// active read can deadlock behind that read's response.
+	fs.NotifyCallback([]interface{}{&fuseops.NotifyInvalInode{
+		Inode:  inode,
+		Offset: 0,
+		Length: -1,
+	}})
+}
+
 func (fs *GoofysFuse) StatFS(
 	ctx context.Context,
 	op *fuseops.StatFSOp) (err error) {
@@ -620,6 +634,11 @@ func (fs *GoofysFuse) ReadFile(
 			// conflict must refresh the object identity even for small files
 			// such as model configs before the transparent retry.
 			fh.retrieveHashMetadata()
+			// The HEAD refresh updates the userspace inode, but a long kernel
+			// attribute TTL may still advertise the previous object size. Push
+			// the new attributes into visibility before retrying so a larger
+			// replacement is not truncated at the old EOF.
+			fs.invalidateKernelInode(op.Inode)
 			continue
 		}
 		err = syscall.EBUSY

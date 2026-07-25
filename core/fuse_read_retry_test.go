@@ -16,6 +16,7 @@ import (
 
 func TestFUSEReadRetriesCleanConditionalIdentityConflict(t *testing.T) {
 	payload := []byte(`{"model_type":"qwen3"}`)
+	staleSize := uint64(len(payload) - 7)
 	const (
 		staleETag = "etag-v1"
 		freshETag = "etag-v2"
@@ -66,8 +67,8 @@ func TestFUSEReadRetriesCleanConditionalIdentityConflict(t *testing.T) {
 
 	inode := NewInode(fs, root, "config.json")
 	inode.Id = 2
-	inode.Attributes.Size = uint64(len(payload))
-	inode.knownSize = uint64(len(payload))
+	inode.Attributes.Size = staleSize
+	inode.knownSize = staleSize
 	inode.knownETag = staleETag
 	inode.hashMetadataChecked = true
 	inode.SetCacheState(ST_CACHED)
@@ -76,13 +77,23 @@ func TestFUSEReadRetriesCleanConditionalIdentityConflict(t *testing.T) {
 
 	const handleID fuseops.HandleID = 7
 	fs.fileHandles[handleID] = NewFileHandle(inode)
+	var invalidated atomic.Bool
+	fsint := NewGoofysFuse(fs)
+	fs.NotifyCallback = func(notifications []interface{}) {
+		for _, notification := range notifications {
+			inval, ok := notification.(*fuseops.NotifyInvalInode)
+			if ok && inval.Inode == inode.Id && inval.Offset == 0 && inval.Length == -1 {
+				invalidated.Store(true)
+			}
+		}
+	}
 	op := &fuseops.ReadFileOp{
 		Inode:  inode.Id,
 		Handle: handleID,
 		Offset: 0,
 		Size:   int64(len(payload)),
 	}
-	if err := NewGoofysFuse(fs).ReadFile(context.Background(), op); err != nil {
+	if err := fsint.ReadFile(context.Background(), op); err != nil {
 		t.Fatal(err)
 	}
 	if got := bytes.Join(op.Data, nil); !bytes.Equal(got, payload) {
@@ -96,5 +107,11 @@ func TestFUSEReadRetriesCleanConditionalIdentityConflict(t *testing.T) {
 	}
 	if got := headCalls.Load(); got != 1 {
 		t.Fatalf("metadata refreshes = %d, want 1", got)
+	}
+	if got := inode.GetAttributes().Size; got != uint64(len(payload)) {
+		t.Fatalf("refreshed inode size = %d, want %d", got, len(payload))
+	}
+	if !invalidated.Load() {
+		t.Fatal("kernel inode was not invalidated after the remote identity changed")
 	}
 }
