@@ -26,6 +26,12 @@ import (
 	"time"
 )
 
+const (
+	DefaultMetadataHTTPTimeout = 30 * time.Second
+	MaxMetadataHTTPTimeout     = 2 * time.Minute
+	DefaultReadRetryAttempts   = 3
+)
+
 type PartSizeConfig struct {
 	PartSize  uint64
 	PartCount uint64
@@ -95,6 +101,7 @@ type FlagStorage struct {
 	MaxParallelCopy     int
 	StatCacheTTL        time.Duration
 	HTTPTimeout         time.Duration
+	MetadataHTTPTimeout time.Duration
 	ReadRetryInterval   time.Duration
 	ReadRetryMultiplier float64
 	ReadRetryMax        time.Duration

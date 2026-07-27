@@ -2926,7 +2926,7 @@ func (s *GoofysTest) TestListBeforeFlushRename(t *C) {
 	// Sleep 1 second to make file1 metadata cache expire and perform a listing
 	// Without renameInProgress in inode.SetFromBlobItem() it was detecting a conflict and
 	// rolling back the file state. Even worse, it looped forever in retryRead() without
-	// ReadRetryAttempts = 3, because it retries io.EOF...
+	// The read may retry io.EOF, but the retry policy is always bounded.
 	time.Sleep(1 * time.Second)
 
 	// Check that file1 isn't rolled back to the old content

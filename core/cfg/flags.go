@@ -608,6 +608,12 @@ MISC OPTIONS:
 		},
 
 		cli.DurationFlag{
+			Name:  "metadata-http-timeout",
+			Value: DefaultMetadataHTTPTimeout,
+			Usage: "Deadline for each S3 metadata request (HEAD/LIST). Values above 2m are clamped to 2m",
+		},
+
+		cli.DurationFlag{
 			Name:  "external-cache-read-timeout",
 			Value: 30 * time.Second,
 			Usage: "Maximum time to wait for an external content-cache read before falling back to origin",
@@ -639,8 +645,8 @@ MISC OPTIONS:
 
 		cli.IntFlag{
 			Name:  "read-retry-attempts",
-			Value: 0,
-			Usage: "Maximum read retry attempts (0 means unlimited)",
+			Value: DefaultReadRetryAttempts,
+			Usage: "Maximum total attempts for origin reads. Values <= 0 use the safe default; unlimited retries are not supported",
 		},
 
 		cli.IntFlag{
@@ -869,6 +875,7 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		MaxParallelCopy:          c.Int("max-parallel-copy"),
 		StatCacheTTL:             c.Duration("stat-cache-ttl"),
 		HTTPTimeout:              c.Duration("http-timeout"),
+		MetadataHTTPTimeout:      c.Duration("metadata-http-timeout"),
 		ExternalCacheReadTimeout: c.Duration("external-cache-read-timeout"),
 		RetryInterval:            c.Duration("retry-interval"),
 		ReadRetryInterval:        c.Duration("read-retry-interval"),
@@ -1111,6 +1118,11 @@ func DefaultFlags() *FlagStorage {
 		RefreshAttr:          ".invalidate",
 		StatCacheTTL:         30 * time.Second,
 		HTTPTimeout:          30 * time.Second,
+		MetadataHTTPTimeout:  DefaultMetadataHTTPTimeout,
+		ReadRetryInterval:    1 * time.Second,
+		ReadRetryMultiplier:  2,
+		ReadRetryMax:         60 * time.Second,
+		ReadRetryAttempts:    DefaultReadRetryAttempts,
 		RetryInterval:        30 * time.Second,
 		MaxDiskCacheFD:       512,
 		RefreshFilename:      ".invalidate",

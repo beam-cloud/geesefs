@@ -16,6 +16,7 @@
 package core
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -65,6 +66,7 @@ type S3Backend struct {
 
 const maxSingleCopyObjectSize = uint64(5 * 1024 * 1024 * 1024)
 const s3WriteRetryAttempts = 5
+const bucketDetectionAttempts = 3
 
 func shouldUseMultipartCopy(gcs bool, size uint64, threshold uint64, sameObject bool) bool {
 	return !gcs && size > threshold && (!sameObject || size > maxSingleCopyObjectSize)
@@ -347,6 +349,24 @@ func (s *S3Backend) newS3() {
 	})
 }
 
+func (s *S3Backend) metadataHTTPTimeout() time.Duration {
+	timeout := cfg.DefaultMetadataHTTPTimeout
+	if s.flags != nil && s.flags.MetadataHTTPTimeout > 0 {
+		timeout = s.flags.MetadataHTTPTimeout
+	}
+	if timeout > cfg.MaxMetadataHTTPTimeout {
+		timeout = cfg.MaxMetadataHTTPTimeout
+	}
+	return timeout
+}
+
+func (s *S3Backend) sendMetadataRequest(req *request.Request) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.metadataHTTPTimeout())
+	defer cancel()
+	req.SetContext(ctx)
+	return req.Send()
+}
+
 func (s *S3Backend) detectBucketLocationByHEAD() (err error, isAws bool) {
 	u := url.URL{
 		Scheme: "https",
@@ -364,26 +384,41 @@ func (s *S3Backend) detectBucketLocationByHEAD() (err error, isAws bool) {
 		u.Host = endpoint.Host
 	}
 
-	var req *http.Request
 	var resp *http.Response
 
-	req, err = http.NewRequest("HEAD", u.String(), nil)
+	req, err := http.NewRequest("HEAD", u.String(), nil)
 	if err != nil {
 		return
 	}
 
-	allowFails := 3
-	for i := 0; i < allowFails; i++ {
-		resp, err = s.S3.Config.HTTPClient.Transport.RoundTrip(req)
+	ctx, cancel := context.WithTimeout(context.Background(), s.metadataHTTPTimeout())
+	defer cancel()
+	httpClient := *s.S3.Config.HTTPClient
+	httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	for attempt := 1; attempt <= bucketDetectionAttempts; attempt++ {
+		resp, err = httpClient.Do(req.Clone(ctx))
 		if err != nil {
 			return
 		}
+		_ = resp.Body.Close()
 		if resp.StatusCode < 500 {
 			break
-		} else if resp.StatusCode == 503 && resp.Status == "503 Slow Down" {
-			time.Sleep(time.Duration(i+1) * time.Second)
-			// allow infinite retries for 503 slow down
-			allowFails += 1
+		}
+		if attempt < bucketDetectionAttempts {
+			delay := time.NewTimer(time.Duration(attempt) * 250 * time.Millisecond)
+			select {
+			case <-delay.C:
+			case <-ctx.Done():
+				if !delay.Stop() {
+					select {
+					case <-delay.C:
+					default:
+					}
+				}
+				return ctx.Err(), false
+			}
 		}
 	}
 
@@ -438,11 +473,6 @@ func (s *S3Backend) detectBucketLocationByHEAD() (err error, isAws bool) {
 }
 
 func (s *S3Backend) testBucket(key string) (err error) {
-	oldAttempts := s.flags.ReadRetryAttempts
-	if oldAttempts == 0 {
-		// Never wait infinitely for init
-		s.flags.ReadRetryAttempts = 5
-	}
 	err = ReadBackoff(s.flags, func(attempt int) error {
 		_, err := s.HeadBlob(&HeadBlobInput{Key: key})
 		return err
@@ -452,7 +482,6 @@ func (s *S3Backend) testBucket(key string) (err error) {
 			err = nil
 		}
 	}
-	s.flags.ReadRetryAttempts = oldAttempts
 	return
 }
 
@@ -521,7 +550,7 @@ func (s *S3Backend) ListObjectsV2(params *s3.ListObjectsV2Input) (*s3.ListObject
 	if s.config.ListV1Ext {
 		in := s3.ListObjectsV1ExtInput(*params)
 		req, resp := s.S3.ListObjectsV1ExtRequest(&in)
-		err := req.Send()
+		err := s.sendMetadataRequest(req)
 		if err != nil {
 			if awsErr, ok := err.(awserr.Error); ok {
 				if awsErr.Code() == "InvalidArgument" || awsErr.Code() == "NotImplemented" {
@@ -542,7 +571,7 @@ func (s *S3Backend) ListObjectsV2(params *s3.ListObjectsV2Input) (*s3.ListObject
 		return &out, s.getRequestId(req), nil
 	} else if s.config.ListV2 {
 		req, resp := s.S3.ListObjectsV2Request(params)
-		err := req.Send()
+		err := s.sendMetadataRequest(req)
 		if err != nil {
 			return nil, "", err
 		}
@@ -562,7 +591,8 @@ func (s *S3Backend) ListObjectsV2(params *s3.ListObjectsV2Input) (*s3.ListObject
 			v1.Marker = params.ContinuationToken
 		}
 
-		objs, err := s.S3.ListObjects(&v1)
+		req, objs := s.S3.ListObjectsRequest(&v1)
+		err := s.sendMetadataRequest(req)
 		if err != nil {
 			return nil, "", err
 		}
@@ -620,7 +650,7 @@ func (s *S3Backend) HeadBlob(param *HeadBlobInput) (*HeadBlobOutput, error) {
 	}
 
 	req, resp := s.S3.HeadObjectRequest(&head)
-	err := req.Send()
+	err := s.sendMetadataRequest(req)
 	if err != nil {
 		return nil, err
 	}
