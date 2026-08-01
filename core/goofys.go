@@ -37,8 +37,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/jacobsa/fuse/fuseops"
 
@@ -86,12 +84,9 @@ func externalCacheStoreErrorIsTerminal(err error) bool {
 	if err == nil {
 		return false
 	}
-	if status.Code(err) == codes.ResourceExhausted {
-		return true
-	}
-	// Older cache servers reported capacity pressure as Internal. Keep this
-	// narrow fallback while mixed worker versions are in service; capacity
-	// cannot recover by immediately replaying the same cache-only write.
+	// Cache servers historically reported this condition as Internal and newer
+	// versions may use ResourceExhausted. Match the stable detail, not the broad
+	// status code: ResourceExhausted can also mean transient server overload.
 	return strings.Contains(strings.ToLower(err.Error()), "disk cache capacity exceeded")
 }
 

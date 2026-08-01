@@ -263,7 +263,10 @@ func TestProcessCacheEventDoesNotRetryCacheCapacityError(t *testing.T) {
 	}{
 		{
 			name: "resource exhausted",
-			err:  status.Error(codes.ResourceExhausted, "cache capacity exhausted"),
+			err: status.Error(
+				codes.ResourceExhausted,
+				"disk cache capacity exceeded",
+			),
 		},
 		{
 			name: "legacy internal response",
@@ -306,6 +309,43 @@ func TestProcessCacheEventDoesNotRetryCacheCapacityError(t *testing.T) {
 				t.Fatalf("cache error count = %d, want 1", got)
 			}
 		})
+	}
+}
+
+func TestProcessCacheEventRetriesTransientResourceExhausted(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	var attempts int32
+	flags.ExternalCacheClient = &fakeContentCache{
+		storeLocalPath: func(source struct {
+			Path      string
+			CachePath string
+		}, opts struct {
+			RoutingKey string
+			Lock       bool
+		}) (string, error) {
+			if atomic.AddInt32(&attempts, 1) < 3 {
+				return "", status.Error(codes.ResourceExhausted, "cache server overloaded")
+			}
+			return opts.RoutingKey, nil
+		},
+	}
+	fs := newUnitFS(flags)
+	originalDelay := externalCacheStoreRetryDelay
+	externalCacheStoreRetryDelay = func(int) time.Duration { return 0 }
+	defer func() { externalCacheStoreRetryDelay = originalDelay }()
+
+	fs.processCacheEvent(cacheEvent{
+		path:            "volumes/volume/model.pt",
+		hash:            "h1",
+		size:            1,
+		localSourcePath: "/immutable/staged/model.pt",
+	})
+
+	if got := atomic.LoadInt32(&attempts); got != 3 {
+		t.Fatalf("transient resource exhausted attempts = %d, want 3", got)
+	}
+	if got := atomic.LoadInt64(&fs.stats.cacheEventsSuccess); got != 1 {
+		t.Fatalf("cache success count = %d, want 1", got)
 	}
 }
 
