@@ -35,6 +35,7 @@ import (
 const (
 	externalPageMmapWindowBytes       = 64 * 1024 * 1024
 	externalPageMmapMaxBytes          = 2 * 1024 * 1024 * 1024
+	externalPageMmapPoolShareDivisor  = 2
 	externalPagePrefetchAheadBytes    = 1024 * 1024 * 1024
 	externalPagePrefetchMaxConcurrent = 8
 	externalPagePrefetchMaxQueued     = 8
@@ -752,13 +753,30 @@ func (fs *Goofys) externalPageCache() *externalPageMmapCache {
 	fs.externalPageMmapCacheMu.Lock()
 	defer fs.externalPageMmapCacheMu.Unlock()
 	if fs.externalPageMmapCache == nil {
-		maxBytes := int64(externalPageMmapMaxBytes)
-		if fs.bufferPool != nil && fs.bufferPool.max > 0 && fs.bufferPool.max < maxBytes {
-			maxBytes = fs.bufferPool.max
-		}
+		maxBytes := externalPageMmapCacheLimit(fs.bufferPool)
 		fs.externalPageMmapCache = newExternalPageMmapCacheWithPool(maxBytes, fs.bufferPool)
 	}
 	return fs.externalPageMmapCache
+}
+
+func externalPageMmapCacheLimit(memoryPool *BufferPool) int64 {
+	maxBytes := int64(externalPageMmapMaxBytes)
+	if memoryPool == nil || memoryPool.max <= 0 {
+		return maxBytes
+	}
+
+	// Mmap entries are charged to the shared buffer pool, but the pool cannot
+	// reclaim them through FreeSomeCleanBuffers. Keep at least half of the
+	// effective mount budget available for foreground reads, readahead, and
+	// writes instead of allowing background page prefetch to consume it all.
+	poolBudget := memoryPool.max / externalPageMmapPoolShareDivisor
+	if poolBudget == 0 {
+		poolBudget = memoryPool.max
+	}
+	if poolBudget < maxBytes {
+		maxBytes = poolBudget
+	}
+	return maxBytes
 }
 
 func (fs *Goofys) closeExternalPageMmapCache() {

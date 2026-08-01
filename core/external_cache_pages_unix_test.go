@@ -522,6 +522,7 @@ func TestExternalPageReadSequenceToleratesReorderedFuseRequests(t *testing.T) {
 
 func TestExternalPageReorderedReadsExtendPrefetchToEOF(t *testing.T) {
 	flags := cfg.DefaultFlags()
+	flags.MemoryLimit = 2 * externalPagePrefetchAheadBytes
 	flags.ExternalCacheClient = &fakeContentCache{}
 	fs := newUnitFS(flags)
 	defer fs.closeExternalPageMmapCache()
@@ -611,6 +612,7 @@ func TestExternalCachePrefetchQueueSustainsConcurrency(t *testing.T) {
 	defer closeRelease()
 
 	flags := cfg.DefaultFlags()
+	flags.MemoryLimit = 2 * externalPagePrefetchAheadBytes
 	var startedCount atomic.Int64
 	flags.ExternalCacheClient = &fakeContentCache{
 		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
@@ -761,7 +763,28 @@ func TestExternalCachePrefetchMemoryBudgetIncludesInflightBytes(t *testing.T) {
 	}
 }
 
-func TestExternalPageCacheUsesEffectiveMountMemoryLimit(t *testing.T) {
+func TestExternalPageMmapCacheLimitPreservesSharedPoolHeadroom(t *testing.T) {
+	tests := []struct {
+		name     string
+		poolMax  int64
+		expected int64
+	}{
+		{name: "small mount budget", poolMax: 128 * 1024 * 1024, expected: 64 * 1024 * 1024},
+		{name: "default mount budget", poolMax: 2 * 1024 * 1024 * 1024, expected: 1024 * 1024 * 1024},
+		{name: "absolute cache cap", poolMax: 8 * 1024 * 1024 * 1024, expected: externalPageMmapMaxBytes},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := &BufferPool{max: tt.poolMax}
+			if got := externalPageMmapCacheLimit(pool); got != tt.expected {
+				t.Fatalf("external page cache limit=%d, want=%d for pool=%d", got, tt.expected, tt.poolMax)
+			}
+		})
+	}
+}
+
+func TestExternalPageCachePreservesForegroundMountMemory(t *testing.T) {
 	flags := cfg.DefaultFlags()
 	flags.MemoryLimit = 128 * 1024 * 1024
 	flags.ExternalCacheClient = &fakeContentCache{
@@ -776,9 +799,29 @@ func TestExternalPageCacheUsesEffectiveMountMemoryLimit(t *testing.T) {
 	if cache.memoryPool != fs.bufferPool {
 		t.Fatal("external page cache is not attached to the mount memory pool")
 	}
-	if cache.maxBytes != fs.bufferPool.max {
-		t.Fatalf("external page cache limit=%d, effective mount limit=%d", cache.maxBytes, fs.bufferPool.max)
+	expectedCacheLimit := fs.bufferPool.max / externalPageMmapPoolShareDivisor
+	if cache.maxBytes != expectedCacheLimit {
+		t.Fatalf("external page cache limit=%d, want=%d for effective mount limit=%d", cache.maxBytes, expectedCacheLimit, fs.bufferPool.max)
 	}
+
+	// Fully reserving the external page cache must still leave enough shared
+	// pool capacity for foreground reads to use the rest of the mount budget.
+	if !cache.reserveBytes(cache.maxBytes) {
+		t.Fatal("failed to reserve the external page cache budget")
+	}
+	reservedBytes := cache.maxBytes
+	defer func() {
+		if reservedBytes > 0 {
+			cache.releaseReservedBytes(reservedBytes, true)
+		}
+	}()
+	foregroundHeadroom := fs.bufferPool.max - cache.maxBytes
+	if err := fs.bufferPool.Use(foregroundHeadroom, false); err != nil {
+		t.Fatalf("external page cache starved foreground pool capacity: %v", err)
+	}
+	fs.bufferPool.Use(-foregroundHeadroom, false)
+	cache.releaseReservedBytes(reservedBytes, true)
+	reservedBytes = 0
 
 	inode := NewInode(fs, nil, "file")
 	fh := NewFileHandle(inode)
