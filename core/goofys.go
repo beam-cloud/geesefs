@@ -37,6 +37,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/jacobsa/fuse/fuseops"
 
@@ -78,6 +80,19 @@ var externalCacheStoreRetryDelay = func(attempt int) time.Duration {
 		return 2 * time.Second
 	}
 	return delay
+}
+
+func externalCacheStoreErrorIsTerminal(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(err) == codes.ResourceExhausted {
+		return true
+	}
+	// Older cache servers reported capacity pressure as Internal. Keep this
+	// narrow fallback while mixed worker versions are in service; capacity
+	// cannot recover by immediately replaying the same cache-only write.
+	return strings.Contains(strings.ToLower(err.Error()), "disk cache capacity exceeded")
 }
 
 type Goofys struct {
@@ -628,6 +643,9 @@ func (fs *Goofys) processCacheEvent(cacheEvent cacheEvent) {
 			if err == nil && hash == cacheEvent.hash {
 				break
 			}
+			if externalCacheStoreErrorIsTerminal(err) {
+				break
+			}
 			// Object-source fills race mutable keys by design: a different or
 			// missing returned content hash means this queued generation has been
 			// superseded. Re-reading the same key cannot safely populate the
@@ -891,6 +909,9 @@ func (fs *Goofys) CacheFileInExternalCacheFromBuffersLocked(inode *Inode) bool {
 				inode: inode,
 			}, "flushed_buffers")
 			return true
+		}
+		if externalCacheStoreErrorIsTerminal(err) {
+			break
 		}
 
 		if attempt == externalCacheStoreAttempts {

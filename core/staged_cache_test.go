@@ -21,6 +21,8 @@ import (
 	"github.com/jacobsa/fuse/fuseops"
 	"github.com/sirupsen/logrus"
 	"github.com/yandex-cloud/geesefs/core/cfg"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type fakeContentCache struct {
@@ -251,6 +253,59 @@ func TestProcessCacheEventRetriesTransientExternalCacheStoreError(t *testing.T) 
 	}
 	if got := atomic.LoadInt64(&fs.stats.cacheEventsErrors); got != 0 {
 		t.Fatalf("expected no final cache event errors, got %d", got)
+	}
+}
+
+func TestProcessCacheEventDoesNotRetryCacheCapacityError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "resource exhausted",
+			err:  status.Error(codes.ResourceExhausted, "cache capacity exhausted"),
+		},
+		{
+			name: "legacy internal response",
+			err: status.Error(
+				codes.Internal,
+				"Failed to add content: disk cache capacity exceeded",
+			),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			flags := cfg.DefaultFlags()
+			var attempts int32
+			flags.ExternalCacheClient = &fakeContentCache{
+				storeLocalPath: func(source struct {
+					Path      string
+					CachePath string
+				}, opts struct {
+					RoutingKey string
+					Lock       bool
+				}) (string, error) {
+					atomic.AddInt32(&attempts, 1)
+					return "", test.err
+				},
+			}
+			fs := newUnitFS(flags)
+
+			fs.processCacheEvent(cacheEvent{
+				path:            "volumes/volume/model.pt",
+				hash:            "h1",
+				size:            1,
+				localSourcePath: "/immutable/staged/model.pt",
+			})
+
+			if got := atomic.LoadInt32(&attempts); got != 1 {
+				t.Fatalf("capacity store attempts = %d, want 1", got)
+			}
+			if got := atomic.LoadInt64(&fs.stats.cacheEventsErrors); got != 1 {
+				t.Fatalf("cache error count = %d, want 1", got)
+			}
+		})
 	}
 }
 
