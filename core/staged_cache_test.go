@@ -779,6 +779,63 @@ func TestNonStagedFlushPartUsesRetryableBufferReader(t *testing.T) {
 	}
 }
 
+func TestFlushPartDropsStaleDirtyCacheOnConditionalReadConflict(t *testing.T) {
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	fs := newUnitFS(flags)
+	aborted := make(chan struct{}, 1)
+
+	backend := &TestBackend{}
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		if param.IfMatch == nil || *param.IfMatch != "etag-v1" {
+			t.Fatalf("conditional read If-Match = %v, want etag-v1", param.IfMatch)
+		}
+		return nil, syscall.EBUSY
+	}
+	backend.MultipartBlobAbortFunc = func(param *MultipartBlobCommitInput) (*MultipartBlobAbortOutput, error) {
+		aborted <- struct{}{}
+		return &MultipartBlobAbortOutput{}, nil
+	}
+
+	root := newRootWithBackend(fs, backend)
+	inode := NewInode(fs, root, "model.bin")
+	inode.Id = 2
+	inode.SetCacheState(ST_MODIFIED)
+	_, partSize := fs.partRange(0)
+	inode.Attributes.Size = partSize
+	inode.knownSize = partSize
+	inode.knownETag = "etag-v1"
+	inode.mpu = &MultipartBlobCommitInput{
+		Key:      PString("model.bin"),
+		UploadId: PString("upload-id"),
+		Parts:    make([]*string, 10000),
+	}
+	inode.buffers.Add(0, []byte("dirty"), BUF_DIRTY, false)
+
+	inode.mu.Lock()
+	inode.flushPart(0)
+	inode.mu.Unlock()
+
+	if inode.CacheState != ST_CACHED {
+		t.Fatalf("cache state = %d, want ST_CACHED", inode.CacheState)
+	}
+	if inode.buffers.AnyUnclean() {
+		t.Fatal("stale dirty buffers remained queued after conditional conflict")
+	}
+	if inode.mpu != nil {
+		t.Fatal("stale multipart upload remained active after conditional conflict")
+	}
+	if inode.TryFlush(1) {
+		t.Fatal("conditional conflict remained eligible for immediate reflush")
+	}
+
+	select {
+	case <-aborted:
+	case <-time.After(time.Second):
+		t.Fatal("stale multipart upload was not aborted")
+	}
+}
+
 func TestNonStagedFlushPartSpoolsHashSourceToTempFile(t *testing.T) {
 	flags := cfg.DefaultFlags()
 	flags.CachePath = t.TempDir()
