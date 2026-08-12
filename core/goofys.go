@@ -2654,6 +2654,9 @@ func ReadBackoff(flags *cfg.FlagStorage, try func(attempt int) error) (err error
 }
 
 func mapHttpError(status int) error {
+	if isTransientBackendHTTPStatus(status) {
+		return syscall.EAGAIN
+	}
 	switch status {
 	case 400:
 		return syscall.EINVAL
@@ -2671,13 +2674,6 @@ func mapHttpError(status int) error {
 		return syscall.ERANGE
 	case http.StatusPreconditionFailed:
 		return syscall.EBUSY
-	case http.StatusRequestTimeout,
-		http.StatusTooManyRequests,
-		http.StatusInternalServerError,
-		http.StatusBadGateway,
-		http.StatusServiceUnavailable,
-		http.StatusGatewayTimeout:
-		return syscall.EAGAIN
 	default:
 		return nil
 	}

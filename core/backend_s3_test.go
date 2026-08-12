@@ -222,6 +222,40 @@ func TestListBlobsRetriesRequestTimeout(t *testing.T) {
 	}
 }
 
+func TestHeadBlobRetriesEmptyRequestTimeoutResponse(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("method = %s, want HEAD", r.Method)
+		}
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("ETag", `"model-etag"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	backend := newMetadataDeadlineTestBackend(server.URL, cfg.DefaultFlags(), &cfg.S3Config{
+		MetadataSDKMaxRetries: 1,
+	})
+	response, err := backend.HeadBlob(&HeadBlobInput{Key: "model.bin"})
+	if err != nil {
+		t.Fatalf("head failed after bodyless 408: %v", err)
+	}
+	if response == nil || response.ETag == nil || *response.ETag != `"model-etag"` {
+		t.Fatalf("unexpected head response: %+v", response)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
+	}
+	if got := backend.S3.MaxRetries(); got != 0 {
+		t.Fatalf("client retries = %d, want metadata override to remain request-local", got)
+	}
+}
+
 func TestListBlobsExhaustedRequestTimeoutMapsToEAGAIN(t *testing.T) {
 	var requests atomic.Int32
 	logs := captureS3Log(t)

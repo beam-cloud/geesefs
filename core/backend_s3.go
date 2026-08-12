@@ -158,6 +158,37 @@ func isRetryableBackendError(err error) bool {
 	return isRetryableTransportError(awsErr.OrigErr())
 }
 
+func isTransientBackendHTTPStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+type metadataRetryer struct {
+	client.DefaultRetryer
+}
+
+func (r metadataRetryer) ShouldRetry(req *request.Request) bool {
+	if req == nil {
+		return false
+	}
+	if r.DefaultRetryer.ShouldRetry(req) {
+		return true
+	}
+	if r.NumMaxRetries == 0 || req.Retryable != nil || req.HTTPResponse == nil {
+		return false
+	}
+	return isTransientBackendHTTPStatus(req.HTTPResponse.StatusCode)
+}
+
 func NewS3(bucket string, flags *cfg.FlagStorage, config *cfg.S3Config) (*S3Backend, error) {
 	if config.MultipartCopyThreshold == 0 {
 		config.MultipartCopyThreshold = 128 * 1024 * 1024
@@ -382,7 +413,7 @@ func (s *S3Backend) sendMetadataRequest(req *request.Request) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.metadataHTTPTimeout())
 	defer cancel()
 	if s.config != nil && s.config.MetadataSDKMaxRetries > 0 {
-		req.Retryer = client.DefaultRetryer{NumMaxRetries: s.config.MetadataSDKMaxRetries}
+		req.Retryer = metadataRetryer{DefaultRetryer: client.DefaultRetryer{NumMaxRetries: s.config.MetadataSDKMaxRetries}}
 	}
 	req.SetContext(ctx)
 	return req.Send()
