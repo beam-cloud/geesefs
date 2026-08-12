@@ -2071,8 +2071,10 @@ func (parent *Inode) LookUpInodeMaybeDir(name string) (*BlobItemOutput, error) {
 			if result.blob != nil {
 				return result.blob, nil
 			}
-			if result.err != nil && mapAwsError(result.err) != syscall.ENOENT {
-				return nil, result.err
+			if result.err != nil {
+				if mapped := mapAwsError(result.err); mapped != syscall.ENOENT {
+					return nil, mapped
+				}
 			}
 		}
 		return nil, syscall.ENOENT
@@ -2099,8 +2101,10 @@ func (parent *Inode) LookUpInodeMaybeDir(name string) (*BlobItemOutput, error) {
 	}
 
 	for _, result := range results {
-		if result.err != nil && mapAwsError(result.err) != syscall.ENOENT {
-			return nil, result.err
+		if result.err != nil {
+			if mapped := mapAwsError(result.err); mapped != syscall.ENOENT {
+				return nil, mapped
+			}
 		}
 	}
 	return nil, syscall.ENOENT

@@ -2671,11 +2671,12 @@ func mapHttpError(status int) error {
 		return syscall.ERANGE
 	case http.StatusPreconditionFailed:
 		return syscall.EBUSY
-	case 429:
-		return syscall.EAGAIN
-	case 503:
-		return syscall.EAGAIN
-	case 500:
+	case http.StatusRequestTimeout,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
 		return syscall.EAGAIN
 	default:
 		return nil
@@ -2685,6 +2686,9 @@ func mapHttpError(status int) error {
 func mapAwsError(err error) error {
 	if err == nil {
 		return nil
+	}
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno
 	}
 
 	if awsErr, ok := err.(awserr.Error); ok {
@@ -2702,23 +2706,48 @@ func mapAwsError(err error) error {
 
 		if reqErr, ok := err.(awserr.RequestFailure); ok {
 			// A service error occurred
-			err = mapHttpError(reqErr.StatusCode())
-			if err != nil {
-				return err
-			} else {
-				s3Log.Warnf("http=%v %v s3=%v request=%v\n",
-					reqErr.StatusCode(), reqErr.Message(),
-					awsErr.Code(), reqErr.RequestID())
-				return reqErr
+			if mapped := mapHttpError(reqErr.StatusCode()); mapped != nil {
+				if mapped == syscall.EAGAIN {
+					logExhaustedBackendError(err)
+				}
+				return mapped
 			}
-		} else {
-			// Generic AWS Error with Code, Message, and original error (if any)
-			s3Log.Warnf("code=%v msg=%v, err=%v\n", awsErr.Code(), awsErr.Message(), awsErr.OrigErr())
-			return awsErr
+			if isRetryableBackendError(err) {
+				logExhaustedBackendError(err)
+				return syscall.EAGAIN
+			}
+			s3Log.Warnf("http=%v %v s3=%v request=%v\n",
+				reqErr.StatusCode(), reqErr.Message(),
+				awsErr.Code(), reqErr.RequestID())
+			return reqErr
 		}
-	} else {
-		return err
+		if isRetryableBackendError(err) {
+			logExhaustedBackendError(err)
+			return syscall.EAGAIN
+		}
+		// Generic AWS Error with Code, Message, and original error (if any)
+		s3Log.Warnf("code=%v msg=%v, err=%v\n", awsErr.Code(), awsErr.Message(), awsErr.OrigErr())
+		return awsErr
 	}
+	if isRetryableBackendError(err) {
+		logExhaustedBackendError(err)
+		return syscall.EAGAIN
+	}
+	return err
+}
+
+func logExhaustedBackendError(err error) {
+	if awsErr, ok := err.(awserr.Error); ok {
+		if reqErr, ok := err.(awserr.RequestFailure); ok {
+			s3Log.Warnf("transient backend request exhausted: http=%d s3=%s request=%s message=%s cause=%v",
+				reqErr.StatusCode(), awsErr.Code(), reqErr.RequestID(), awsErr.Message(), awsErr.OrigErr())
+			return
+		}
+		s3Log.Warnf("transient backend request exhausted: s3=%s message=%s cause=%v",
+			awsErr.Code(), awsErr.Message(), awsErr.OrigErr())
+		return
+	}
+	s3Log.Warnf("transient backend request exhausted: cause=%v", err)
 }
 
 func isNoSuchUploadError(err error) bool {

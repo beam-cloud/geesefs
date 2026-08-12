@@ -37,6 +37,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/aws/corehandlers"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/request"
@@ -138,6 +139,23 @@ func isRetryableTransportError(err error) bool {
 	}
 	var netErr net.Error
 	return errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary())
+}
+
+func isRetryableBackendError(err error) bool {
+	if isRetryableTransportError(err) {
+		return true
+	}
+	awsErr, ok := err.(awserr.Error)
+	if !ok {
+		return false
+	}
+	switch awsErr.Code() {
+	case "InternalError", "RequestError", "RequestTimeout", "RequestTimeoutException",
+		"ServiceUnavailable", "SlowDown", "Throttling", "ThrottlingException",
+		"TooManyRequestsException":
+		return true
+	}
+	return isRetryableTransportError(awsErr.OrigErr())
 }
 
 func NewS3(bucket string, flags *cfg.FlagStorage, config *cfg.S3Config) (*S3Backend, error) {
@@ -363,6 +381,9 @@ func (s *S3Backend) metadataHTTPTimeout() time.Duration {
 func (s *S3Backend) sendMetadataRequest(req *request.Request) error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.metadataHTTPTimeout())
 	defer cancel()
+	if s.config != nil && s.config.MetadataSDKMaxRetries > 0 {
+		req.Retryer = client.DefaultRetryer{NumMaxRetries: s.config.MetadataSDKMaxRetries}
+	}
 	req.SetContext(ctx)
 	return req.Send()
 }
@@ -1063,19 +1084,8 @@ func (s *S3Backend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, error) {
 }
 
 func shouldRetry(err error) bool {
-	if isRetryableTransportError(err) {
+	if isRetryableBackendError(err) {
 		return true
-	}
-	if awsErr, ok := err.(awserr.Error); ok {
-		switch awsErr.Code() {
-		case "InternalError", "RequestError", "RequestTimeout", "RequestTimeoutException",
-			"ServiceUnavailable", "SlowDown", "Throttling", "ThrottlingException",
-			"TooManyRequestsException":
-			return true
-		}
-		if isRetryableTransportError(awsErr.OrigErr()) {
-			return true
-		}
 	}
 	err = mapAwsError(err)
 	return err != syscall.ENOENT && err != syscall.EINVAL &&

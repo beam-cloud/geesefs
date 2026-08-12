@@ -1,20 +1,26 @@
 package core
 
 import (
+	"bytes"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/sirupsen/logrus"
 	"github.com/yandex-cloud/geesefs/core/cfg"
 )
 
@@ -22,6 +28,37 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func captureS3Log(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	output := &bytes.Buffer{}
+	originalOutput := s3Log.Out
+	originalLevel := s3Log.Level
+	s3Log.SetOutput(output)
+	s3Log.SetLevel(logrus.WarnLevel)
+	t.Cleanup(func() {
+		s3Log.SetOutput(originalOutput)
+		s3Log.SetLevel(originalLevel)
+	})
+	return output
+}
+
+func newListBlobsTestBackend(t *testing.T, endpoint string, retries int, timeout time.Duration) *S3Backend {
+	t.Helper()
+	flags := cfg.DefaultFlags()
+	flags.Endpoint = endpoint
+	flags.MetadataHTTPTimeout = timeout
+	backend, err := NewS3("bucket", flags, (&cfg.S3Config{
+		AccessKey:             "key",
+		SecretKey:             "secret",
+		ListV2:                true,
+		MetadataSDKMaxRetries: retries,
+	}).Init())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return backend
 }
 
 func newMetadataDeadlineTestBackend(endpoint string, flags *cfg.FlagStorage, config *cfg.S3Config) *S3Backend {
@@ -155,6 +192,165 @@ func TestMultipartCopyPartRetriesTransientInternalError(t *testing.T) {
 	}
 	if got := requests.Load(); got != 2 {
 		t.Fatalf("requests = %d, want 2", got)
+	}
+	if got := backend.S3.MaxRetries(); got != 0 {
+		t.Fatalf("client retries = %d, want metadata override to remain request-local", got)
+	}
+}
+
+func TestListBlobsRetriesRequestTimeout(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusRequestTimeout)
+			_, _ = fmt.Fprint(w, `<Error><Code>RequestTimeout</Code><Message>retry me</Message></Error>`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = fmt.Fprint(w, `<ListBucketResult><Name>bucket</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`)
+	}))
+	defer server.Close()
+
+	backend := newListBlobsTestBackend(t, server.URL, cfg.DefaultMetadataSDKMaxRetries, 0)
+
+	if _, err := backend.ListBlobs(&ListBlobsInput{}); err != nil {
+		t.Fatalf("list failed after transient request timeout: %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
+	}
+}
+
+func TestListBlobsExhaustedRequestTimeoutMapsToEAGAIN(t *testing.T) {
+	var requests atomic.Int32
+	logs := captureS3Log(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/xml")
+		w.Header().Set("X-Amz-Request-Id", "request-408")
+		w.WriteHeader(http.StatusRequestTimeout)
+		_, _ = fmt.Fprint(w, `<Error><Code>RequestTimeout</Code><Message>still unavailable</Message></Error>`)
+	}))
+	defer server.Close()
+
+	backend := newListBlobsTestBackend(t, server.URL, cfg.DefaultMetadataSDKMaxRetries, 0)
+
+	_, err := backend.ListBlobs(&ListBlobsInput{})
+	if err == nil {
+		t.Fatal("expected request timeout")
+	}
+	mapped := mapAwsError(err)
+	if !errors.Is(mapped, syscall.EAGAIN) {
+		t.Fatalf("mapAwsError(%v) = %v, want %v", err, mapped, syscall.EAGAIN)
+	}
+	if remapped := mapAwsError(mapped); remapped != syscall.EAGAIN {
+		t.Fatalf("remapped error = %v, want %v", remapped, syscall.EAGAIN)
+	}
+	if got := requests.Load(); got != int32(cfg.DefaultMetadataSDKMaxRetries+1) {
+		t.Fatalf("requests = %d, want %d", got, cfg.DefaultMetadataSDKMaxRetries+1)
+	}
+	logText := logs.String()
+	if strings.Count(logText, "transient backend request exhausted") != 1 ||
+		!strings.Contains(logText, "http=408") ||
+		!strings.Contains(logText, "s3=RequestTimeout") ||
+		!strings.Contains(logText, "request=request-408") {
+		t.Fatalf("unexpected exhausted request log: %q", logText)
+	}
+}
+
+func TestListBlobsRetriesHonorMetadataDeadline(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		time.Sleep(25 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusRequestTimeout)
+		_, _ = fmt.Fprint(w, `<Error><Code>RequestTimeout</Code><Message>still unavailable</Message></Error>`)
+	}))
+	defer server.Close()
+
+	const metadataTimeout = 75 * time.Millisecond
+	backend := newListBlobsTestBackend(t, server.URL, cfg.DefaultMetadataSDKMaxRetries, metadataTimeout)
+
+	started := time.Now()
+	_, err := backend.ListBlobs(&ListBlobsInput{})
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("expected request timeout")
+	}
+	if mapped := mapAwsError(err); !errors.Is(mapped, syscall.EAGAIN) {
+		t.Fatalf("mapAwsError(%v) = %v, want %v", err, mapped, syscall.EAGAIN)
+	}
+	if got := requests.Load(); got >= int32(cfg.DefaultMetadataSDKMaxRetries+1) {
+		t.Fatalf("requests = %d, want metadata deadline to stop retries before %d", got, cfg.DefaultMetadataSDKMaxRetries+1)
+	}
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("metadata retries took %v, want total deadline near %v", elapsed, metadataTimeout)
+	}
+}
+
+func TestListBlobsHealthyDoesNotRetry(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = fmt.Fprint(w, `<ListBucketResult><Name>bucket</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`)
+	}))
+	defer server.Close()
+
+	backend := newListBlobsTestBackend(t, server.URL, cfg.DefaultMetadataSDKMaxRetries, 0)
+
+	if _, err := backend.ListBlobs(&ListBlobsInput{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+}
+
+func TestListBlobsMetadataRetriesRequireOptIn(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusRequestTimeout)
+		_, _ = fmt.Fprint(w, `<Error><Code>RequestTimeout</Code><Message>do not retry</Message></Error>`)
+	}))
+	defer server.Close()
+
+	backend := newListBlobsTestBackend(t, server.URL, 0, 0)
+
+	_, err := backend.ListBlobs(&ListBlobsInput{})
+	if mapped := mapAwsError(err); !errors.Is(mapped, syscall.EAGAIN) {
+		t.Fatalf("mapAwsError(%v) = %v, want %v", err, mapped, syscall.EAGAIN)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1 without metadata retry opt-in", got)
+	}
+}
+
+func TestRetryableBackendErrorsMapToEAGAIN(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "request timeout code",
+			err:  awserr.New("RequestTimeout", "request timed out", nil),
+		},
+		{
+			name: "request transport timeout",
+			err: awserr.New("RequestError", "request failed", &net.DNSError{
+				IsTimeout: true,
+			}),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := mapAwsError(test.err); !errors.Is(got, syscall.EAGAIN) {
+				t.Fatalf("mapAwsError(%v) = %v, want %v", test.err, got, syscall.EAGAIN)
+			}
+		})
 	}
 }
 

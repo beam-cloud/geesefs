@@ -30,6 +30,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 )
 
+const DefaultMetadataSDKMaxRetries = client.DefaultRetryerMaxNumRetries
+
 type S3Config struct {
 	Profile         string
 	SharedConfig    []string
@@ -45,6 +47,10 @@ type S3Config struct {
 	SDKMaxRetryDelay    time.Duration
 	SDKMinThrottleDelay time.Duration
 	SDKMaxThrottleDelay time.Duration
+
+	// MetadataSDKMaxRetries overrides the retry policy for bounded metadata
+	// requests only. Zero preserves the client's configured retry policy.
+	MetadataSDKMaxRetries int
 
 	RequesterPays bool
 	Region        string
