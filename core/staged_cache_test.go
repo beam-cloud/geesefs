@@ -1808,7 +1808,7 @@ func TestDirectStagedPutUsesImmutableGeneration(t *testing.T) {
 	}
 }
 
-func TestDirectStagedMultipartUsesImmutableGenerationAcrossTruncate(t *testing.T) {
+func TestDirectStagedMultipartAbortsWhenGenerationChangesDuringUpload(t *testing.T) {
 	const partSize = uint64(1024 * 1024)
 	initial := make([]byte, stagedUploadMemorySnapshotLimit+int(partSize)+137)
 	for offset := 0; offset < len(initial); offset += int(partSize) {
@@ -1834,17 +1834,16 @@ func TestDirectStagedMultipartUsesImmutableGenerationAcrossTruncate(t *testing.T
 	root := newRootWithBackend(fs, backend)
 	inode, stagedPath := newStagedRenameInode(t, fs, root, "model.bin", initial)
 
-	var snapshotPath string
+	// Large generations are uploaded straight from the live staged file; a
+	// write while parts are in flight must abort the upload before commit.
 	backend.mutateFirstPart = func() error {
 		matches, err := filepath.Glob(filepath.Join(filepath.Dir(stagedPath), ".geesefs-upload-*"))
 		if err != nil {
 			return err
 		}
-		if len(matches) != 1 {
-			return fmt.Errorf("file-backed upload snapshots = %v, want exactly one", matches)
+		if len(matches) != 0 {
+			return fmt.Errorf("large upload made a file-backed snapshot: %v", matches)
 		}
-		snapshotPath = matches[0]
-
 		if err := inode.SetAttributes(PUInt64(0), nil, nil, nil, nil); err != nil {
 			return err
 		}
@@ -1854,43 +1853,42 @@ func TestDirectStagedMultipartUsesImmutableGenerationAcrossTruncate(t *testing.T
 	if err := fs.flushStagedFile(inode); err != nil {
 		t.Fatal(err)
 	}
-	if snapshotPath == "" {
-		t.Fatal("multipart upload did not use a file-backed immutable snapshot")
+	if committed := backend.committedGenerations(); len(committed) != 0 {
+		t.Fatalf("multipart commits after a mid-upload write = %d, want 0 (aborted)", len(committed))
 	}
-	if _, err := os.Stat(snapshotPath); !os.IsNotExist(err) {
-		t.Fatalf("multipart snapshot was not cleaned after upload: %v", err)
-	}
-	committed := backend.committedGenerations()
-	if len(committed) != 1 {
-		t.Fatalf("first multipart commits = %d, want 1", len(committed))
-	}
-	if !bytes.Equal(committed[0], initial) {
-		t.Fatalf("first multipart commit mixed generations: size=%d want=%d", len(committed[0]), len(initial))
+	backend.mu.Lock()
+	openUploads := len(backend.parts)
+	backend.mu.Unlock()
+	if openUploads != 0 {
+		t.Fatalf("aborted upload left %d multipart uploads open", openUploads)
 	}
 
 	inode.mu.Lock()
 	stagedFile := inode.StagedFile
-	cacheState := inode.CacheState
+	flushError := inode.flushError
 	inode.mu.Unlock()
+	if flushError != nil {
+		t.Fatalf("a superseded generation must not surface as a flush error: %v", flushError)
+	}
 	if stagedFile == nil {
-		t.Fatal("next staged generation was discarded after multipart commit")
+		t.Fatal("next staged generation was discarded after the aborted upload")
 	}
 	stagedFile.mu.Lock()
 	nextDirty := stagedFile.shouldFlush && !stagedFile.flushing && !stagedFile.awaitingRemoteRename
 	stagedFile.mu.Unlock()
-	if !nextDirty || cacheState != ST_MODIFIED {
-		t.Fatalf("next staged generation is not dirty: should_flush=%v cache_state=%d", nextDirty, cacheState)
+	if !nextDirty {
+		t.Fatal("next staged generation is not marked for flush")
 	}
 
 	if err := fs.flushStagedFile(inode); err != nil {
 		t.Fatal(err)
 	}
-	committed = backend.committedGenerations()
-	if len(committed) != 2 {
-		t.Fatalf("multipart commits = %d, want 2", len(committed))
+	committed := backend.committedGenerations()
+	if len(committed) != 1 {
+		t.Fatalf("multipart commits = %d, want 1", len(committed))
 	}
-	if !bytes.Equal(committed[1], replacement) {
-		t.Fatalf("second multipart commit size = %d, want replacement size %d", len(committed[1]), len(replacement))
+	if !bytes.Equal(committed[0], replacement) {
+		t.Fatalf("commit size = %d, want replacement size %d", len(committed[0]), len(replacement))
 	}
 	inode.mu.Lock()
 	stagedFile = inode.StagedFile
@@ -1900,6 +1898,35 @@ func TestDirectStagedMultipartUsesImmutableGenerationAcrossTruncate(t *testing.T
 	}
 	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
 		t.Fatalf("live staged path was not cleaned after replacement upload: %v", err)
+	}
+}
+
+func TestDirectStagedMultipartUploadsLiveFileUnchangedDuringUpload(t *testing.T) {
+	const partSize = uint64(1024 * 1024)
+	data := bytes.Repeat([]byte("stable-generation"), 700000)
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	flags.SinglePartMB = 1
+	flags.MaxParallelParts = 4
+	flags.PartSizes = []cfg.PartSizeConfig{{PartSize: partSize, PartCount: 10000}}
+	fs := newUnitFS(flags)
+	backend := &stagedMultipartBackend{}
+	root := newRootWithBackend(fs, backend)
+	inode, stagedPath := newStagedRenameInode(t, fs, root, "model.bin", data)
+
+	if err := fs.flushStagedFile(inode); err != nil {
+		t.Fatal(err)
+	}
+	committed := backend.committedGenerations()
+	if len(committed) != 1 || !bytes.Equal(committed[0], data) {
+		t.Fatalf("live multipart upload did not commit the staged content (commits=%d)", len(committed))
+	}
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(stagedPath), ".geesefs-upload-*"))
+	if len(matches) != 0 {
+		t.Fatalf("live upload left snapshot files: %v", matches)
 	}
 }
 

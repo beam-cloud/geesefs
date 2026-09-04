@@ -1919,18 +1919,31 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	localFile := stagedFile.FD
 	localPath := localFile.Name()
 	totalSize := inode.Attributes.Size
-	// Every direct upload must read one immutable staged generation. PutObject
-	// retries require a stable Content-Length, and multipart workers must not
-	// observe a mixture of parts when the live file is truncated or rewritten
-	// while an upload is in flight. Large generations use a file-backed snapshot.
-	// The content hash is taken from the same bytes in the same pass, so it
-	// always describes exactly what gets uploaded.
+	// Every direct upload must describe exactly one staged generation. Small
+	// generations are snapshotted into memory. Large ones are read straight
+	// from the live staged file instead of being copied first: every write and
+	// truncate bumps stagedFile.generation under stagedFile.mu, so if the
+	// generation is unchanged right before the multipart upload is committed,
+	// no byte changed while the parts (and the hash) were read and the object
+	// is exactly this generation. If it did change, the upload is aborted
+	// before anything becomes visible and the flusher retries.
 	wantHash := fs.flags.HashAttr != "" && totalSize >= fs.flags.MinFileSizeForHashKB*1024
-	uploadSource, hashString, cleanupUploadSource, snapshotErr := snapshotStagedUpload(localFile, totalSize, wantHash)
-	if snapshotErr != nil {
-		stagedFile.mu.Unlock()
-		inode.mu.Unlock()
-		return snapshotErr
+	var (
+		uploadSource        io.ReaderAt = localFile
+		hashString          string
+		cleanupUploadSource = func() {}
+		// Only multipart uploads can be checked between reading and
+		// committing, so a single PutObject always works from a snapshot.
+		liveUpload = totalSize > stagedUploadMemorySnapshotLimit && totalSize > fs.flags.SinglePartMB*1024*1024
+	)
+	if !liveUpload {
+		var snapshotErr error
+		uploadSource, hashString, cleanupUploadSource, snapshotErr = snapshotStagedUpload(localFile, totalSize, wantHash)
+		if snapshotErr != nil {
+			stagedFile.mu.Unlock()
+			inode.mu.Unlock()
+			return snapshotErr
+		}
 	}
 	defer cleanupUploadSource()
 	flushGeneration := stagedFile.generation
@@ -1962,6 +1975,33 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 		fs.WakeupFlusher()
 	}()
 
+	generationStillCurrent := func() bool {
+		stagedFile.mu.Lock()
+		defer stagedFile.mu.Unlock()
+		return stagedFile.generation == flushGeneration
+	}
+	retryNewGeneration := func() error {
+		// Nothing was committed; the flusher will run again with the new
+		// generation (FinishFlush(true) in the deferred cleanup keeps
+		// shouldFlush set).
+		log.Debugf("Direct staged file changed while being read; retrying with the new generation: inode=%s size=%d", inode.FullName(), totalSize)
+		return nil
+	}
+
+	prepareStarted := time.Now()
+	if liveUpload && wantHash {
+		hashed, hashErr := hashLocalFile(localFile, totalSize)
+		if !generationStillCurrent() {
+			return retryNewGeneration()
+		}
+		if hashErr != nil {
+			inode.mu.Lock()
+			inode.recordFlushError(hashErr)
+			inode.mu.Unlock()
+			return hashErr
+		}
+		hashString = hashed
+	}
 	var hash []byte
 	if wantHash {
 		hash = []byte(hashString)
@@ -1977,15 +2017,29 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	metadata := escapeMetadata(inode.userMetadata)
 	inode.mu.Unlock()
 
-	log.Debugf("Directly flushing staged file: inode=%s size=%d path=%s", inode.FullName(), totalSize, localPath)
-	resp, err := fs.uploadStagedFileDirect(cloud, key, uploadSource, totalSize, contentType, metadata)
+	log.Debugf("Directly flushing staged file: inode=%s size=%d path=%s live=%v prepare=%s", inode.FullName(), totalSize, localPath, liveUpload, time.Since(prepareStarted).Truncate(time.Millisecond))
+	uploadStarted := time.Now()
+	var beforeCommit func() error
+	if liveUpload {
+		beforeCommit = func() error {
+			if !generationStillCurrent() {
+				return errStagedGenerationChanged
+			}
+			return nil
+		}
+	}
+	resp, err := fs.uploadStagedFileDirect(cloud, key, uploadSource, totalSize, contentType, metadata, beforeCommit)
 	if err != nil {
+		if liveUpload && (err == errStagedGenerationChanged || !generationStillCurrent()) {
+			return retryNewGeneration()
+		}
 		log.Warnf("Failed direct staged file flush for %s: %v", inode.FullName(), err)
 		inode.mu.Lock()
 		inode.recordFlushError(err)
 		inode.mu.Unlock()
 		return err
 	}
+	log.Debugf("Direct staged file upload done: inode=%s size=%d upload=%s", inode.FullName(), totalSize, time.Since(uploadStarted).Truncate(time.Millisecond))
 
 	inode.mu.Lock()
 	if inode.StagedFile != stagedFile {
@@ -2217,8 +2271,23 @@ type hash256 interface {
 	Sum(b []byte) []byte
 }
 
-func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key string, file io.ReaderAt, size uint64, contentType *string, metadata map[string]*string) (*MultipartBlobCommitOutput, error) {
+// errStagedGenerationChanged is returned by a beforeCommit hook when the staged
+// file was written to while its parts were being uploaded.
+var errStagedGenerationChanged = errors.New("staged file changed during upload")
+
+// uploadStagedFileDirect uploads size bytes of file to key. For multipart
+// uploads, beforeCommit (if non-nil) runs after every part is uploaded and
+// before the upload is committed; an error from it aborts the upload so that
+// nothing becomes visible.
+func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key string, file io.ReaderAt, size uint64, contentType *string, metadata map[string]*string, beforeCommit func() error) (*MultipartBlobCommitOutput, error) {
 	if size <= fs.flags.SinglePartMB*1024*1024 {
+		if beforeCommit != nil {
+			// A single PutObject cannot be checked between reading and
+			// committing; callers snapshot anything this small instead.
+			if err := beforeCommit(); err != nil {
+				return nil, err
+			}
+		}
 		resp, err := cloud.PutBlob(&PutBlobInput{
 			Key:         key,
 			Metadata:    metadata,
@@ -2355,6 +2424,12 @@ func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key string, file 
 	if uploadErr != nil {
 		_, _ = cloud.MultipartBlobAbort(mpu)
 		return nil, uploadErr
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
+			_, _ = cloud.MultipartBlobAbort(mpu)
+			return nil, err
+		}
 	}
 
 	mpu.NumParts = uint32(len(parts))
