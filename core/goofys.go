@@ -1913,11 +1913,9 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 		return nil
 	}
 
-	if syncErr := stagedFile.FD.Sync(); syncErr != nil {
-		stagedFile.mu.Unlock()
-		inode.mu.Unlock()
-		return syncErr
-	}
+	// The staged file is only the upload source: the object store is what
+	// makes the data durable, so there is no reason to fsync a gigabyte of
+	// staging to local disk before reading it back out of the page cache.
 	localFile := stagedFile.FD
 	localPath := localFile.Name()
 	totalSize := inode.Attributes.Size
@@ -1925,7 +1923,10 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	// retries require a stable Content-Length, and multipart workers must not
 	// observe a mixture of parts when the live file is truncated or rewritten
 	// while an upload is in flight. Large generations use a file-backed snapshot.
-	uploadSource, cleanupUploadSource, snapshotErr := snapshotStagedUpload(localFile, totalSize)
+	// The content hash is taken from the same bytes in the same pass, so it
+	// always describes exactly what gets uploaded.
+	wantHash := fs.flags.HashAttr != "" && totalSize >= fs.flags.MinFileSizeForHashKB*1024
+	uploadSource, hashString, cleanupUploadSource, snapshotErr := snapshotStagedUpload(localFile, totalSize, wantHash)
 	if snapshotErr != nil {
 		stagedFile.mu.Unlock()
 		inode.mu.Unlock()
@@ -1962,11 +1963,7 @@ func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	}()
 
 	var hash []byte
-	if fs.flags.HashAttr != "" && totalSize >= fs.flags.MinFileSizeForHashKB*1024 {
-		hashString, hashErr := hashLocalFile(uploadSource, totalSize)
-		if hashErr != nil {
-			return hashErr
-		}
+	if wantHash {
 		hash = []byte(hashString)
 	}
 
@@ -2102,37 +2099,122 @@ func hashLocalFile(file io.ReaderAt, size uint64) (string, error) {
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
-func snapshotStagedUpload(file *os.File, size uint64) (io.ReaderAt, func(), error) {
+// snapshotStagedUpload copies the first size bytes of a staged file into an
+// immutable upload source and, when hash is set, returns the sha256 of those
+// same bytes. Large files are copied through a small pipeline: one reader
+// pulls 4 MiB chunks out of the page cache while the previous chunk is being
+// written to the snapshot and hashed concurrently, so a 1 GiB flush costs one
+// pass over the data instead of a copy pass followed by a hash pass.
+func snapshotStagedUpload(file *os.File, size uint64, hash bool) (io.ReaderAt, string, func(), error) {
 	if size <= stagedUploadMemorySnapshotLimit {
 		snapshot := make([]byte, int(size))
 		n, err := file.ReadAt(snapshot, 0)
 		if err != nil && err != io.EOF {
-			return nil, nil, err
+			return nil, "", nil, err
 		}
 		if uint64(n) != size {
-			return nil, nil, io.ErrUnexpectedEOF
+			return nil, "", nil, io.ErrUnexpectedEOF
 		}
-		return bytes.NewReader(snapshot), func() {}, nil
+		sum := ""
+		if hash {
+			digest := sha256.Sum256(snapshot)
+			sum = hex.EncodeToString(digest[:])
+		}
+		return bytes.NewReader(snapshot), sum, func() {}, nil
 	}
 
 	snapshot, err := os.CreateTemp(filepath.Dir(file.Name()), ".geesefs-upload-*")
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 	cleanup := func() {
 		_ = snapshot.Close()
 		_ = os.Remove(snapshot.Name())
 	}
-	n, err := io.Copy(snapshot, io.NewSectionReader(file, 0, int64(size)))
-	if err != nil {
-		cleanup()
-		return nil, nil, err
+
+	const chunkSize = 4 * 1024 * 1024
+	const inflight = 3
+	type chunk struct {
+		buf []byte
+		n   int
 	}
-	if uint64(n) != size {
-		cleanup()
-		return nil, nil, io.ErrUnexpectedEOF
+	free := make(chan []byte, inflight)
+	for i := 0; i < inflight; i++ {
+		free <- make([]byte, chunkSize)
 	}
-	return snapshot, cleanup, nil
+	chunks := make(chan chunk, inflight)
+	var hasher hash256
+	if hash {
+		hasher = sha256.New()
+	}
+
+	var consumeErr error
+	consumed := make(chan struct{})
+	go func() {
+		defer close(consumed)
+		for c := range chunks {
+			if consumeErr == nil {
+				data := c.buf[:c.n]
+				if hasher != nil {
+					var wg sync.WaitGroup
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						hasher.Write(data)
+					}()
+					_, consumeErr = snapshot.Write(data)
+					wg.Wait()
+				} else {
+					_, consumeErr = snapshot.Write(data)
+				}
+			}
+			free <- c.buf
+		}
+	}()
+
+	var readErr error
+	for offset := uint64(0); offset < size; {
+		buf := <-free
+		want := uint64(len(buf))
+		if remaining := size - offset; remaining < want {
+			want = remaining
+		}
+		n, err := file.ReadAt(buf[:want], int64(offset))
+		if err != nil && err != io.EOF {
+			free <- buf
+			readErr = err
+			break
+		}
+		if uint64(n) != want {
+			free <- buf
+			readErr = io.ErrUnexpectedEOF
+			break
+		}
+		chunks <- chunk{buf: buf, n: n}
+		offset += uint64(n)
+	}
+	close(chunks)
+	<-consumed
+
+	if readErr != nil {
+		cleanup()
+		return nil, "", nil, readErr
+	}
+	if consumeErr != nil {
+		cleanup()
+		return nil, "", nil, consumeErr
+	}
+	sum := ""
+	if hasher != nil {
+		sum = hex.EncodeToString(hasher.Sum(nil))
+	}
+	return snapshot, sum, cleanup, nil
+}
+
+// hash256 is the subset of hash.Hash used by snapshotStagedUpload.
+type hash256 interface {
+	Write(p []byte) (int, error)
+	Sum(b []byte) []byte
 }
 
 func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key string, file io.ReaderAt, size uint64, contentType *string, metadata map[string]*string) (*MultipartBlobCommitOutput, error) {

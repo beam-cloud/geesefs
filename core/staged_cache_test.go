@@ -2037,7 +2037,7 @@ func TestLargeStagedPutSnapshotIsFileBackedAndImmutable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snapshot, cleanup, err := snapshotStagedUpload(file, size)
+	snapshot, sum, cleanup, err := snapshotStagedUpload(file, size, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2047,6 +2047,10 @@ func TestLargeStagedPutSnapshotIsFileBackedAndImmutable(t *testing.T) {
 		t.Fatalf("large snapshot type = %T, want *os.File", snapshot)
 	}
 	snapshotPath := snapshotFile.Name()
+	if want, err := hashLocalFile(snapshot, size); err != nil || sum != want {
+		cleanup()
+		t.Fatalf("single-pass hash = %q (err %v), want hash of snapshot %q", sum, err, want)
+	}
 	if err := file.Truncate(12); err != nil {
 		cleanup()
 		t.Fatal(err)
@@ -2068,6 +2072,58 @@ func TestLargeStagedPutSnapshotIsFileBackedAndImmutable(t *testing.T) {
 	cleanup()
 	if _, err := os.Stat(snapshotPath); !os.IsNotExist(err) {
 		t.Fatalf("file-backed snapshot was not removed: %v", err)
+	}
+}
+
+func TestSnapshotStagedUploadHashesWhatItCopies(t *testing.T) {
+	for _, size := range []uint64{1, stagedUploadMemorySnapshotLimit, stagedUploadMemorySnapshotLimit + 1, 4*1024*1024*2 + 12345} {
+		path := filepath.Join(t.TempDir(), "staged")
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i*7 + int(size))
+		}
+		if _, err := file.WriteAt(data, 0); err != nil {
+			t.Fatal(err)
+		}
+		// Bytes past size must not leak into the snapshot or the hash.
+		if _, err := file.WriteAt([]byte("junk"), int64(size)); err != nil {
+			t.Fatal(err)
+		}
+
+		snapshot, sum, cleanup, err := snapshotStagedUpload(file, size, true)
+		if err != nil {
+			t.Fatalf("size %d: %v", size, err)
+		}
+		got := make([]byte, size)
+		if _, err := snapshot.ReadAt(got, 0); err != nil && err != io.EOF {
+			cleanup()
+			t.Fatalf("size %d: %v", size, err)
+		}
+		if !bytes.Equal(got, data) {
+			cleanup()
+			t.Fatalf("size %d: snapshot content differs from source", size)
+		}
+		want := sha256.Sum256(data)
+		if sum != hex.EncodeToString(want[:]) {
+			cleanup()
+			t.Fatalf("size %d: hash = %s, want %x", size, sum, want)
+		}
+		cleanup()
+
+		_, sum, cleanup, err = snapshotStagedUpload(file, size, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sum != "" {
+			cleanup()
+			t.Fatalf("size %d: hash computed when not requested", size)
+		}
+		cleanup()
+		file.Close()
 	}
 }
 
