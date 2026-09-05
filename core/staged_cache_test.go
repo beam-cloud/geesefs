@@ -3815,3 +3815,62 @@ func byteSizeName(size int64) string {
 		return "custom"
 	}
 }
+
+// fsync on a staged file whose upload another goroutine already started must
+// not return until that upload has been committed.
+func TestSyncStagedFileWaitsForInFlightUpload(t *testing.T) {
+	payload := []byte("bytes that fsync promises are durable")
+	uploadStarted := make(chan struct{}, 1)
+	releaseUpload := make(chan struct{})
+	backend := &stagedRenameBackend{}
+	backend.PutBlobFunc = func(param *PutBlobInput) (*PutBlobOutput, error) {
+		uploadStarted <- struct{}{}
+		<-releaseUpload
+		if _, err := io.ReadAll(param.Body); err != nil {
+			return nil, err
+		}
+		now := time.Now()
+		return &PutBlobOutput{ETag: PString("etag"), LastModified: &now}, nil
+	}
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, backend)
+	inode, _ := newStagedRenameInode(t, fs, root, "file", payload)
+
+	// The periodic flusher's flush: starts the upload and blocks in PutBlob.
+	flusherDone := make(chan error, 1)
+	go func() { flusherDone <- fs.flushStagedFile(inode) }()
+	select {
+	case <-uploadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the upload to start")
+	}
+
+	// fsync arrives while that upload is in flight.
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- fs.syncStagedFile(inode) }()
+	select {
+	case err := <-syncDone:
+		t.Fatalf("fsync returned (%v) while the upload was still in flight", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseUpload)
+	for _, done := range []chan error{flusherDone, syncDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for flush/sync to finish")
+		}
+	}
+	if inode.StagedFile != nil {
+		t.Fatal("staged file still attached after a committed upload")
+	}
+}

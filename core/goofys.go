@@ -1713,6 +1713,50 @@ func (fs *Goofys) flushStagedFile(inode *Inode) error {
 	return fs.flushStagedFileDirect(inode)
 }
 
+// syncStagedFileWait is how long syncStagedFile sleeps between checks on a
+// flush that another goroutine is running.
+const syncStagedFileWait = 5 * time.Millisecond
+
+// syncStagedFile is flushStagedFile for fsync and fsync-on-close: it returns
+// only once the staged bytes are in the object store (or the upload failed).
+// flushStagedFile returns nil straight away when a flush is already running,
+// which is right for the periodic flusher but would let fsync report
+// durability for a gigabyte still on its way up.
+func (fs *Goofys) syncStagedFile(inode *Inode) error {
+	for {
+		if err := fs.flushStagedFileDirect(inode); err != nil {
+			return err
+		}
+
+		inode.mu.Lock()
+		stagedFile := inode.StagedFile
+		flushErr := inode.flushError
+		renaming := inode.renamingTo
+		inode.mu.Unlock()
+		if stagedFile == nil || renaming {
+			// Uploaded (the staged generation is released once the object is
+			// committed), or a rename owns the file and will flush it.
+			return nil
+		}
+		if flushErr != nil {
+			return flushErr
+		}
+
+		stagedFile.mu.Lock()
+		done := stagedFile.FD == nil || stagedFile.awaitingRemoteRename
+		stagedFile.mu.Unlock()
+		if done {
+			// awaitingRemoteRename: the bytes are committed under the old key
+			// and only the rename is outstanding.
+			return nil
+		}
+
+		// Either a flush is in progress (ours or the flusher's) or the last
+		// one saw the file change and left it for a retry; wait and go again.
+		time.Sleep(syncStagedFileWait)
+	}
+}
+
 func (fs *Goofys) flushStagedFileBuffered(inode *Inode) (err error) {
 	inode.mu.Lock()
 

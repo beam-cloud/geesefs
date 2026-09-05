@@ -746,7 +746,7 @@ func (fs *GoofysFuse) SyncFile(
 		} else if in.isDir() {
 			err = fs.SyncTree(in)
 		} else if in.StagedFile != nil {
-			err = in.fs.flushStagedFile(in)
+			err = in.fs.syncStagedFile(in)
 		} else {
 			err = in.SyncFile()
 		}
@@ -801,7 +801,7 @@ func (fs *GoofysFuse) ReleaseFileHandle(
 
 	if fh.inode.fs.flags.FsyncOnClose {
 		if fh.inode.StagedFile != nil {
-			err = fh.inode.fs.flushStagedFile(fh.inode)
+			err = fh.inode.fs.syncStagedFile(fh.inode)
 			if err != nil {
 				return err
 			}
