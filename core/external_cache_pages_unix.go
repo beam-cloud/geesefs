@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	externalPageMmapWindowBytes       = 64 * 1024 * 1024
+	externalPageMmapWindowBytes       = 16 * 1024 * 1024
 	externalPageMmapMaxBytes          = 2 * 1024 * 1024 * 1024
 	externalPageMmapPoolShareDivisor  = 2
 	externalPagePrefetchAheadBytes    = 1024 * 1024 * 1024
@@ -630,7 +630,7 @@ func (fh *FileHandle) externalWindowLocal(pageCache cfg.ContentCacheClientLocalP
 // scheduleExternalPagePrefetch queues read-ahead windows from start. With FD
 // reads, content that is already on this node is served by the kernel from the
 // page file, so prefetch only hints the next window into the page cache.
-// Content that is still remote (remote=true) is pulled in 64 MiB windows over
+// Content that is still remote (remote=true) is pulled in 16 MiB windows over
 // the wire so sequential reads run at link speed.
 func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto, remote bool) {
 	if hash == "" || (pageCache == nil && readIntoCache == nil) || start >= fileSize {
