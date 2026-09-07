@@ -1731,28 +1731,30 @@ func (fs *Goofys) syncStagedFile(inode *Inode) error {
 		inode.mu.Lock()
 		stagedFile := inode.StagedFile
 		flushErr := inode.flushError
-		renaming := inode.renamingTo
+		renamePending := inode.oldParent != nil || inode.renamingTo
 		inode.mu.Unlock()
-		if stagedFile == nil || renaming {
-			// Uploaded (the staged generation is released once the object is
-			// committed), or a rename owns the file and will flush it.
-			return nil
-		}
 		if flushErr != nil {
 			return flushErr
 		}
-
-		stagedFile.mu.Lock()
-		done := stagedFile.FD == nil || stagedFile.awaitingRemoteRename
-		stagedFile.mu.Unlock()
-		if done {
-			// awaitingRemoteRename: the bytes are committed under the old key
-			// and only the rename is outstanding.
+		if stagedFile == nil {
+			// Released once the object is committed under its final key.
 			return nil
 		}
 
-		// Either a flush is in progress (ours or the flusher's) or the last
-		// one saw the file change and left it for a retry; wait and go again.
+		stagedFile.mu.Lock()
+		uploaded := stagedFile.FD == nil || stagedFile.awaitingRemoteRename
+		stagedFile.mu.Unlock()
+		if uploaded && !renamePending {
+			return nil
+		}
+		if uploaded {
+			// Committed under the old key; other mounts see the file only
+			// after the remote rename, so wait for it and make sure it runs.
+			inode.TryFlush(MAX_FLUSH_PRIORITY)
+			fs.WakeupFlusher()
+		}
+
+		// Upload or rename still in flight; wait and go again.
 		time.Sleep(syncStagedFileWait)
 	}
 }
@@ -3058,8 +3060,22 @@ func (fs *Goofys) SyncTree(parent *Inode) (err error) {
 		fs.mu.RLock()
 		inode := fs.inodes[id]
 		fs.mu.RUnlock()
-		if inode != nil {
-			inode.SyncFile()
+		if inode == nil {
+			continue
+		}
+		// Staged files keep their bytes out of buffers, so SyncFile would
+		// return while the upload is still in flight.
+		inode.mu.Lock()
+		staged := inode.StagedFile != nil
+		inode.mu.Unlock()
+		var syncErr error
+		if staged {
+			syncErr = fs.syncStagedFile(inode)
+		} else {
+			syncErr = inode.SyncFile()
+		}
+		if syncErr != nil && err == nil {
+			err = syncErr
 		}
 	}
 	return

@@ -3874,3 +3874,163 @@ func TestSyncStagedFileWaitsForInFlightUpload(t *testing.T) {
 		t.Fatal("staged file still attached after a committed upload")
 	}
 }
+
+// fsync after a rename during the upload must wait for the remote rename too.
+func TestSyncStagedFileWaitsForRemoteRename(t *testing.T) {
+	const (
+		oldName = "model.safetensors.incomplete"
+		newName = "model.safetensors"
+	)
+	payload := []byte("model weights")
+	uploadStarted := make(chan struct{}, 1)
+	releaseUpload := make(chan struct{})
+	copied := make(chan *CopyBlobInput, 1)
+	releaseCopy := make(chan struct{})
+	backend := &stagedRenameBackend{}
+	backend.PutBlobFunc = func(param *PutBlobInput) (*PutBlobOutput, error) {
+		uploadStarted <- struct{}{}
+		<-releaseUpload
+		if _, err := io.ReadAll(param.Body); err != nil {
+			return nil, err
+		}
+		now := time.Now()
+		return &PutBlobOutput{ETag: PString("etag"), LastModified: &now}, nil
+	}
+	backend.CopyBlobFunc = func(param *CopyBlobInput) (*CopyBlobOutput, error) {
+		copied <- param
+		<-releaseCopy
+		return &CopyBlobOutput{}, nil
+	}
+	backend.GetBlobFunc = func(param *GetBlobInput) (*GetBlobOutput, error) {
+		return nil, syscall.ENOENT
+	}
+	backend.deleteBlob = func(param *DeleteBlobInput) (*DeleteBlobOutput, error) {
+		return &DeleteBlobOutput{}, nil
+	}
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, backend)
+	inode, _ := newStagedRenameInode(t, fs, root, oldName, payload)
+
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- fs.flushStagedFile(inode) }()
+	select {
+	case <-uploadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the upload to start")
+	}
+	if err := root.Rename(oldName, root, newName); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseUpload)
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the upload")
+	}
+
+	// Upload done, remote rename outstanding: fsync must block on the copy.
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- fs.syncStagedFile(inode) }()
+	select {
+	case copyInput := <-copied:
+		if copyInput.Source != oldName || copyInput.Destination != newName {
+			t.Fatalf("remote copy = %q -> %q, want %q -> %q", copyInput.Source, copyInput.Destination, oldName, newName)
+		}
+	case err := <-syncDone:
+		t.Fatalf("fsync returned (%v) before the remote rename was even scheduled", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("fsync did not schedule the pending remote rename")
+	}
+	select {
+	case err := <-syncDone:
+		t.Fatalf("fsync returned (%v) while the remote rename was still in flight", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseCopy)
+	select {
+	case err := <-syncDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for fsync after the remote rename")
+	}
+	inode.mu.Lock()
+	oldParent, stagedFile := inode.oldParent, inode.StagedFile
+	inode.mu.Unlock()
+	if oldParent != nil || stagedFile != nil {
+		t.Fatalf("fsync returned with rename pending=%v staged=%v", oldParent != nil, stagedFile != nil)
+	}
+}
+
+// sync(2)/syncfs(2) reach SyncTree; it must wait for in-flight staged uploads.
+func TestSyncTreeWaitsForStagedUpload(t *testing.T) {
+	payload := []byte("bytes that sync promises are durable")
+	uploadStarted := make(chan struct{}, 1)
+	releaseUpload := make(chan struct{})
+	backend := &stagedRenameBackend{}
+	backend.PutBlobFunc = func(param *PutBlobInput) (*PutBlobOutput, error) {
+		uploadStarted <- struct{}{}
+		<-releaseUpload
+		if _, err := io.ReadAll(param.Body); err != nil {
+			return nil, err
+		}
+		now := time.Now()
+		return &PutBlobOutput{ETag: PString("etag"), LastModified: &now}, nil
+	}
+
+	flags := cfg.DefaultFlags()
+	flags.HashAttr = ""
+	flags.StagedWriteModeEnabled = true
+	flags.StagedWritePath = t.TempDir()
+	fs := newUnitFS(flags)
+	root := newRootWithBackend(fs, backend)
+	inode, _ := newStagedRenameInode(t, fs, root, "file", payload)
+	fs.mu.Lock()
+	if fs.inodes == nil {
+		fs.inodes = make(map[fuseops.InodeID]*Inode)
+	}
+	fs.inodes[root.Id] = root
+	fs.inodes[inode.Id] = inode
+	fs.mu.Unlock()
+
+	flusherDone := make(chan error, 1)
+	go func() { flusherDone <- fs.flushStagedFile(inode) }()
+	select {
+	case <-uploadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the upload to start")
+	}
+
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- fs.SyncTree(nil) }()
+	select {
+	case err := <-syncDone:
+		t.Fatalf("SyncTree returned (%v) while the staged upload was still in flight", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseUpload)
+	for _, done := range []chan error{flusherDone, syncDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for flush/sync to finish")
+		}
+	}
+	if inode.StagedFile != nil {
+		t.Fatal("staged file still attached after a committed upload")
+	}
+}
