@@ -309,7 +309,7 @@ func TestExternalCachePrefetchPrefersReadInto(t *testing.T) {
 	inode := NewInode(fs, nil, "file")
 	fh := NewFileHandle(inode)
 
-	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto))
+	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto), false)
 
 	deadline := time.After(2 * time.Second)
 	for {
@@ -366,7 +366,7 @@ func TestExternalCachePrefetchFallsBackToPageFilesWhenReadIntoFails(t *testing.T
 	inode := NewInode(fs, nil, "file")
 	fh := NewFileHandle(inode)
 
-	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto))
+	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), flags.ExternalCacheClient.(cfg.ContentCacheReadInto), false)
 
 	deadline := time.After(2 * time.Second)
 	for {
@@ -547,7 +547,7 @@ func TestExternalPageReorderedReadsExtendPrefetchToEOF(t *testing.T) {
 			if !fh.observeExternalPageRead(hash, offset, mib) {
 				t.Fatalf("reordered read at offset %d broke the sequential run", offset)
 			}
-			fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+mib), fileSize, pageCache, nil)
+			fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+mib), fileSize, pageCache, nil, false)
 		}
 	}
 
@@ -630,7 +630,7 @@ func TestExternalCachePrefetchQueueSustainsConcurrency(t *testing.T) {
 	cache := fs.externalPageCache()
 	fileSize := uint64(externalPageMmapWindowBytes * (externalPagePrefetchMaxConcurrent + externalPagePrefetchMaxQueued))
 
-	fh.scheduleExternalPagePrefetch("hash", 0, fileSize, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), nil)
+	fh.scheduleExternalPagePrefetch("hash", 0, fileSize, flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews), nil, false)
 
 	for i := 0; i < externalPagePrefetchMaxConcurrent; i++ {
 		select {
@@ -826,7 +826,7 @@ func TestExternalPageCachePreservesForegroundMountMemory(t *testing.T) {
 	inode := NewInode(fs, nil, "file")
 	fh := NewFileHandle(inode)
 	pageCache := flags.ExternalCacheClient.(cfg.ContentCacheClientLocalPageFileViews)
-	fh.scheduleExternalPagePrefetch("hash", 0, externalPagePrefetchAheadBytes, pageCache, nil)
+	fh.scheduleExternalPagePrefetch("hash", 0, externalPagePrefetchAheadBytes, pageCache, nil, false)
 	waitForExternalPageCondition(t, time.Second, func() bool {
 		cache.mu.Lock()
 		defer cache.mu.Unlock()

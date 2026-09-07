@@ -75,6 +75,9 @@ type externalPagePrefetchKey struct {
 
 type externalPagePrefetchState struct {
 	done chan struct{}
+	// data is set when the job publishes a window readers can wait for; FD-mode
+	// hint jobs only warm the kernel page cache.
+	data bool
 }
 
 type externalPagePrefetchJob struct {
@@ -265,7 +268,7 @@ func (fh *FileHandle) tryReadExternalCachePagesWithFD(offset, size uint64, allow
 		hitCount := atomic.AddInt64(&fh.inode.fs.stats.externalPageHits, 1)
 		atomic.AddInt64(&fh.inode.fs.stats.externalPageBytes, int64(size))
 		if sequential {
-			fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
+			fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache, true)
 		}
 		fh.logExternalPageHit(path, hash, offset, size, 0, "mmap_cache", started, time.Time{}, hitCount)
 		return data, int(size), nil, callback, true, nil
@@ -286,12 +289,11 @@ func (fh *FileHandle) tryReadExternalCachePagesWithFD(offset, size uint64, allow
 	if prefetchEnd > fileSize {
 		prefetchEnd = fileSize
 	}
-	// FD-mode prefetch only issues page-cache hints; it never publishes an mmap
-	// window for lookup below. Waiting for that job can therefore add the full
-	// foreground timeout without producing a usable result. Go straight to the
-	// exact single-view FD lookup while the hint proceeds independently.
-	if !allowExternalFD && offset+size <= prefetchEnd {
-		prefetchDone := mmapCache.prefetchDone(hash, windowOffset, prefetchEnd)
+	// Wait only for a window that will be published for lookup below. FD-mode
+	// hint jobs never publish one, so waiting on them would cost the full
+	// timeout for nothing; the exact FD lookup proceeds while the hint runs.
+	if offset+size <= prefetchEnd {
+		prefetchDone := mmapCache.prefetchDataDone(hash, windowOffset, prefetchEnd, !allowExternalFD)
 		joined := prefetchDone != nil
 		finished := false
 		if joined {
@@ -329,7 +331,7 @@ func (fh *FileHandle) tryReadExternalCachePagesWithFD(offset, size uint64, allow
 			hitCount := atomic.AddInt64(&fh.inode.fs.stats.externalPageHits, 1)
 			atomic.AddInt64(&fh.inode.fs.stats.externalPageBytes, int64(size))
 			if sequential {
-				fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
+				fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache, true)
 			}
 			source := "mmap_cache_race"
 			if joined {
@@ -347,7 +349,7 @@ func (fh *FileHandle) tryReadExternalCachePagesWithFD(offset, size uint64, allow
 			hitCount := atomic.AddInt64(&fh.inode.fs.stats.externalPageHits, 1)
 			atomic.AddInt64(&fh.inode.fs.stats.externalPageBytes, int64(size))
 			if sequential {
-				fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
+				fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache, false)
 			}
 			fh.logExternalPageHit(path, hash, offset, size, 1, "fd_page_file", started, time.Time{}, hitCount)
 			return nil, int(size), fdRead, callback, true, nil
@@ -422,7 +424,7 @@ func (fh *FileHandle) tryReadExternalCachePagesWithFD(offset, size uint64, allow
 	hitCount := atomic.AddInt64(&fh.inode.fs.stats.externalPageHits, 1)
 	atomic.AddInt64(&fh.inode.fs.stats.externalPageBytes, int64(size))
 	if sequential {
-		fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
+		fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache, false)
 	}
 	fh.logExternalPageHit(path, hash, offset, size, len(views), "client_local_page_file", started, mmapStarted, hitCount)
 	return data, int(size), nil, callback, true, nil
@@ -595,28 +597,51 @@ func (fh *FileHandle) prefetchExternalCachePagesOnOpen() {
 		return
 	}
 
-	fh.scheduleExternalPagePrefetch(hash, 0, fileSize, pageCache, readIntoCache)
+	// One local lookup decides whether this open pulls the file over the wire.
+	remote := fh.inode.fs.externalCacheFDReadsEnabled() && readIntoCache != nil && pageCache != nil &&
+		!fh.externalWindowLocal(pageCache, hash, 0, fileSize)
+	fh.scheduleExternalPagePrefetch(hash, 0, fileSize, pageCache, readIntoCache, remote)
 }
 
-func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto) {
-	fdMode := fh.inode.fs.externalCacheFDReadsEnabled()
-	if fdMode {
-		// The kernel will move foreground bytes straight from a local page file.
-		// Prefetch only needs to ask the kernel to warm those page-file ranges;
-		// building mmap or heap windows here would duplicate the same I/O.
-		readIntoCache = nil
+// externalWindowLocal reports whether the aligned window at start is fully
+// held by a store on this node.
+func (fh *FileHandle) externalWindowLocal(pageCache cfg.ContentCacheClientLocalPageFileViews, hash string, start, fileSize uint64) bool {
+	end := start + externalPageMmapWindowBytes
+	if end > fileSize {
+		end = fileSize
 	}
+	if end <= start {
+		return true
+	}
+	views, err := fh.inode.fs.externalCacheClientLocalPageFileViews(pageCache, hash, int64(start), int64(end-start))
+	if err != nil || len(views) == 0 {
+		return false
+	}
+	var covered uint64
+	for _, view := range views {
+		if view.Length <= 0 {
+			return false
+		}
+		covered += uint64(view.Length)
+	}
+	return covered == end-start
+}
+
+// scheduleExternalPagePrefetch queues read-ahead windows from start. With FD
+// reads, content that is already on this node is served by the kernel from the
+// page file, so prefetch only hints the next window into the page cache.
+// Content that is still remote (remote=true) is pulled in 64 MiB windows over
+// the wire so sequential reads run at link speed.
+func (fh *FileHandle) scheduleExternalPagePrefetch(hash string, start, fileSize uint64, pageCache cfg.ContentCacheClientLocalPageFileViews, readIntoCache cfg.ContentCacheReadInto, remote bool) {
 	if hash == "" || (pageCache == nil && readIntoCache == nil) || start >= fileSize {
 		return
 	}
-
 	start = externalPageWindowStart(start)
 	cache := fh.inode.fs.externalPageCache()
+	fdMode := fh.inode.fs.externalCacheFDReadsEnabled() && !remote
 	aheadBytes := uint64(externalPagePrefetchAheadBytes)
 	if fdMode {
-		// FD reads rely on the kernel page cache, whose readahead is most useful
-		// as a short sequential lookahead. Keep only the next aligned window in
-		// flight instead of flooding the device with the generic 1 GiB fan-out.
+		readIntoCache = nil
 		aheadBytes = externalPageMmapWindowBytes
 	}
 	cache.mu.Lock()
@@ -710,8 +735,8 @@ func (fh *FileHandle) tryReadExternalCacheInto(path, hash string, offset, size, 
 			pageCache = nil
 		}
 		readIntoCache, _ := fh.inode.fs.flags.ExternalCacheClient.(cfg.ContentCacheReadInto)
-		fh.scheduleExternalPagePrefetch(hash, offset, fileSize, pageCache, readIntoCache)
-		fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache)
+		fh.scheduleExternalPagePrefetch(hash, offset, fileSize, pageCache, readIntoCache, true)
+		fh.scheduleExternalPagePrefetch(hash, externalPageWindowEnd(offset+size), fileSize, pageCache, readIntoCache, true)
 	}
 
 	released := int32(0)
@@ -945,7 +970,7 @@ func (c *externalPageMmapCache) prefetchWindowMode(fs *Goofys, cacheKey string, 
 		return false
 	}
 
-	state := &externalPagePrefetchState{done: make(chan struct{})}
+	state := &externalPagePrefetchState{done: make(chan struct{}), data: !fdMode}
 	job := externalPagePrefetchJob{
 		fs:            fs,
 		key:           key,
@@ -1122,11 +1147,17 @@ func (c *externalPageMmapCache) finishPrefetch(job externalPagePrefetchJob, succ
 }
 
 func (c *externalPageMmapCache) prefetchDone(cacheKey string, offset, end uint64) <-chan struct{} {
+	return c.prefetchDataDone(cacheKey, offset, end, true)
+}
+
+// prefetchDataDone returns the in-flight job for the window, or nil. With
+// any=false only jobs that publish a data window are returned.
+func (c *externalPageMmapCache) prefetchDataDone(cacheKey string, offset, end uint64, any bool) <-chan struct{} {
 	key := externalPagePrefetchKey{cacheKey: cacheKey, offset: offset, end: end}
 	c.mu.Lock()
 	state := c.prefetching[key]
 	c.mu.Unlock()
-	if state == nil {
+	if state == nil || (!any && !state.data) {
 		return nil
 	}
 	return state.done

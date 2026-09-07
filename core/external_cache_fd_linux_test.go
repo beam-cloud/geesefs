@@ -270,7 +270,7 @@ func TestExternalCacheFDPrefetchUsesPageFileHintsOnly(t *testing.T) {
 	defer fs.closeExternalPageMmapCache()
 	pageCache := cfg.ContentCacheClientLocalPageFileViews(cache)
 	readInto := cfg.ContentCacheReadInto(cache)
-	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), pageCache, readInto)
+	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), pageCache, readInto, false)
 	cacheState := fs.externalPageCache()
 	waitForExternalPageCondition(t, time.Second, func() bool {
 		cacheState.mu.Lock()
@@ -331,7 +331,7 @@ func TestExternalCacheFDReadDoesNotWaitForHintOnlyPrefetch(t *testing.T) {
 	fs, inode, fh := newExternalFDTestFile(t, nil, cache)
 	inode.Attributes.Size = fileSize
 	defer fs.closeExternalPageMmapCache()
-	fh.scheduleExternalPagePrefetch("hash", 0, fileSize, cache, nil)
+	fh.scheduleExternalPagePrefetch("hash", 0, fileSize, cache, nil, false)
 	select {
 	case <-prefetchStarted:
 	case <-time.After(time.Second):
@@ -366,6 +366,88 @@ func TestExternalCacheFDReadDoesNotWaitForHintOnlyPrefetch(t *testing.T) {
 	}, "hint-only prefetch to finish")
 }
 
+// Remote content under FD reads: prefetch pulls whole windows over the wire and
+// the foreground read waits for its window instead of issuing its own fetch.
+func TestExternalCacheFDRemoteContentPrefetchesDataWindows(t *testing.T) {
+	const (
+		fileSize = uint64(externalPageMmapWindowBytes) + 4096
+		readSize = int64(1024 * 1024)
+	)
+	var readIntoCalls atomic.Int64
+	releaseWindow := make(chan struct{})
+	cache := &fakeContentCache{
+		clientLocalPageFileViews: func(hash string, offset int64, length int64, opts struct{ RoutingKey string }) ([]cfg.ClientLocalPageFileView, error) {
+			return nil, errContentNotFound
+		},
+		readContentInto: func(ctx context.Context, hash string, offset int64, dst []byte, opts struct{ RoutingKey string }) (int64, error) {
+			readIntoCalls.Add(1)
+			if offset == 0 {
+				<-releaseWindow
+			}
+			for i := range dst {
+				dst[i] = byte((offset + int64(i)) % 251)
+			}
+			return int64(len(dst)), nil
+		},
+	}
+	fs, inode, fh := newExternalFDTestFile(t, nil, cache)
+	inode.Attributes.Size = fileSize
+	defer fs.closeExternalPageMmapCache()
+
+	fh.prefetchExternalCachePagesOnOpen()
+	waitForExternalPageCondition(t, time.Second, func() bool { return readIntoCalls.Load() >= 2 }, "remote window prefetch")
+
+	done := make(chan struct{})
+	var data [][]byte
+	var bytesRead int
+	var fdRead *externalCacheFDRead
+	var err error
+	go func() {
+		defer close(done)
+		var callback func()
+		data, bytesRead, fdRead, callback, err = fh.readFileWithCallback(int64(readSize), readSize, true)
+		if callback != nil {
+			callback()
+		}
+	}()
+	select {
+	case <-done:
+		close(releaseWindow)
+		t.Fatalf("foreground read did not wait for the in-flight data window: bytes=%d fd=%v err=%v", bytesRead, fdRead != nil, err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseWindow)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fdRead != nil || bytesRead != int(readSize) {
+		t.Fatalf("remote read served as fd=%v bytes=%d", fdRead != nil, bytesRead)
+	}
+	var got []byte
+	for _, part := range data {
+		got = append(got, part...)
+	}
+	for i, b := range got {
+		if want := byte((readSize + int64(i)) % 251); b != want {
+			t.Fatalf("byte %d = %d, want %d", i, b, want)
+		}
+	}
+	if got := atomic.LoadInt64(&fs.stats.externalPrefetch.waitHits); got != 1 {
+		t.Fatalf("prefetch wait hits=%d, want 1", got)
+	}
+	// Both windows of the file came over the wire; the foreground read did not add a third fetch.
+	waitForExternalPageCondition(t, time.Second, func() bool {
+		cacheState := fs.externalPageCache()
+		cacheState.mu.Lock()
+		defer cacheState.mu.Unlock()
+		return cacheState.prefetchActive == 0 && len(cacheState.prefetchQueue) == 0
+	}, "remote prefetch to drain")
+	if got := readIntoCalls.Load(); got != 2 {
+		t.Fatalf("read-into calls=%d, want 2 (one per window)", got)
+	}
+}
+
 func TestExternalCacheFDPrefetchFailedHintIsNotCountedAsSuccess(t *testing.T) {
 	payload := []byte("prefetch")
 	missingPath := filepath.Join(t.TempDir(), "missing-page")
@@ -381,7 +463,7 @@ func TestExternalCacheFDPrefetchFailedHintIsNotCountedAsSuccess(t *testing.T) {
 	}
 	fs, _, fh := newExternalFDTestFile(t, payload, cache)
 	defer fs.closeExternalPageMmapCache()
-	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), cache, cache)
+	fh.scheduleExternalPagePrefetch("hash", 0, uint64(len(payload)), cache, cache, false)
 	cacheState := fs.externalPageCache()
 	waitForExternalPageCondition(t, time.Second, func() bool {
 		cacheState.mu.Lock()
@@ -435,7 +517,7 @@ func TestExternalCacheFDPrefetchKeepsOneAlignedWindowAhead(t *testing.T) {
 	defer fs.closeExternalPageMmapCache()
 	pageCache := cfg.ContentCacheClientLocalPageFileViews(cache)
 
-	fh.scheduleExternalPagePrefetch("hash", 0, fileSize, pageCache, nil)
+	fh.scheduleExternalPagePrefetch("hash", 0, fileSize, pageCache, nil, false)
 	select {
 	case got := <-started:
 		if got.offset != 0 || got.length != window {
@@ -466,7 +548,7 @@ func TestExternalCacheFDPrefetchKeepsOneAlignedWindowAhead(t *testing.T) {
 		return cacheState.prefetchActive == 0
 	}, "initial FD lookahead to finish")
 
-	fh.scheduleExternalPagePrefetch("hash", uint64(window), fileSize, pageCache, nil)
+	fh.scheduleExternalPagePrefetch("hash", uint64(window), fileSize, pageCache, nil, false)
 	select {
 	case got := <-started:
 		if got.offset != window || got.length != window {
