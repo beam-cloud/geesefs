@@ -1759,179 +1759,6 @@ func (fs *Goofys) syncStagedFile(inode *Inode) error {
 	}
 }
 
-func (fs *Goofys) flushStagedFileBuffered(inode *Inode) (err error) {
-	inode.mu.Lock()
-
-	stagedFile := inode.StagedFile
-	if stagedFile == nil {
-		inode.fs.stagedFiles.Delete(inode.Id)
-		inode.mu.Unlock()
-		return nil
-	}
-
-	stagedFile.mu.Lock()
-	if stagedFile.flushing {
-		stagedFile.mu.Unlock()
-		inode.mu.Unlock()
-		return nil
-	}
-
-	if inode.flushError != nil {
-		if time.Since(inode.flushErrorTime) < inode.fs.flags.RetryInterval {
-			err = inode.flushError
-			stagedFile.mu.Unlock()
-			inode.mu.Unlock()
-			return err
-		}
-		inode.flushError = nil
-	}
-
-	totalSize := int64(inode.Attributes.Size)
-
-	stagedFile.flushing = true
-	stagedFile.shouldFlush = true
-	stagedFile.mu.Unlock()
-
-	inode.mu.Unlock()
-
-	defer func() {
-		if err != nil {
-			stagedFile.FinishFlush(true)
-			fs.WakeupFlusher()
-		}
-	}()
-
-	fs.WakeupFlusher()
-	offset := int64(0)
-
-	for offset < totalSize {
-		chunkSize := fs.flags.StagedWriteFlushSize
-		if totalSize-offset < int64(fs.flags.StagedWriteFlushSize) {
-			chunkSize = uint64(totalSize - offset)
-		}
-
-		// Lock this part's range while we're reading / flushing it
-		inode.mu.Lock()
-		inode.LockRange(uint64(offset), chunkSize, true)
-		inode.mu.Unlock()
-
-		var n int
-		var readErr error
-		{
-			stagedFile.mu.Lock()
-			if stagedFile.FD == nil {
-				stagedFile.mu.Unlock()
-				inode.mu.Lock()
-				inode.UnlockRange(uint64(offset), chunkSize, true)
-				inode.mu.Unlock()
-				err = syscall.EAGAIN
-				return err
-			}
-			buf := make([]byte, chunkSize)
-			n, readErr = stagedFile.FD.ReadAt(buf, offset)
-			stagedFile.mu.Unlock()
-
-			if readErr != nil && readErr != io.EOF {
-				log.Errorf("Error reading from staged file: %v", readErr)
-				inode.mu.Lock()
-				inode.UnlockRange(uint64(offset), chunkSize, true)
-				inode.mu.Unlock()
-				err = readErr
-				return err
-			}
-
-			if n == 0 {
-				inode.mu.Lock()
-				inode.UnlockRange(uint64(offset), chunkSize, true)
-				inode.mu.Unlock()
-				if offset < totalSize {
-					err = io.ErrUnexpectedEOF
-				}
-				return err
-			}
-
-			// Check if readers want to interrupt this flush
-			inode.mu.Lock()
-			canProceed := inode.checkPauseWritersInterruptible()
-			if !canProceed {
-				// Readers are waiting - yield to them and retry later
-				log.Debugf("Staged file flush interrupted by readers for %s, will retry", inode.FullName())
-				inode.UnlockRange(uint64(offset), chunkSize, true)
-
-				// Reset flushing state so it can be retried
-				stagedFile.FinishFlush(true)
-
-				inode.mu.Unlock()
-				return nil // Exit and let readers proceed, staged file will be retried later
-			}
-			inode.mu.Unlock()
-
-			copyData := len(buf) < cap(buf)-4096
-			err = stagedFile.FH.WriteFile(offset, buf[:n], copyData)
-			if err != nil {
-				log.Errorf("Error writing staged data data for flush: %v", err)
-				inode.mu.Lock()
-				inode.UnlockRange(uint64(offset), chunkSize, true)
-				inode.mu.Unlock()
-				return err
-			}
-		}
-
-		// Unlock this part's range after it's ready to flush
-		inode.mu.Lock()
-		inode.UnlockRange(uint64(offset), chunkSize, true)
-		inode.mu.Unlock()
-
-		offset += int64(n)
-		if readErr == io.EOF {
-			break
-		}
-	}
-
-	err = inode.SyncFile()
-	if err != nil {
-		log.Errorf("Error syncing staged file: %v", err)
-		return err
-	}
-
-	localPath, hasLocalPath := stagedFile.Path()
-	preserveForCache := false
-	if fs.flags.CacheThroughModeEnabled && fs.flags.ExternalCacheClient != nil && hasLocalPath {
-		preserveForCache = fs.CacheFileInExternalCacheFromSource(inode, localPath, true)
-		if preserveForCache {
-			stagedFile.PreserveForCache(localPath)
-		}
-	}
-
-	var (
-		hash []byte
-		size uint64
-	)
-	inode.mu.Lock()
-	if inode.userMetadata != nil {
-		hash = inode.userMetadata[fs.flags.HashAttr]
-	}
-	size = inode.Attributes.Size
-	if inode.StagedFile == stagedFile {
-		inode.StagedFile = nil
-	}
-	inode.fs.stagedFiles.Delete(inode.Id)
-	inode.mu.Unlock()
-
-	stagedFile.FinishFlush(false)
-	stagedFile.Cleanup()
-
-	if fs.flags.EventCallback != nil {
-		fs.flags.EventCallback(cfg.EventStagedFileUploaded, map[string]interface{}{
-			"inode": stagedFile.FH.inode.FullName(),
-			"hash":  hash,
-			"size":  size,
-		})
-	}
-
-	return nil
-}
-
 func (fs *Goofys) flushStagedFileDirect(inode *Inode) (err error) {
 	inode.mu.Lock()
 
@@ -2326,6 +2153,24 @@ var errStagedGenerationChanged = errors.New("staged file changed during upload")
 // before the upload is committed; an error from it aborts the upload so that
 // nothing becomes visible.
 func (fs *Goofys) uploadStagedFileDirect(cloud StorageBackend, key string, file io.ReaderAt, size uint64, contentType *string, metadata map[string]*string, beforeCommit func() error) (*MultipartBlobCommitOutput, error) {
+	for attempt := 1; ; attempt++ {
+		if beforeCommit != nil {
+			if err := beforeCommit(); err != nil {
+				return nil, err
+			}
+		}
+		resp, err := fs.uploadStagedFileAttempt(cloud, key, file, size, contentType, metadata, beforeCommit)
+		if !isNoSuchUploadError(err) || attempt == s3WriteRetryAttempts {
+			return resp, err
+		}
+		// The upload ID is gone, but the staged bytes are still ours. Restart
+		// the whole upload; retrying a part with the same ID cannot recover it.
+		log.Warnf("Restarting lost staged multipart upload: key=%s attempt=%d/%d", key, attempt, s3WriteRetryAttempts)
+		time.Sleep(s3WriteRetryDelay(attempt))
+	}
+}
+
+func (fs *Goofys) uploadStagedFileAttempt(cloud StorageBackend, key string, file io.ReaderAt, size uint64, contentType *string, metadata map[string]*string, beforeCommit func() error) (*MultipartBlobCommitOutput, error) {
 	if size <= fs.flags.SinglePartMB*1024*1024 {
 		if beforeCommit != nil {
 			// A single PutObject cannot be checked between reading and
