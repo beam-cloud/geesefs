@@ -1930,6 +1930,73 @@ func TestDirectStagedMultipartUploadsLiveFileUnchangedDuringUpload(t *testing.T)
 	}
 }
 
+type lostStagedUploadBackend struct {
+	stagedMultipartBackend
+	failUploads int
+	onCommit    bool
+	err         error
+}
+
+func (b *lostStagedUploadBackend) MultipartBlobAdd(p *MultipartBlobAddInput) (*MultipartBlobAddOutput, error) {
+	if !b.onCommit && b.nextUpload <= b.failUploads {
+		return nil, b.err
+	}
+	return b.stagedMultipartBackend.MultipartBlobAdd(p)
+}
+
+func (b *lostStagedUploadBackend) MultipartBlobCommit(p *MultipartBlobCommitInput) (*MultipartBlobCommitOutput, error) {
+	if b.onCommit && b.nextUpload <= b.failUploads {
+		return nil, b.err
+	}
+	return b.stagedMultipartBackend.MultipartBlobCommit(p)
+}
+
+func TestSyncStagedFileRecoversLostMultipartUpload(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		onCommit    bool
+		failUploads int
+		err         error
+		wantUploads int
+		wantError   bool
+	}{
+		{"part", false, 1, newNoSuchUploadError(), 2, false},
+		{"commit", true, 1, newNoSuchUploadError(), 2, false},
+		{"exhausted", false, s3WriteRetryAttempts, newNoSuchUploadError(), s3WriteRetryAttempts, true},
+		{"permission", false, 1, syscall.EACCES, 1, true},
+		{"missing_key", false, 1, syscall.ENOENT, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			flags := cfg.DefaultFlags()
+			flags.HashAttr = ""
+			flags.StagedWriteModeEnabled = true
+			flags.StagedWritePath = t.TempDir()
+			flags.SinglePartMB = 1
+			flags.MaxParallelParts = 4
+			flags.PartSizes = []cfg.PartSizeConfig{{PartSize: 1 << 20, PartCount: 10000}}
+			fs := newUnitFS(flags)
+			backend := &lostStagedUploadBackend{failUploads: tc.failUploads, onCommit: tc.onCommit, err: tc.err}
+			payload := bytes.Repeat([]byte("retained model weights"), 500000)
+			inode, stagedPath := newStagedRenameInode(t, fs, newRootWithBackend(fs, backend), "model.bin", payload)
+			err := fs.syncStagedFile(inode)
+			if (err != nil) != tc.wantError || backend.nextUpload != tc.wantUploads {
+				t.Fatalf("fsync error=%v uploads=%d, want error=%v uploads=%d", err, backend.nextUpload, tc.wantError, tc.wantUploads)
+			}
+			if len(backend.parts) != 0 {
+				t.Fatalf("left %d multipart uploads open", len(backend.parts))
+			}
+			if tc.wantError {
+				data, readErr := os.ReadFile(stagedPath)
+				if readErr != nil || !bytes.Equal(data, payload) || inode.StagedFile == nil {
+					t.Fatalf("failed fsync lost the staged bytes: %v", readErr)
+				}
+			} else if got := backend.committedGenerations(); len(got) != 1 || !bytes.Equal(got[0], payload) || inode.StagedFile != nil {
+				t.Fatal("fsync did not commit exactly the original staged bytes")
+			}
+		})
+	}
+}
+
 func TestStagedPartialOverwritePreservesLogicalSize(t *testing.T) {
 	origin := bytes.Repeat([]byte("o"), 512)
 	replacement := []byte("new journal\n")
